@@ -109,12 +109,8 @@ local INTERNAL = {
     FastTPArrivalTimeout = 3,
     FastTPCooldown = 2,
     ServerRetryDelay = 3,
-    ServerPageDelay = 0.03,
     TeleportStartTimeout = 8,
-    FailedServerCooldown = 30,
-    MaxServerPages = 100,
-    MaxServerPlayers = 12,
-    TargetRegion = "Singapore",
+    TeleportTransferTimeout = 30,
     SafeEntrance = Vector3.new(
         -5083.26025390625,
         314.6056823730469,
@@ -171,7 +167,6 @@ if not bootstrapStillCurrent() then
     return
 end
 
-local ServerBrowser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
 local PreviousRuntime = Environment.__AutoBountyRuntime
 
 if PreviousRuntime and type(PreviousRuntime.Stop) == "function" then
@@ -366,7 +361,7 @@ local Runtime = {
     HopReason = nil,
     FollowTimeoutHopDetail = nil,
     HopWorkerRunning = false,
-    CurrentRegion = nil,
+    HopAttemptEpoch = 0,
     EmptySince = nil,
     Candidates = {},
     CandidateInfo = {},
@@ -383,7 +378,6 @@ local Runtime = {
     FriendCache = {},
     FriendCheckedAt = {},
     FriendAuditComplete = false,
-    ServerAuditComplete = false,
     ESPObjects = {},
     SafeZoneParts = {},
     SafeZonesFolder = nil,
@@ -1545,7 +1539,6 @@ local function canAttack(targetEpoch)
         or Runtime.LocalDead
         or Runtime.HopPending
         or not Runtime.FriendAuditComplete
-        or not Runtime.ServerAuditComplete
         or Runtime.Mode ~= "ENGAGE"
         or not Runtime.InsideHitbox then
 
@@ -2187,9 +2180,9 @@ local function startMovementWorker()
             return
         end
 
-        if not Runtime.FriendAuditComplete or not Runtime.ServerAuditComplete then
+        if not Runtime.FriendAuditComplete then
             if Runtime.CurrentTarget then
-                clearTarget("Waiting for server safety checks")
+                clearTarget("Waiting for friend checks")
             end
 
             return
@@ -2529,138 +2522,11 @@ local function startESPWorker()
     end)
 end
 
-local function isTargetRegion(region)
-    return type(region) == "string"
-        and string.find(string.lower(region), string.lower(INTERNAL.TargetRegion), 1, true) ~= nil
-end
-
-local function getCurrentJob()
-    local browser = ServerBrowser
-
-    if not browser or not browser.Parent then
-        browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
-        ServerBrowser = browser
-    end
-
-    if not browser then
-        return game.JobId
-    end
-
-    local success, jobId = pcall(function()
-        return browser:InvokeServer("getjob")
-    end)
-
-    if success and type(jobId) == "string" and jobId ~= "" then
-        return jobId
-    end
-
-    return game.JobId
-end
-
-local function scanServers()
-    while Runtime.Running and Runtime.ServerScanBusy do
-        task.wait(0.1)
-    end
-
-    if not Runtime.Running then
-        return nil, {}
-    end
-
-    local browser = ServerBrowser
-
-    if not browser or not browser.Parent then
-        browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
-        ServerBrowser = browser
-    end
-
-    if not browser then
-        warnOnce("server-browser:missing", "ReplicatedStorage.__ServerBrowser is missing; server hopping will keep retrying.")
-        return nil, {}
-    end
-
-    Runtime.ServerScanBusy = true
-    local currentJob = tostring(getCurrentJob())
-    local currentRegion
-    local available = {}
-    Runtime.FailedServers = Runtime.FailedServers or {}
-
-    for jobId, failedUntil in pairs(Runtime.FailedServers) do
-        if type(failedUntil) ~= "number" or failedUntil <= os.clock() then
-            Runtime.FailedServers[jobId] = nil
-        end
-    end
-
-    for page = 1, INTERNAL.MaxServerPages do
-        if not Runtime.Running then
-            break
-        end
-
-        local success, servers = pcall(function()
-            return browser:InvokeServer(page)
-        end)
-
-        if not success then
-            warnOnce("server-browser:page", "A server-browser page request failed: " .. tostring(servers))
-        elseif type(servers) ~= "table" then
-            warnOnce("server-browser:schema", "The server browser returned an unexpected page format.")
-        else
-            local pageHadEntries = false
-
-            for key, info in pairs(servers) do
-                if type(info) == "table" then
-                    pageHadEntries = true
-                    local jobId = tostring(info.JobId or info.Id or key)
-                    local region = type(info.Region) == "string" and info.Region or ""
-                    local count = tonumber(info.Count or info.Playing or info.Players)
-
-                    if jobId == currentJob or jobId == tostring(game.JobId) then
-                        currentRegion = region ~= "" and region or currentRegion
-                    elseif jobId ~= ""
-                        and isTargetRegion(region)
-                        and count
-                        and count < INTERNAL.MaxServerPlayers
-                        and not Runtime.FailedServers[jobId] then
-
-                        table.insert(available, {
-                            JobId = jobId,
-                            Count = count,
-                            Region = region,
-                        })
-                    end
-                end
-            end
-
-            if not pageHadEntries then
-                break
-            end
-        end
-
-        task.wait(INTERNAL.ServerPageDelay)
-    end
-
-    table.sort(available, function(left, right)
-        if left.Count == right.Count then
-            return left.JobId < right.JobId
-        end
-
-        return left.Count < right.Count
-    end)
-
-    Runtime.CurrentRegion = currentRegion
-    Runtime.RegionChecked = true
-    Runtime.ServerScanBusy = false
-    return currentRegion, available
-end
-
 local function determineHopReason()
     local friend = findFriendInServer()
 
     if friend then
         return "friend", friend.Name
-    end
-
-    if Runtime.RegionChecked and not isTargetRegion(Runtime.CurrentRegion) then
-        return "region", Runtime.CurrentRegion or "Unknown"
     end
 
     if Runtime.FollowTimeoutHopDetail then
@@ -2669,7 +2535,6 @@ local function determineHopReason()
 
     if Runtime.SafeZonesReady
         and Runtime.FriendAuditComplete
-        and Runtime.ServerAuditComplete
         and Runtime.EmptySince
         and os.clock() - Runtime.EmptySince >= INTERNAL.EmptyListGrace
         and #Runtime.Candidates == 0
@@ -2684,11 +2549,12 @@ end
 local HOP_PRIORITY = {
     empty = 1,
     ["follow-timeout"] = 1,
-    region = 2,
     friend = 3,
 }
 
 local function stopHopPending(message)
+    Runtime.HopAttemptEpoch = Runtime.HopAttemptEpoch + 1
+    Runtime.Teleporting = false
     Runtime.HopPending = false
     Runtime.HopReason = nil
     Runtime.HopDetail = nil
@@ -2759,11 +2625,16 @@ local function runHopWorker()
             Runtime.Mode = "HOP_WAIT"
 
             while Runtime.Running and Runtime.HopPending do
+                local activeReason = determineHopReason()
+
+                if not activeReason then
+                    stopHopPending("Hop condition cleared; scanning")
+                    break
+                end
+
                 local inCombat, inCombatKnown = readLocalInCombat()
 
                 if inCombatKnown and inCombat == true then
-                    local activeReason = determineHopReason()
-
                     if activeReason == "follow-timeout" then
                         stopHopPending("Combat started; PlayerFollowTime reset")
                         break
@@ -2799,28 +2670,7 @@ local function runHopWorker()
 
             Runtime.HopReason = reason
             Runtime.HopDetail = detail
-            setStatus("Scanning Singapore servers (" .. reason .. ")")
-            local _, servers = scanServers()
-
-            if not Runtime.Running or not Runtime.HopPending then
-                break
-            end
-
-            if Runtime.SafeMode or Runtime.LocalDead then
-                task.wait(0.1)
-                continue
-            end
-
-            rebuildCandidates()
-            reason, detail = determineHopReason()
-
-            if not reason then
-                stopHopPending("Hop condition cleared; scanning")
-                break
-            end
-
-            Runtime.HopReason = reason
-            Runtime.HopDetail = detail
+            setStatus("Preparing random Roblox server hop (" .. reason .. ")")
 
             local currentInCombat, currentInCombatKnown = readLocalInCombat()
 
@@ -2835,16 +2685,18 @@ local function runHopWorker()
             elseif not currentInCombatKnown or currentInCombat == true then
                 setStatus("Combat state blocks server hop")
                 task.wait(0.25)
-            elseif #servers == 0 then
-                setStatus("No Singapore server available; retrying")
-                task.wait(INTERNAL.ServerRetryDelay)
             else
-                local selectionLimit = math.min(5, #servers)
-                local chosen = servers[math.random(1, selectionLimit)]
+                Runtime.HopAttemptEpoch = Runtime.HopAttemptEpoch + 1
+                local attemptEpoch = Runtime.HopAttemptEpoch
                 local teleportStarted = false
+                local teleportStartedDeadline
                 local teleportFailed = false
                 local teleportFailureMessage
                 local teleportConnection = LocalPlayer.OnTeleport:Connect(function(state)
+                    if Runtime.HopAttemptEpoch ~= attemptEpoch then
+                        return
+                    end
+
                     if state == Enum.TeleportState.Failed then
                         teleportFailed = true
                         teleportFailureMessage = "OnTeleport reported Failed"
@@ -2853,16 +2705,19 @@ local function runHopWorker()
                         or state == Enum.TeleportState.InProgress then
 
                         teleportStarted = true
+                        teleportStartedDeadline = teleportStartedDeadline
+                            or (os.clock() + INTERNAL.TeleportTransferTimeout)
+                        setStatus("Roblox teleport started; waiting for transfer")
                     end
                 end)
                 local initFailedConnection = TeleportService.TeleportInitFailed:Connect(function(player, _, errorMessage)
-                    if player == LocalPlayer then
+                    if Runtime.HopAttemptEpoch == attemptEpoch and player == LocalPlayer then
                         teleportFailed = true
                         teleportFailureMessage = tostring(errorMessage)
                     end
                 end)
 
-                -- Final race check immediately before the teleport remote.
+                -- Final race check immediately before the Roblox teleport request.
                 local finalInCombat, finalInCombatKnown = readLocalInCombat()
 
                 if not finalInCombatKnown
@@ -2884,48 +2739,57 @@ local function runHopWorker()
                     task.wait(0.25)
                 else
                     Runtime.Mode = "HOPPING"
-                    setStatus(string.format("Joining Singapore server (%d/%d)", chosen.Count, INTERNAL.MaxServerPlayers))
+                    setStatus("Joining a random Roblox server (" .. reason .. ")")
                     Runtime.Teleporting = true
 
-                    local deadline = os.clock() + INTERNAL.TeleportStartTimeout
-                    local invokeFinished = false
+                    local requestDeadline = os.clock() + INTERNAL.TeleportStartTimeout
                     local invokeBlocked = false
+                    local invokeReasonCleared = false
                     local success
                     local result
                     local teleportCharacter = Runtime.Character
                     local teleportCharacterEpoch = Runtime.CharacterEpoch
-
-                    task.spawn(function()
-                        local closureInCombat, closureInCombatKnown = readLocalInCombat()
-                        local mayTeleport = Runtime.Running
-                            and Runtime.HopPending
-                            and not Runtime.SafeMode
-                            and not Runtime.LocalDead
-                            and Runtime.Character == teleportCharacter
-                            and Runtime.CharacterEpoch == teleportCharacterEpoch
-                            and closureInCombatKnown
-                            and closureInCombat == false
-
-                        if mayTeleport then
-                            success, result = pcall(function()
-                                return ServerBrowser:InvokeServer("teleport", chosen.JobId)
-                            end)
-                        else
-                            invokeBlocked = true
-                            success = false
-                            result = "Combat or character state changed before teleport"
-                        end
-
-                        invokeFinished = true
-                    end)
-
-                    while Runtime.Running
-                        and not teleportFailed
+                    rebuildCandidates()
+                    local invokeReason, invokeDetail = determineHopReason()
+                    local invokeInCombat, invokeInCombatKnown = readLocalInCombat()
+                    local mayTeleport = Runtime.Running
+                        and Runtime.HopPending
+                        and Runtime.HopAttemptEpoch == attemptEpoch
+                        and invokeReason ~= nil
                         and not Runtime.SafeMode
                         and not Runtime.LocalDead
-                        and os.clock() < deadline do
+                        and Runtime.Character == teleportCharacter
+                        and Runtime.CharacterEpoch == teleportCharacterEpoch
+                        and invokeInCombatKnown
+                        and invokeInCombat == false
 
-                        if invokeFinished and success == false then
+                    if mayTeleport then
+                        Runtime.HopReason = invokeReason
+                        Runtime.HopDetail = invokeDetail
+                        success, result = pcall(function()
+                            return TeleportService:Teleport(game.PlaceId, LocalPlayer)
+                        end)
+                    else
+                        invokeBlocked = true
+                        invokeReasonCleared = invokeReason == nil
+                        success = false
+                        result = invokeReasonCleared
+                            and "Hop condition cleared before teleport"
+                            or "Combat or character state changed before teleport"
+                    end
+
+                    while Runtime.Running
+                        and Runtime.HopAttemptEpoch == attemptEpoch
+                        and not teleportFailed
+                        and not Runtime.SafeMode
+                        and not Runtime.LocalDead do
+
+                        if success == false
+                            or (not teleportStarted and os.clock() >= requestDeadline)
+                            or (teleportStarted
+                                and teleportStartedDeadline
+                                and os.clock() >= teleportStartedDeadline) then
+
                             break
                         end
 
@@ -2936,38 +2800,49 @@ local function runHopWorker()
                     teleportConnection:Disconnect()
                     initFailedConnection:Disconnect()
 
+                    if not Runtime.Running
+                        or not Runtime.HopPending
+                        or Runtime.HopAttemptEpoch ~= attemptEpoch then
+
+                        task.wait(0.1)
+                        continue
+                    end
+
                     local interrupted = Runtime.SafeMode or Runtime.LocalDead
                     local activeReason = determineHopReason()
+                    local hopConditionCleared = invokeBlocked
+                        and invokeReasonCleared
+                        and activeReason == nil
                     local followTimerReset = invokeBlocked and activeReason == "follow-timeout"
 
-                    if followTimerReset then
+                    if hopConditionCleared then
+                        stopHopPending("Hop condition cleared; scanning")
+                    elseif followTimerReset then
                         stopHopPending("Combat/character change reset PlayerFollowTime")
                     end
 
-                    if followTimerReset then
+                    if hopConditionCleared then
+                        -- Targeting can resume immediately.
+                    elseif followTimerReset then
                         -- A fresh target and full timer are required.
                     elseif interrupted then
                         setStatus(Runtime.SafeMode and "SafeMode active; server hop queued" or "Respawn interrupted server hop")
                     elseif invokeBlocked then
                         setStatus("Combat/character state changed; server hop remains queued")
-                    else
-                        Runtime.FailedServers[chosen.JobId] = os.clock() + INTERNAL.FailedServerCooldown
                     end
 
-                    if followTimerReset or invokeBlocked then
-                        -- No teleport request was sent, so this server is not failed.
+                    if hopConditionCleared or followTimerReset or invokeBlocked then
+                        -- No teleport request was sent.
                     elseif interrupted then
                         -- The queued hop resumes after SafeMode/respawn.
-                    elseif not invokeFinished then
-                        warnOnce("server-browser:invoke-timeout:" .. chosen.JobId, "The server teleport remote did not return before timeout; trying another server.")
                     elseif not success then
-                        warnOnce("server-browser:teleport:" .. chosen.JobId, "Server teleport failed: " .. tostring(result))
+                        warnOnce("random-hop:teleport", "Random Roblox server hop failed: " .. tostring(result))
                     elseif teleportFailed then
-                        warnOnce("server-browser:teleport-state:" .. chosen.JobId, "Server teleport failed after starting: " .. tostring(teleportFailureMessage))
+                        warnOnce("random-hop:teleport-state", "Random Roblox server hop failed after starting: " .. tostring(teleportFailureMessage))
                     elseif teleportStarted then
-                        warnOnce("server-browser:stalled:" .. chosen.JobId, "Teleport started but this client did not leave within the timeout; trying another server.")
+                        warnOnce("random-hop:stalled", "Random Roblox server hop stalled during transfer; retrying.")
                     else
-                        warnOnce("server-browser:no-start:" .. chosen.JobId, "Server teleport did not start; another server will be tried.")
+                        warnOnce("random-hop:no-start", "Random Roblox server hop did not start; retrying.")
                     end
 
                     task.wait(INTERNAL.ServerRetryDelay)
@@ -3083,8 +2958,8 @@ local function startTargetWorker()
             if Runtime.CurrentTarget then
                 local currentInfo = Runtime.CandidateInfo[Runtime.CurrentTarget]
 
-                if not Runtime.FriendAuditComplete or not Runtime.ServerAuditComplete then
-                    clearTarget("Waiting for initial server safety checks")
+                if not Runtime.FriendAuditComplete then
+                    clearTarget("Waiting for initial friend checks")
                 elseif currentInfo then
                     local lockedInfo = Runtime.CurrentTargetInfo
 
@@ -3103,10 +2978,7 @@ local function startTargetWorker()
             end
 
             if not Runtime.LocalDead and not Runtime.SafeMode and not Runtime.HopPending then
-                if not Runtime.ServerAuditComplete then
-                    Runtime.EmptySince = nil
-                    setStatus("Waiting for server-region check")
-                elseif not Runtime.FriendAuditComplete then
+                if not Runtime.FriendAuditComplete then
                     Runtime.EmptySince = nil
                     setStatus("Checking players for friends")
                 elseif not Runtime.SafeZonesFolder or not Runtime.SafeZonesReady then
@@ -3140,34 +3012,6 @@ local function startTargetWorker()
     end)
 end
 
-local function startServerAudit()
-    task.spawn(function()
-        while Runtime.Running and not Runtime.ServerAuditComplete do
-            setStatus("Checking server region")
-            local region = scanServers()
-
-            if not Runtime.Running then
-                return
-            end
-
-            Runtime.ServerAuditComplete = Runtime.RegionChecked == true
-
-            if Runtime.ServerAuditComplete then
-                if not isTargetRegion(region) then
-                    requestHop("region", region or "Unknown")
-                elseif not Runtime.CurrentTarget and not Runtime.HopPending then
-                    setStatus("Singapore server confirmed; scanning")
-                end
-
-                return
-            end
-
-            setStatus("Server browser unavailable; retrying region check")
-            task.wait(INTERNAL.ServerRetryDelay)
-        end
-    end)
-end
-
 function Runtime:Stop(reason)
     if not self.Running then
         return
@@ -3176,6 +3020,8 @@ function Runtime:Stop(reason)
     self.Running = false
     self.HopPending = false
     self.FollowTimeoutHopDetail = nil
+    self.HopAttemptEpoch = self.HopAttemptEpoch + 1
+    self.Teleporting = false
     self.TargetEpoch = self.TargetEpoch + 1
     self.CharacterEpoch = self.CharacterEpoch + 1
     self.SafeEpoch = self.SafeEpoch + 1
@@ -3245,7 +3091,5 @@ end)
 if LocalPlayer.Character then
     bindCharacter(LocalPlayer.Character)
 end
-
-startServerAudit()
 
 return Runtime
