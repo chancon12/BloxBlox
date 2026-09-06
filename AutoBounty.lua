@@ -1,6 +1,6 @@
 -- GitHub-side Auto Bounty module.
 -- External options are intentionally limited to Team, Weapon, FastTP, ESP,
--- health thresholds, and hitbox settings.
+-- health thresholds, hitbox settings, and PlayerFollowTime.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -43,6 +43,13 @@ local FastTPEnabled = Settings.FastTP ~= false
 local ESPEnabled = Settings.ESPPlayer ~= false
 local LowHealth = tonumber(Settings.LowHealth) or 8000
 local RecoveryHealth = tonumber(Settings.MaxHealth) or 10000
+local RawPlayerFollowTime = Settings.PlayerFollowTime
+local PlayerFollowTime = RawPlayerFollowTime == nil and 30 or tonumber(RawPlayerFollowTime)
+
+if not isFiniteNumber(PlayerFollowTime) or PlayerFollowTime <= 0 then
+    warn("[AutoBounty] PlayerFollowTime must be a finite number above 0; using 30 seconds.")
+    PlayerFollowTime = 30
+end
 
 if not isFiniteNumber(LowHealth) then
     warn("[AutoBounty] LowHealth is not finite; using 8000.")
@@ -177,7 +184,8 @@ if not bootstrapStillCurrent() then
     return
 end
 
--- Blox Fruits keeps DataLoaded false until the player selects a team.
+-- Select the team first. In the current client, DataLoaded's presence is the
+-- usable marker; its BoolValue.Value can remain false after gameplay is ready.
 print("[AutoBounty] Selecting team: " .. Config.Team)
 local TeamRequestOk, TeamRequestResult = pcall(function()
     return CommF:InvokeServer("SetTeam", Config.Team)
@@ -212,33 +220,71 @@ assert(
     "[AutoBounty] The requested team was not confirmed within 15 seconds"
 )
 
-print("[AutoBounty] Team confirmed; waiting for DataLoaded")
+print("[AutoBounty] Team confirmed; waiting for DataLoaded marker and Data.Level")
 
 local DataLoadedDeadline = os.clock() + 60
 local DataLoaded
+local LoadedData
+local LoadedLevelObject
+local LoadedLevel
 local StableDataLoaded
-local DataLoadedTrueSince
+local StableData
+local StableLevelObject
+local ReadySince
+local LastTeamName = "<missing>"
+local LastMarkerState = "<missing>"
+local LastLevelState = "<missing>"
 
 while bootstrapStillCurrent() and os.clock() < DataLoadedDeadline do
     local current = LocalPlayer:FindFirstChild("DataLoaded")
     local currentTeam = LocalPlayer.Team
     local teamMatches = currentTeam and currentTeam.Name == Config.Team
+    local data = LocalPlayer:FindFirstChild("Data")
+    local levelObject = data and data:FindFirstChild("Level")
+    local level = levelObject
+        and levelObject:IsA("ValueBase")
+        and tonumber(levelObject.Value)
 
     if current and not current:IsA("BoolValue") then
         error("[AutoBounty] LocalPlayer.DataLoaded must be a BoolValue")
     end
 
-    if teamMatches and current and current.Value then
-        if StableDataLoaded ~= current then
+    LastTeamName = currentTeam and currentTeam.Name or "<missing>"
+    LastMarkerState = current
+        and (current.ClassName .. " Value=" .. tostring(current.Value))
+        or "<missing>"
+    LastLevelState = level and tostring(level) or "<missing-or-invalid>"
+
+    local ready = teamMatches
+        and current
+        and data
+        and levelObject
+        and isFiniteNumber(level)
+        and level >= 1
+
+    if ready then
+        if StableDataLoaded == current
+            and StableData == data
+            and StableLevelObject == levelObject then
+
+            if os.clock() - ReadySince >= 0.5 then
+                DataLoaded = current
+                LoadedData = data
+                LoadedLevelObject = levelObject
+                LoadedLevel = level
+                break
+            end
+        else
             StableDataLoaded = current
-            DataLoadedTrueSince = os.clock()
-        elseif os.clock() - DataLoadedTrueSince >= 0.5 then
-            DataLoaded = current
-            break
+            StableData = data
+            StableLevelObject = levelObject
+            ReadySince = os.clock()
         end
     else
         StableDataLoaded = nil
-        DataLoadedTrueSince = nil
+        StableData = nil
+        StableLevelObject = nil
+        ReadySince = nil
     end
 
     task.wait(0.1)
@@ -248,15 +294,40 @@ if not bootstrapStillCurrent() then
     return
 end
 
-assert(
-    LocalPlayer.Team
-        and LocalPlayer.Team.Name == Config.Team
-        and DataLoaded
-        and DataLoaded.Parent == LocalPlayer
-        and DataLoaded.Value,
-    "[AutoBounty] The configured team and DataLoaded did not remain ready within 60 seconds"
+local finalLevel = LoadedLevelObject
+    and LoadedLevelObject:IsA("ValueBase")
+    and tonumber(LoadedLevelObject.Value)
+local readinessStillValid = LocalPlayer.Team
+    and LocalPlayer.Team.Name == Config.Team
+    and DataLoaded
+    and LocalPlayer:FindFirstChild("DataLoaded") == DataLoaded
+    and DataLoaded.Parent == LocalPlayer
+    and LoadedData
+    and LocalPlayer:FindFirstChild("Data") == LoadedData
+    and LoadedLevelObject
+    and LoadedData:FindFirstChild("Level") == LoadedLevelObject
+    and LoadedLevelObject.Parent == LoadedData
+    and isFiniteNumber(finalLevel)
+    and finalLevel >= 1
+
+if not readinessStillValid then
+    error(
+        "[AutoBounty] Readiness timed out or changed: team="
+            .. LastTeamName
+            .. ", DataLoaded="
+            .. LastMarkerState
+            .. ", Level="
+            .. LastLevelState
+    )
+end
+
+LoadedLevel = finalLevel
+print(
+    "[AutoBounty] Readiness confirmed; DataLoaded.Value="
+        .. tostring(DataLoaded.Value)
+        .. ", Level="
+        .. tostring(LoadedLevel)
 )
-print("[AutoBounty] DataLoaded is true; initializing systems")
 
 if not bootstrapStillCurrent() then
     return
@@ -276,6 +347,15 @@ local Runtime = {
     Humanoid = nil,
     Root = nil,
     InsideHitbox = false,
+    FollowNoCombatSince = nil,
+    FollowTimerEpoch = nil,
+    FollowTimerCharacterEpoch = nil,
+    DamageCheckDeadline = nil,
+    DamageCheckLastHealth = nil,
+    DamageCheckEpoch = nil,
+    DamageCheckCharacterEpoch = nil,
+    DamageCheckExpired = false,
+    DamageObserved = false,
     AimActive = false,
     SafeMode = false,
     LocalDead = true,
@@ -284,6 +364,7 @@ local Runtime = {
     LastEntranceAt = 0,
     HopPending = false,
     HopReason = nil,
+    FollowTimeoutHopDetail = nil,
     HopWorkerRunning = false,
     CurrentRegion = nil,
     EmptySince = nil,
@@ -292,6 +373,8 @@ local Runtime = {
     CandidateReasons = {},
     PendingSince = {},
     PendingCandidateCount = 0,
+    NoProgressCharacters = {},
+    TargetConnections = {},
     Connections = {},
     CharacterConnections = {},
     PressedKeys = {},
@@ -376,6 +459,10 @@ local function readBooleanAttribute(instance, name, fallback)
     end
 
     return value, true
+end
+
+local function readLocalInCombat()
+    return readBooleanAttribute(Runtime.Character, "InCombat", nil)
 end
 
 local function setRequiredLocalAttribute(name)
@@ -877,6 +964,7 @@ end
 local requestHop
 local enterSafeMode
 local exitSafeMode
+local cancelFollowTimeoutHop
 
 local function requestFriendCheck(player)
     if not player or player == LocalPlayer or player.Parent ~= Players then
@@ -1014,6 +1102,16 @@ local function evaluateTarget(player)
         return false, "dead-or-respawning"
     end
 
+    local noProgressCharacter = Runtime.NoProgressCharacters[player]
+
+    if noProgressCharacter then
+        if noProgressCharacter == character then
+            return false, "no-health-progress"
+        end
+
+        Runtime.NoProgressCharacters[player] = nil
+    end
+
     local inSafeZone = isInsideSafeZone(root.Position)
 
     if inSafeZone == nil then
@@ -1094,12 +1192,26 @@ local function rebuildCandidates()
     return candidates
 end
 
+local function resetTargetTimers()
+    Runtime.FollowNoCombatSince = nil
+    Runtime.FollowTimerEpoch = nil
+    Runtime.FollowTimerCharacterEpoch = nil
+    Runtime.DamageCheckDeadline = nil
+    Runtime.DamageCheckLastHealth = nil
+    Runtime.DamageCheckEpoch = nil
+    Runtime.DamageCheckCharacterEpoch = nil
+    Runtime.DamageCheckExpired = false
+    Runtime.DamageObserved = false
+end
+
 local function clearTarget(reason)
     Runtime.TargetEpoch = Runtime.TargetEpoch + 1
     Runtime.AimActive = false
     Runtime.AimPosition = nil
     Runtime.InsideHitbox = false
     Runtime.CurrentTool = nil
+    resetTargetTimers()
+    disconnectConnections(Runtime.TargetConnections)
     releaseAllKeys()
     restoreTargetHitbox()
     restoreLocalCollision()
@@ -1344,6 +1456,37 @@ local function setTarget(player, targetInfo)
     Runtime.Mode = "PREPARE"
     Runtime.TargetEpoch = Runtime.TargetEpoch + 1
     local targetEpoch = Runtime.TargetEpoch
+    local preparedHumanoid = preparedInfo and preparedInfo.Humanoid
+
+    if preparedHumanoid and preparedHumanoid.Parent then
+        local healthConnection = preparedHumanoid.HealthChanged:Connect(function(health)
+            if not Runtime.Running
+                or Runtime.CurrentTarget ~= player
+                or Runtime.TargetEpoch ~= targetEpoch
+                or Runtime.DamageCheckEpoch ~= targetEpoch
+                or Runtime.DamageObserved
+                or not Runtime.DamageCheckDeadline then
+
+                return
+            end
+
+            local previousHealth = Runtime.DamageCheckLastHealth
+
+            if os.clock() >= Runtime.DamageCheckDeadline then
+                Runtime.DamageCheckExpired = true
+                return
+            end
+
+            if previousHealth and health < previousHealth then
+                Runtime.DamageObserved = true
+                Runtime.DamageCheckDeadline = nil
+            else
+                Runtime.DamageCheckLastHealth = health
+            end
+        end)
+        table.insert(Runtime.TargetConnections, healthConnection)
+    end
+
     updateTargetGUI()
     setStatus("Preparing " .. player.Name)
 
@@ -1816,6 +1959,11 @@ enterSafeMode = function()
     Runtime.SafeEpoch = Runtime.SafeEpoch + 1
     local safeEpoch = Runtime.SafeEpoch
     local characterEpoch = Runtime.CharacterEpoch
+
+    if cancelFollowTimeoutHop then
+        cancelFollowTimeoutHop("SafeMode reset PlayerFollowTime")
+    end
+
     clearTarget()
     Runtime.Mode = "SAFE_MODE"
     setStatus("SafeMode: low health")
@@ -1907,6 +2055,11 @@ local function handleLocalDeath(characterEpoch)
     Runtime.LocalDead = true
     Runtime.SafeMode = false
     Runtime.SafeEpoch = Runtime.SafeEpoch + 1
+
+    if cancelFollowTimeoutHop then
+        cancelFollowTimeoutHop("Local death reset PlayerFollowTime")
+    end
+
     clearTarget()
     Runtime.Mode = "RESPAWN"
     setStatus("Local player died; waiting for respawn")
@@ -1994,6 +2147,7 @@ local function bindCharacter(character)
         end
 
         Runtime.LocalDead = false
+        readLocalInCombat()
         startPvPEnable()
         handleHealthChanged(humanoid.Health, characterEpoch)
 
@@ -2055,7 +2209,7 @@ local function startMovementWorker()
 
         local player = Runtime.CurrentTarget
 
-        if not player or (Runtime.Mode ~= "CHASE" and Runtime.Mode ~= "ENGAGE") then
+        if not player then
             return
         end
 
@@ -2107,6 +2261,54 @@ local function startMovementWorker()
             Root = targetRoot,
             Level = readLevel(player),
         }
+        local now = os.clock()
+        local targetEpoch = Runtime.TargetEpoch
+        local characterEpoch = Runtime.CharacterEpoch
+        local inCombat, inCombatKnown = readLocalInCombat()
+
+        if inCombatKnown and inCombat == true then
+            Runtime.FollowNoCombatSince = nil
+            Runtime.FollowTimerEpoch = nil
+            Runtime.FollowTimerCharacterEpoch = nil
+        elseif inCombatKnown then
+            if Runtime.FollowTimerEpoch ~= targetEpoch
+                or Runtime.FollowTimerCharacterEpoch ~= characterEpoch
+                or not Runtime.FollowNoCombatSince then
+
+                Runtime.FollowNoCombatSince = now
+                Runtime.FollowTimerEpoch = targetEpoch
+                Runtime.FollowTimerCharacterEpoch = characterEpoch
+            elseif now - Runtime.FollowNoCombatSince >= PlayerFollowTime then
+                local finalInCombat, finalInCombatKnown = readLocalInCombat()
+
+                if Runtime.Running
+                    and Runtime.CurrentTarget == player
+                    and Runtime.TargetEpoch == targetEpoch
+                    and Runtime.CharacterEpoch == characterEpoch
+                    and not Runtime.SafeMode
+                    and not Runtime.LocalDead
+                    and not Runtime.HopPending
+                    and finalInCombatKnown
+                    and finalInCombat == false then
+
+                    requestHop("follow-timeout", player.Name)
+                    return
+                end
+
+                Runtime.FollowNoCombatSince = nil
+                Runtime.FollowTimerEpoch = nil
+                Runtime.FollowTimerCharacterEpoch = nil
+            end
+        else
+            Runtime.FollowNoCombatSince = nil
+            Runtime.FollowTimerEpoch = nil
+            Runtime.FollowTimerCharacterEpoch = nil
+        end
+
+        if Runtime.Mode ~= "CHASE" and Runtime.Mode ~= "ENGAGE" then
+            return
+        end
+
         Runtime.AimPosition = targetRoot.Position
         applyTargetHitbox(targetRoot)
         applyLocalNoClip()
@@ -2121,7 +2323,49 @@ local function startMovementWorker()
                 and math.abs(localPosition.Z) <= halfSize.Z
         end
 
+        local wasInsideHitbox = Runtime.InsideHitbox
         Runtime.InsideHitbox = insideHitbox
+
+        if insideHitbox
+            and not wasInsideHitbox
+            and Runtime.DamageCheckEpoch ~= targetEpoch then
+
+            Runtime.DamageCheckDeadline = now + PlayerFollowTime
+            Runtime.DamageCheckLastHealth = targetHumanoid.Health
+            Runtime.DamageCheckEpoch = targetEpoch
+            Runtime.DamageCheckCharacterEpoch = characterEpoch
+            Runtime.DamageCheckExpired = false
+            Runtime.DamageObserved = false
+        end
+
+        if Runtime.DamageCheckEpoch == targetEpoch
+            and Runtime.DamageCheckCharacterEpoch == characterEpoch
+            and Runtime.DamageCheckDeadline
+            and not Runtime.DamageObserved then
+
+            local currentTargetHealth = targetHumanoid.Health
+
+            if not Runtime.DamageCheckExpired
+                and now < Runtime.DamageCheckDeadline
+                and Runtime.DamageCheckLastHealth
+                and currentTargetHealth < Runtime.DamageCheckLastHealth then
+
+                Runtime.DamageObserved = true
+                Runtime.DamageCheckDeadline = nil
+            else
+                Runtime.DamageCheckLastHealth = currentTargetHealth
+
+                if (Runtime.DamageCheckExpired or now >= Runtime.DamageCheckDeadline)
+                    and Runtime.CurrentTarget == player
+                    and Runtime.TargetEpoch == targetEpoch
+                    and Runtime.CharacterEpoch == characterEpoch then
+
+                    Runtime.NoProgressCharacters[player] = character
+                    clearTarget("Target health did not decrease; switching target")
+                    return
+                end
+            end
+        end
 
         if insideHitbox then
             if Runtime.Mode ~= "ENGAGE" then
@@ -2419,6 +2663,10 @@ local function determineHopReason()
         return "region", Runtime.CurrentRegion or "Unknown"
     end
 
+    if Runtime.FollowTimeoutHopDetail then
+        return "follow-timeout", Runtime.FollowTimeoutHopDetail
+    end
+
     if Runtime.SafeZonesReady
         and Runtime.FriendAuditComplete
         and Runtime.ServerAuditComplete
@@ -2435,6 +2683,7 @@ end
 
 local HOP_PRIORITY = {
     empty = 1,
+    ["follow-timeout"] = 1,
     region = 2,
     friend = 3,
 }
@@ -2443,11 +2692,31 @@ local function stopHopPending(message)
     Runtime.HopPending = false
     Runtime.HopReason = nil
     Runtime.HopDetail = nil
+    Runtime.FollowTimeoutHopDetail = nil
 
     if Runtime.Running and not Runtime.SafeMode and not Runtime.LocalDead then
         Runtime.Mode = "SCAN"
         setStatus(message or "Hop cancelled; scanning")
     end
+end
+
+cancelFollowTimeoutHop = function(message)
+    if not Runtime.HopPending or not Runtime.FollowTimeoutHopDetail then
+        return false
+    end
+
+    Runtime.FollowTimeoutHopDetail = nil
+
+    local replacementReason, replacementDetail = determineHopReason()
+
+    if replacementReason then
+        Runtime.HopReason = replacementReason
+        Runtime.HopDetail = replacementDetail
+        return false
+    end
+
+    stopHopPending(message or "PlayerFollowTime reset")
+    return true
 end
 
 local function runHopWorker()
@@ -2464,6 +2733,13 @@ local function runHopWorker()
             while Runtime.Running
                 and Runtime.HopPending
                 and (Runtime.SafeMode or Runtime.LocalDead) do
+
+                local activeReason = determineHopReason()
+
+                if activeReason == "follow-timeout" then
+                    stopHopPending("SafeMode/respawn reset PlayerFollowTime")
+                    break
+                end
 
                 if Runtime.SafeMode then
                     Runtime.Mode = "SAFE_MODE"
@@ -2483,13 +2759,24 @@ local function runHopWorker()
             Runtime.Mode = "HOP_WAIT"
 
             while Runtime.Running and Runtime.HopPending do
-                local inCombat = readBooleanAttribute(LocalPlayer, "InCombat", false)
+                local inCombat, inCombatKnown = readLocalInCombat()
 
-                if inCombat ~= true then
+                if inCombatKnown and inCombat == true then
+                    local activeReason = determineHopReason()
+
+                    if activeReason == "follow-timeout" then
+                        stopHopPending("Combat started; PlayerFollowTime reset")
+                        break
+                    end
+                end
+
+                if inCombatKnown and inCombat == false then
                     break
                 end
 
-                setStatus("Waiting for InCombat to turn off before hopping")
+                setStatus(inCombatKnown
+                    and "Waiting for InCombat to turn off before hopping"
+                    or "Waiting for Character.InCombat before hopping")
                 task.wait(0.25)
             end
 
@@ -2535,10 +2822,18 @@ local function runHopWorker()
             Runtime.HopReason = reason
             Runtime.HopDetail = detail
 
+            local currentInCombat, currentInCombatKnown = readLocalInCombat()
+
             if Runtime.SafeMode or Runtime.LocalDead then
                 task.wait(0.1)
-            elseif LocalPlayer:GetAttribute("InCombat") == true then
-                setStatus("Combat restarted; delaying server hop")
+            elseif currentInCombatKnown
+                and currentInCombat == true
+                and reason == "follow-timeout" then
+
+                stopHopPending("Combat started; PlayerFollowTime reset")
+                task.wait(0.1)
+            elseif not currentInCombatKnown or currentInCombat == true then
+                setStatus("Combat state blocks server hop")
                 task.wait(0.25)
             elseif #servers == 0 then
                 setStatus("No Singapore server available; retrying")
@@ -2568,12 +2863,24 @@ local function runHopWorker()
                 end)
 
                 -- Final race check immediately before the teleport remote.
-                local finalInCombat = readBooleanAttribute(LocalPlayer, "InCombat", false)
+                local finalInCombat, finalInCombatKnown = readLocalInCombat()
 
-                if finalInCombat == true or Runtime.SafeMode or Runtime.LocalDead then
+                if not finalInCombatKnown
+                    or finalInCombat == true
+                    or Runtime.SafeMode
+                    or Runtime.LocalDead then
                     teleportConnection:Disconnect()
                     initFailedConnection:Disconnect()
-                    setStatus(Runtime.SafeMode and "SafeMode active; server hop queued" or "Combat/respawn interrupted server hop")
+
+                    if finalInCombatKnown
+                        and finalInCombat == true
+                        and reason == "follow-timeout" then
+
+                        stopHopPending("Combat started; PlayerFollowTime reset")
+                    else
+                        setStatus(Runtime.SafeMode and "SafeMode active; server hop queued" or "Combat/respawn interrupted server hop")
+                    end
+
                     task.wait(0.25)
                 else
                     Runtime.Mode = "HOPPING"
@@ -2582,13 +2889,33 @@ local function runHopWorker()
 
                     local deadline = os.clock() + INTERNAL.TeleportStartTimeout
                     local invokeFinished = false
+                    local invokeBlocked = false
                     local success
                     local result
+                    local teleportCharacter = Runtime.Character
+                    local teleportCharacterEpoch = Runtime.CharacterEpoch
 
                     task.spawn(function()
-                        success, result = pcall(function()
-                            return ServerBrowser:InvokeServer("teleport", chosen.JobId)
-                        end)
+                        local closureInCombat, closureInCombatKnown = readLocalInCombat()
+                        local mayTeleport = Runtime.Running
+                            and Runtime.HopPending
+                            and not Runtime.SafeMode
+                            and not Runtime.LocalDead
+                            and Runtime.Character == teleportCharacter
+                            and Runtime.CharacterEpoch == teleportCharacterEpoch
+                            and closureInCombatKnown
+                            and closureInCombat == false
+
+                        if mayTeleport then
+                            success, result = pcall(function()
+                                return ServerBrowser:InvokeServer("teleport", chosen.JobId)
+                            end)
+                        else
+                            invokeBlocked = true
+                            success = false
+                            result = "Combat or character state changed before teleport"
+                        end
+
                         invokeFinished = true
                     end)
 
@@ -2610,14 +2937,26 @@ local function runHopWorker()
                     initFailedConnection:Disconnect()
 
                     local interrupted = Runtime.SafeMode or Runtime.LocalDead
+                    local activeReason = determineHopReason()
+                    local followTimerReset = invokeBlocked and activeReason == "follow-timeout"
 
-                    if interrupted then
+                    if followTimerReset then
+                        stopHopPending("Combat/character change reset PlayerFollowTime")
+                    end
+
+                    if followTimerReset then
+                        -- A fresh target and full timer are required.
+                    elseif interrupted then
                         setStatus(Runtime.SafeMode and "SafeMode active; server hop queued" or "Respawn interrupted server hop")
+                    elseif invokeBlocked then
+                        setStatus("Combat/character state changed; server hop remains queued")
                     else
                         Runtime.FailedServers[chosen.JobId] = os.clock() + INTERNAL.FailedServerCooldown
                     end
 
-                    if interrupted then
+                    if followTimerReset or invokeBlocked then
+                        -- No teleport request was sent, so this server is not failed.
+                    elseif interrupted then
                         -- The queued hop resumes after SafeMode/respawn.
                     elseif not invokeFinished then
                         warnOnce("server-browser:invoke-timeout:" .. chosen.JobId, "The server teleport remote did not return before timeout; trying another server.")
@@ -2650,6 +2989,10 @@ requestHop = function(reason, detail)
 
     if Runtime.HopPending and requestedPriority < currentPriority then
         return
+    end
+
+    if reason == "follow-timeout" then
+        Runtime.FollowTimeoutHopDetail = detail or "PlayerFollowTime expired"
     end
 
     Runtime.HopPending = true
@@ -2696,6 +3039,7 @@ local function startFriendWorker()
         end
 
         Runtime.PendingSince[player] = nil
+        Runtime.NoProgressCharacters[player] = nil
 
         if Runtime.CurrentTarget == player then
             clearTarget("Target left the server")
@@ -2831,10 +3175,13 @@ function Runtime:Stop(reason)
 
     self.Running = false
     self.HopPending = false
+    self.FollowTimeoutHopDetail = nil
     self.TargetEpoch = self.TargetEpoch + 1
     self.CharacterEpoch = self.CharacterEpoch + 1
     self.SafeEpoch = self.SafeEpoch + 1
     self.AimActive = false
+    resetTargetTimers()
+    table.clear(self.NoProgressCharacters)
 
     if self.CameraBindName then
         pcall(function()
@@ -2847,6 +3194,7 @@ function Runtime:Stop(reason)
     restoreTargetHitbox()
     restoreLocalCollision()
     destroyAllESP()
+    disconnectConnections(self.TargetConnections)
     disconnectConnections(self.CharacterConnections)
     disconnectConnections(self.SafeZoneConnections)
     disconnectConnections(self.Connections)
@@ -2898,7 +3246,6 @@ if LocalPlayer.Character then
     bindCharacter(LocalPlayer.Character)
 end
 
-readBooleanAttribute(LocalPlayer, "InCombat", false)
 startServerAudit()
 
 return Runtime
