@@ -69,6 +69,15 @@ if typeof(ConfiguredHitboxSize) ~= "Vector3"
 end
 
 local HitboxEnabled = HitboxConfig.Enabled ~= false
+local ConfiguredHitboxTransparency = tonumber(HitboxConfig.Transparency)
+
+if not isFiniteNumber(ConfiguredHitboxTransparency) then
+    warn("[AutoBounty] Settings.Hitbox.Transparency is invalid; using 0.5.")
+    ConfiguredHitboxTransparency = 0.5
+elseif ConfiguredHitboxTransparency < 0 or ConfiguredHitboxTransparency > 1 then
+    warn("[AutoBounty] Settings.Hitbox.Transparency must be between 0 and 1; clamping it.")
+    ConfiguredHitboxTransparency = math.clamp(ConfiguredHitboxTransparency, 0, 1)
+end
 
 local INTERNAL = {
     MaxLevelDifference = 800,
@@ -215,6 +224,8 @@ local Runtime = {
     SafeZonesFolder = nil,
     SafeZonesReady = false,
     SafeZoneConnections = {},
+    CameraBindName = "AutoBountyCamera_" .. tostring(LocalPlayer.UserId),
+    CameraBound = false,
     GUI = nil,
     Labels = {},
 }
@@ -660,6 +671,10 @@ local function restoreTargetHitbox()
         if snapshot.Part.Massless == true then
             snapshot.Part.Massless = snapshot.Massless
         end
+
+        if snapshot.Part.Transparency == ConfiguredHitboxTransparency then
+            snapshot.Part.Transparency = snapshot.Transparency
+        end
     end)
 end
 
@@ -675,6 +690,7 @@ local function applyTargetHitbox(root)
             root.Size = ConfiguredHitboxSize
             root.CanCollide = false
             root.Massless = true
+            root.Transparency = ConfiguredHitboxTransparency
         end)
         return
     end
@@ -685,12 +701,14 @@ local function applyTargetHitbox(root)
         Size = root.Size,
         CanCollide = root.CanCollide,
         Massless = root.Massless,
+        Transparency = root.Transparency,
     }
 
     pcall(function()
         root.Size = ConfiguredHitboxSize
         root.CanCollide = false
         root.Massless = true
+        root.Transparency = ConfiguredHitboxTransparency
     end)
 end
 
@@ -1347,6 +1365,58 @@ local function AutoTween(goalCFrame, deltaTime, insideHitbox)
     root.CFrame = root.CFrame:Lerp(goalCFrame, math.clamp(alpha, 0, 1))
 end
 
+local function faceRootTowardTarget(localRoot, targetRoot)
+    local targetPosition = targetRoot.Position
+    local flatTarget = Vector3.new(targetPosition.X, localRoot.Position.Y, targetPosition.Z)
+
+    if (flatTarget - localRoot.Position).Magnitude > 0.001 then
+        localRoot.CFrame = CFrame.lookAt(localRoot.Position, flatTarget)
+    end
+end
+
+local function faceCameraTowardTarget()
+    if not Runtime.Running
+        or Runtime.LocalDead
+        or Runtime.SafeMode
+        or Runtime.HopPending
+        or not Runtime.InsideHitbox
+        or Runtime.Mode ~= "ENGAGE" then
+
+        return
+    end
+
+    local targetPlayer = Runtime.CurrentTarget
+    local targetInfo = Runtime.CurrentTargetInfo
+    local targetCharacter = targetInfo and targetInfo.Character
+    local targetHumanoid = targetInfo and targetInfo.Humanoid
+    local targetRoot = targetInfo and targetInfo.Root
+    local camera = Workspace.CurrentCamera
+
+    if not targetPlayer
+        or targetPlayer.Parent ~= Players
+        or not targetInfo
+        or targetInfo.Player ~= targetPlayer
+        or targetPlayer.Character ~= targetCharacter
+        or not targetCharacter
+        or not targetCharacter.Parent
+        or not targetHumanoid
+        or targetHumanoid.Parent ~= targetCharacter
+        or targetHumanoid.Health <= 0
+        or not targetRoot
+        or not targetRoot:IsA("BasePart")
+        or not targetRoot:IsDescendantOf(targetCharacter)
+        or not camera then
+
+        return
+    end
+
+    local cameraPosition = camera.CFrame.Position
+
+    if (targetRoot.Position - cameraPosition).Magnitude > 0.001 then
+        camera.CFrame = CFrame.lookAt(cameraPosition, targetRoot.Position)
+    end
+end
+
 local function installAimHook()
     if Environment.__AutoBountyAimHookInstalled then
         return
@@ -1853,6 +1923,29 @@ local function bindCharacter(character)
 end
 
 local function startMovementWorker()
+    pcall(function()
+        RunService:UnbindFromRenderStep(Runtime.CameraBindName)
+    end)
+
+    local cameraBindOk, cameraBindError = pcall(function()
+        RunService:BindToRenderStep(
+            Runtime.CameraBindName,
+            Enum.RenderPriority.Camera.Value + 1,
+            faceCameraTowardTarget
+        )
+    end)
+
+    if cameraBindOk then
+        Runtime.CameraBound = true
+    else
+        warnOnce(
+            "camera:bind",
+            "Could not bind camera target lock after CameraModule; using RenderStepped fallback: "
+                .. tostring(cameraBindError)
+        )
+        connect(RunService.RenderStepped, faceCameraTowardTarget)
+    end
+
     connect(RunService.Heartbeat, function(deltaTime)
         if not Runtime.Running or Runtime.LocalDead or Runtime.SafeMode or Runtime.HopPending then
             return
@@ -1961,6 +2054,10 @@ local function startMovementWorker()
         end
 
         AutoTween(targetRoot.CFrame, deltaTime, insideHitbox)
+
+        if insideHitbox then
+            faceRootTowardTarget(localRoot, targetRoot)
+        end
     end)
 end
 
@@ -2656,6 +2753,14 @@ function Runtime:Stop(reason)
     self.CharacterEpoch = self.CharacterEpoch + 1
     self.SafeEpoch = self.SafeEpoch + 1
     self.AimActive = false
+
+    if self.CameraBindName then
+        pcall(function()
+            RunService:UnbindFromRenderStep(self.CameraBindName)
+        end)
+        self.CameraBound = false
+    end
+
     releaseAllKeys()
     restoreTargetHitbox()
     restoreLocalCollision()
