@@ -12,6 +12,15 @@ local Workspace = game:GetService("Workspace")
 
 local Environment = getgenv and getgenv() or _G
 local Config = Environment.AutoBountyConfig
+local LoaderToken = Environment.__AutoBountyLoaderToken
+local BootstrapToken = {}
+
+Environment.__AutoBountyBootstrapToken = BootstrapToken
+
+local function bootstrapStillCurrent()
+    return Environment.__AutoBountyBootstrapToken == BootstrapToken
+        and (LoaderToken == nil or Environment.__AutoBountyLoaderToken == LoaderToken)
+end
 
 assert(type(Config) == "table", "AutoBountyConfig must be configured before loading AutoBounty.lua")
 assert(
@@ -127,26 +136,35 @@ if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
+if not bootstrapStillCurrent() then
+    return
+end
+
 local LocalPlayer = Players.LocalPlayer
 
-while not LocalPlayer do
-    Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+while not LocalPlayer and bootstrapStillCurrent() do
+    task.wait(0.1)
     LocalPlayer = Players.LocalPlayer
 end
 
-local DataLoaded = LocalPlayer:WaitForChild("DataLoaded", 60)
-
-assert(DataLoaded, "[AutoBounty] LocalPlayer.DataLoaded was not found within 60 seconds")
-assert(DataLoaded:IsA("BoolValue"), "[AutoBounty] LocalPlayer.DataLoaded must be a BoolValue")
-
-while not DataLoaded.Value do
-    DataLoaded:GetPropertyChangedSignal("Value"):Wait()
+if not bootstrapStillCurrent() then
+    return
 end
 
-local Remotes = ReplicatedStorage:WaitForChild("Remotes")
-local CommF = Remotes:WaitForChild("CommF_")
-local ServerBrowser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
+assert(LocalPlayer, "[AutoBounty] LocalPlayer is unavailable")
+print("[AutoBounty] Module started for " .. LocalPlayer.Name)
 
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 30)
+assert(Remotes, "[AutoBounty] ReplicatedStorage.Remotes was not found within 30 seconds")
+
+local CommF = Remotes:WaitForChild("CommF_", 30)
+assert(CommF, "[AutoBounty] ReplicatedStorage.Remotes.CommF_ was not found within 30 seconds")
+
+if not bootstrapStillCurrent() then
+    return
+end
+
+local ServerBrowser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
 local PreviousRuntime = Environment.__AutoBountyRuntime
 
 if PreviousRuntime and type(PreviousRuntime.Stop) == "function" then
@@ -155,10 +173,20 @@ if PreviousRuntime and type(PreviousRuntime.Stop) == "function" then
     end)
 end
 
--- This is deliberately the module's first gameplay mutation.
+if not bootstrapStillCurrent() then
+    return
+end
+
+-- Blox Fruits keeps DataLoaded false until the player selects a team.
+print("[AutoBounty] Selecting team: " .. Config.Team)
 local TeamRequestOk, TeamRequestResult = pcall(function()
     return CommF:InvokeServer("SetTeam", Config.Team)
 end)
+
+if not bootstrapStillCurrent() then
+    print("[AutoBounty] Startup superseded after team request")
+    return
+end
 
 assert(
     TeamRequestOk,
@@ -167,7 +195,7 @@ assert(
 
 local TeamDeadline = os.clock() + 15
 
-while os.clock() < TeamDeadline do
+while bootstrapStillCurrent() and os.clock() < TeamDeadline do
     if LocalPlayer.Team and LocalPlayer.Team.Name == Config.Team then
         break
     end
@@ -175,10 +203,64 @@ while os.clock() < TeamDeadline do
     task.wait(0.1)
 end
 
+if not bootstrapStillCurrent() then
+    return
+end
+
 assert(
     LocalPlayer.Team and LocalPlayer.Team.Name == Config.Team,
     "[AutoBounty] The requested team was not confirmed within 15 seconds"
 )
+
+print("[AutoBounty] Team confirmed; waiting for DataLoaded")
+
+local DataLoadedDeadline = os.clock() + 60
+local DataLoaded
+local StableDataLoaded
+local DataLoadedTrueSince
+
+while bootstrapStillCurrent() and os.clock() < DataLoadedDeadline do
+    local current = LocalPlayer:FindFirstChild("DataLoaded")
+    local currentTeam = LocalPlayer.Team
+    local teamMatches = currentTeam and currentTeam.Name == Config.Team
+
+    if current and not current:IsA("BoolValue") then
+        error("[AutoBounty] LocalPlayer.DataLoaded must be a BoolValue")
+    end
+
+    if teamMatches and current and current.Value then
+        if StableDataLoaded ~= current then
+            StableDataLoaded = current
+            DataLoadedTrueSince = os.clock()
+        elseif os.clock() - DataLoadedTrueSince >= 0.5 then
+            DataLoaded = current
+            break
+        end
+    else
+        StableDataLoaded = nil
+        DataLoadedTrueSince = nil
+    end
+
+    task.wait(0.1)
+end
+
+if not bootstrapStillCurrent() then
+    return
+end
+
+assert(
+    LocalPlayer.Team
+        and LocalPlayer.Team.Name == Config.Team
+        and DataLoaded
+        and DataLoaded.Parent == LocalPlayer
+        and DataLoaded.Value,
+    "[AutoBounty] The configured team and DataLoaded did not remain ready within 60 seconds"
+)
+print("[AutoBounty] DataLoaded is true; initializing systems")
+
+if not bootstrapStillCurrent() then
+    return
+end
 
 local Runtime = {
     Running = true,
