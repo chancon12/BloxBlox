@@ -2,7 +2,7 @@
 -- External options are intentionally limited to Team, Weapon, Attack, FastTP,
 -- AutoHop, ESP, NoClip, TweenSpeed, SafeModeY, health thresholds, hitbox settings,
 -- PlayerFollowTime, NoDamageTimeout, SkipPreviousTargets, OrbitEnabled, RaceV3, RaceV4,
--- ClickAttack, HitboxOffset, and optional ReadSkillCooldown.
+-- ClickAttack, HitboxOffset, SafeZoneRadius, and optional ReadSkillCooldown.
 -- Race flags belong in Config.Settings and require an explicit true.
 -- NoDamageTimeout is the seconds allowed for the first health drop after entering the hitbox.
 -- SkipPreviousTargets defaults to true; set false to allow previous targets through this filter.
@@ -10,6 +10,8 @@
 -- ClickAttack defaults to true; set false to disable normal attacks while skills are cooling down.
 -- HitboxOffset defaults to Vector3.new(0, 0, 0), relative to the target's CFrame:
 -- +X right, +Y up, -Z front, +Z behind. Positions stay inside the hitbox and above sea level.
+-- SafeZoneRadius defaults to 100 studs from each zone part's center (3D distance).
+-- For a zone inside a Model, use the nearest ancestor Model's valid PrimaryPart when available.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -68,6 +70,8 @@ local RawPlayerFollowTime = Settings.PlayerFollowTime
 local PlayerFollowTime = RawPlayerFollowTime == nil and 30 or tonumber(RawPlayerFollowTime)
 local RawNoDamageTimeout = Settings.NoDamageTimeout
 local NoDamageTimeout = RawNoDamageTimeout == nil and 30 or tonumber(RawNoDamageTimeout)
+local RawSafeZoneRadius = Settings.SafeZoneRadius
+local SafeZoneRadius = RawSafeZoneRadius == nil and 100 or tonumber(RawSafeZoneRadius)
 local HitboxOffset = Settings.HitboxOffset
 
 if HitboxOffset == nil then
@@ -114,6 +118,11 @@ end
 if not isFiniteNumber(NoDamageTimeout) or NoDamageTimeout <= 0 then
     warn("[AutoBounty] NoDamageTimeout must be a finite number above 0; using 30 seconds.")
     NoDamageTimeout = 30
+end
+
+if not isFiniteNumber(SafeZoneRadius) or SafeZoneRadius <= 0 then
+    warn("[AutoBounty] SafeZoneRadius must be a finite number above 0; using 100 studs.")
+    SafeZoneRadius = 100
 end
 
 if not isFiniteNumber(LowHealth) then
@@ -225,10 +234,16 @@ local ENTRANCES = {
     [7449423635] = {
         Vector3.new(-5083.26025390625, 314.6056823730469, -3175.673095703125),
         Vector3.new(-12471.169921875, 374.94024658203, -7551.677734375),
+        Vector3.new(28286.355, 14896.534, 102.625),
+        Vector3.new(5661.529, 1017.275, -334.962),
+        Vector3.new(-16813.439, 61.606, 304.874),
     },
     [100117331123089] = {
         Vector3.new(-5083.26025390625, 314.6056823730469, -3175.673095703125),
         Vector3.new(-12471.169921875, 374.94024658203, -7551.677734375),
+        Vector3.new(28286.355, 14896.534, 102.625),
+        Vector3.new(5661.529, 1017.275, -334.962),
+        Vector3.new(-16813.439, 61.606, 304.874),
     },
 }
 
@@ -880,18 +895,68 @@ local function startSafeZoneBinder()
     end)
 end
 
-local function isInsideSafeZone(worldPosition)
-    if not Runtime.SafeZonesFolder
-        or not Runtime.SafeZonesFolder.Parent
-        or not Runtime.SafeZonesReady then
+local function getSafeZoneCenterPart(part, folder)
+    if not part
+        or not part.Parent
+        or not part:IsA("BasePart")
+        or not part:IsDescendantOf(folder) then
 
         return nil
     end
 
-    for part in pairs(Runtime.SafeZoneParts) do
-        if part.Parent and pointInsidePart(part, worldPosition, 0.5) then
-            return true
+    local ancestor = part.Parent
+
+    while ancestor and ancestor ~= folder do
+        if ancestor:IsA("Model") then
+            local primary = ancestor.PrimaryPart
+
+            if primary
+                and primary.Parent
+                and primary:IsA("BasePart")
+                and primary:IsDescendantOf(ancestor)
+                and primary:IsDescendantOf(folder) then
+
+                return primary
+            end
         end
+
+        ancestor = ancestor.Parent
+    end
+
+    return part
+end
+
+local function isInsideSafeZone(worldPosition)
+    if not Runtime.SafeZonesFolder
+        or not Runtime.SafeZonesFolder.Parent
+        or not Runtime.SafeZonesReady
+        or not isFiniteVector3(worldPosition) then
+
+        return nil
+    end
+
+    local checkedCenters = {}
+    local hasValidCenter = false
+
+    for part in pairs(Runtime.SafeZoneParts) do
+        local centerPart = getSafeZoneCenterPart(part, Runtime.SafeZonesFolder)
+
+        if centerPart and not checkedCenters[centerPart] then
+            checkedCenters[centerPart] = true
+            local center = centerPart.Position
+
+            if isFiniteVector3(center) then
+                hasValidCenter = true
+
+                if (worldPosition - center).Magnitude <= SafeZoneRadius then
+                    return true
+                end
+            end
+        end
+    end
+
+    if not hasValidCenter then
+        return nil
     end
 
     return false
@@ -3617,7 +3682,7 @@ local function startMovementWorker()
             clearTarget("Waiting for SafeZones")
             return
         elseif inSafeZone then
-            clearTarget("Target entered a safe zone")
+            clearTarget("Target entered the safe-zone radius")
             return
         end
 
