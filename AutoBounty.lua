@@ -1,6 +1,7 @@
 -- GitHub-side Auto Bounty module.
--- External options are intentionally limited to Team, Weapon, FastTP, ESP,
--- AutoHop, NoClip, TweenSpeed, health thresholds, hitbox settings, and PlayerFollowTime.
+-- External options are intentionally limited to Team, Weapon, Attack, FastTP,
+-- AutoHop, ESP, NoClip, TweenSpeed, SafeModeY, health thresholds, hitbox settings,
+-- and PlayerFollowTime.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -42,10 +43,14 @@ local FastTPEnabled = Settings.FastTP ~= false
 local ESPEnabled = Settings.ESPPlayer ~= false
 local RawAutoHop = Settings.AutoHop
 local AutoHopEnabled = RawAutoHop == nil and true or RawAutoHop
+local RawAttack = Settings.Attack
+local AttackEnabled = RawAttack == nil and true or RawAttack
 local RawNoClip = Settings.NoClip
 local NoClipEnabled = RawNoClip == nil and true or RawNoClip
 local RawTweenSpeed = Settings.TweenSpeed
 local TweenSpeed = RawTweenSpeed == nil and 180 or tonumber(RawTweenSpeed)
+local RawSafeModeY = Settings.SafeModeY
+local SafeModeY = RawSafeModeY == nil and 1000 or tonumber(RawSafeModeY)
 local LowHealth = tonumber(Settings.LowHealth) or 8000
 local RecoveryHealth = tonumber(Settings.MaxHealth) or 10000
 local RawPlayerFollowTime = Settings.PlayerFollowTime
@@ -56,6 +61,11 @@ if type(AutoHopEnabled) ~= "boolean" then
     AutoHopEnabled = true
 end
 
+if type(AttackEnabled) ~= "boolean" then
+    warn("[AutoBounty] Attack must be true or false; using true.")
+    AttackEnabled = true
+end
+
 if type(NoClipEnabled) ~= "boolean" then
     warn("[AutoBounty] NoClip must be true or false; using true.")
     NoClipEnabled = true
@@ -64,6 +74,11 @@ end
 if not isFiniteNumber(TweenSpeed) or TweenSpeed <= 0 then
     warn("[AutoBounty] TweenSpeed must be a finite number above 0; using 180 studs per second.")
     TweenSpeed = 180
+end
+
+if not isFiniteNumber(SafeModeY) or SafeModeY <= 0 then
+    warn("[AutoBounty] SafeModeY must be a finite world Y position above 0; using 1000.")
+    SafeModeY = 1000
 end
 
 if not isFiniteNumber(PlayerFollowTime) or PlayerFollowTime <= 0 then
@@ -136,11 +151,6 @@ local INTERNAL = {
     ExternalHopURL = "https://raw.githubusercontent.com/WhiteX1208/Scripts/refs/heads/main/KaitunFindFruit.luau",
     ExternalHopDownloadTimeout = 15,
     ExternalHopMaxAbandonedDownloads = 3,
-    SafeEntrance = Vector3.new(
-        -5083.26025390625,
-        314.6056823730469,
-        -3175.673095703125
-    ),
 }
 
 local function isFiniteVector3(value)
@@ -408,6 +418,7 @@ local Runtime = {
     DamageObserved = false,
     AimActive = false,
     SafeMode = false,
+    SafeModeAtAltitude = false,
     LocalDead = true,
     Teleporting = false,
     EntranceBusy = false,
@@ -436,7 +447,9 @@ local Runtime = {
     HitboxSnapshot = nil,
     LocalCollisionSnapshot = {},
     LocalCollisionCharacter = nil,
+    AttackEnabled = AttackEnabled,
     AutoHopEnabled = AutoHopEnabled,
+    SafeModeY = SafeModeY,
     NoClipEnabled = NoClipEnabled,
     BodyClip = nil,
     BodyClipRoot = nil,
@@ -1855,7 +1868,8 @@ local function setTarget(player, targetInfo)
 
     if preparedHumanoid and preparedHumanoid.Parent then
         local healthConnection = preparedHumanoid.HealthChanged:Connect(function(health)
-            if not Runtime.Running
+            if not AttackEnabled
+                or not Runtime.Running
                 or Runtime.CurrentTarget ~= player
                 or Runtime.TargetEpoch ~= targetEpoch
                 or Runtime.DamageCheckEpoch ~= targetEpoch
@@ -1933,7 +1947,8 @@ local function setTarget(player, targetInfo)
 end
 
 local function canAttack(targetEpoch)
-    if not Runtime.Running
+    if not AttackEnabled
+        or not Runtime.Running
         or Runtime.TargetEpoch ~= targetEpoch
         or not Runtime.CurrentTarget
         or Runtime.SafeMode
@@ -2020,6 +2035,94 @@ local function AutoTween(goalCFrame, deltaTime, insideHitbox)
     if safeNextCFrame then
         root.CFrame = safeNextCFrame
     end
+end
+
+local function updateSafeModeMovement(deltaTime)
+    local character = Runtime.Character
+    local humanoid = Runtime.Humanoid
+    local root = Runtime.Root
+
+    if not Runtime.Running
+        or not Runtime.SafeMode
+        or Runtime.LocalDead
+        or not character
+        or character ~= LocalPlayer.Character
+        or not character.Parent
+        or not humanoid
+        or humanoid.Parent ~= character
+        or humanoid.Health <= 0 then
+
+        restoreLocalCollision()
+        return false
+    end
+
+    if not root
+        or not root.Parent
+        or not root:IsA("BasePart")
+        or not root:IsDescendantOf(character) then
+
+        restoreLocalCollision()
+
+        local replacementRoot = character:FindFirstChild("HumanoidRootPart")
+
+        if not replacementRoot or not replacementRoot:IsA("BasePart") then
+            Runtime.SafeModeAtAltitude = false
+
+            if Runtime.Status ~= "SafeMode: waiting for HumanoidRootPart" then
+                setStatus("SafeMode: waiting for HumanoidRootPart")
+            end
+
+            return false
+        end
+
+        Runtime.Root = replacementRoot
+        root = replacementRoot
+    end
+
+    if not isFiniteVector3(root.Position) then
+        restoreLocalCollision()
+        Runtime.SafeModeAtAltitude = false
+        return false
+    end
+
+    applyLocalNoClip()
+
+    local position = root.Position
+    local safeGoal = CFrame.new(position.X, SafeModeY, position.Z)
+        * root.CFrame.Rotation
+
+    AutoTween(safeGoal, deltaTime, false)
+
+    if not Runtime.Running
+        or not Runtime.SafeMode
+        or Runtime.LocalDead
+        or Runtime.Character ~= character
+        or Runtime.Humanoid ~= humanoid
+        or Runtime.Root ~= root
+        or LocalPlayer.Character ~= character
+        or not root.Parent
+        or not root:IsDescendantOf(character) then
+
+        restoreLocalCollision()
+        return false
+    end
+
+    local atAltitude = math.abs(root.Position.Y - SafeModeY) <= 0.5
+
+    if atAltitude ~= Runtime.SafeModeAtAltitude then
+        Runtime.SafeModeAtAltitude = atAltitude
+
+        if atAltitude then
+            setStatus(string.format(
+                "SafeMode: holding at Y %.1f until MaxHealth",
+                SafeModeY
+            ))
+        else
+            setStatus(string.format("SafeMode: moving to Y %.1f", SafeModeY))
+        end
+    end
+
+    return true
 end
 
 local function shouldAdvancePlayerChase(
@@ -2315,6 +2418,7 @@ local function installAimHook()
 
         if runtime
             and runtime.Running
+            and runtime.AttackEnabled
             and runtime.AimActive
             and runtime.InsideHitbox
             and runtime.AimPosition
@@ -2553,7 +2657,12 @@ local function startWeaponWorker()
         local weaponOrder = getWeaponOrder()
 
         while Runtime.Running do
-            if not Runtime.CurrentTarget or not Runtime.InsideHitbox then
+            if not AttackEnabled then
+                Runtime.AimActive = false
+                Runtime.CurrentTool = nil
+                releaseAllKeys()
+                task.wait(0.05)
+            elseif not Runtime.CurrentTarget or not Runtime.InsideHitbox then
                 Runtime.AimActive = false
                 Runtime.CurrentTool = nil
                 releaseAllKeys()
@@ -2623,25 +2732,16 @@ enterSafeMode = function()
 
     Runtime.SafeMode = true
     Runtime.SafeEpoch = Runtime.SafeEpoch + 1
-    local safeEpoch = Runtime.SafeEpoch
-    local characterEpoch = Runtime.CharacterEpoch
+    Runtime.SafeModeAtAltitude = false
 
     if cancelFollowTimeoutHop then
         cancelFollowTimeoutHop("SafeMode reset PlayerFollowTime")
     end
 
     clearTarget()
+    applyLocalNoClip()
     Runtime.Mode = "SAFE_MODE"
-    setStatus("SafeMode: low health")
-
-    task.spawn(function()
-        invokeEntrance(INTERNAL.SafeEntrance, "SafeMode", nil, function()
-            return Runtime.SafeMode
-                and not Runtime.LocalDead
-                and Runtime.SafeEpoch == safeEpoch
-                and Runtime.CharacterEpoch == characterEpoch
-        end)
-    end)
+    setStatus(string.format("SafeMode: moving to Y %.1f", SafeModeY))
 end
 
 exitSafeMode = function()
@@ -2651,13 +2751,15 @@ exitSafeMode = function()
 
     Runtime.SafeMode = false
     Runtime.SafeEpoch = Runtime.SafeEpoch + 1
+    Runtime.SafeModeAtAltitude = false
+    restoreLocalCollision()
     Runtime.Mode = Runtime.HopPending and "HOP_WAIT" or "SCAN"
 
     if not Runtime.HopPending then
         Runtime.EmptySince = nil
     end
 
-    setStatus(Runtime.HopPending and "Recovered; resuming server hop" or "Recovered; scanning")
+    setStatus(Runtime.HopPending and "Recovered; resuming server hop" or "Recovered; returning to combat")
     ensureCombatAttributes()
     startPvPEnable()
 end
@@ -2725,6 +2827,7 @@ local function handleLocalDeath(characterEpoch)
     Runtime.LocalDead = true
     Runtime.SafeMode = false
     Runtime.SafeEpoch = Runtime.SafeEpoch + 1
+    Runtime.SafeModeAtAltitude = false
 
     if cancelFollowTimeoutHop then
         cancelFollowTimeoutHop("Local death reset PlayerFollowTime")
@@ -2747,6 +2850,7 @@ local function bindCharacter(character)
     disconnectConnections(Runtime.CharacterConnections)
     Runtime.LocalDead = true
     Runtime.SafeMode = false
+    Runtime.SafeModeAtAltitude = false
     clearTarget()
     Runtime.Mode = "RESPAWN"
     setStatus("Binding character")
@@ -2859,7 +2963,7 @@ local function startMovementWorker()
 
         enforceLocalYFloor()
 
-        if Runtime.LocalDead or Runtime.SafeMode then
+        if Runtime.LocalDead then
             return
         end
 
@@ -2870,8 +2974,23 @@ local function startMovementWorker()
             return
         end
 
+        if Runtime.SafeMode then
+            handleHealthChanged(humanoid.Health, Runtime.CharacterEpoch)
+
+            if Runtime.SafeMode then
+                updateSafeModeMovement(deltaTime)
+            end
+
+            return
+        end
+
         if humanoid.Health <= (Runtime.EffectiveLowHealth or LowHealth) then
             enterSafeMode()
+
+            if Runtime.SafeMode then
+                updateSafeModeMovement(deltaTime)
+            end
+
             return
         end
 
@@ -3033,7 +3152,8 @@ local function startMovementWorker()
         local wasInsideHitbox = Runtime.InsideHitbox
         Runtime.InsideHitbox = insideHitbox
 
-        if insideHitbox
+        if AttackEnabled
+            and insideHitbox
             and not wasInsideHitbox
             and Runtime.DamageCheckEpoch ~= targetEpoch then
 
@@ -3045,7 +3165,8 @@ local function startMovementWorker()
             Runtime.DamageObserved = false
         end
 
-        if Runtime.DamageCheckEpoch == targetEpoch
+        if AttackEnabled
+            and Runtime.DamageCheckEpoch == targetEpoch
             and Runtime.DamageCheckCharacterEpoch == characterEpoch
             and Runtime.DamageCheckDeadline
             and not Runtime.DamageObserved then
@@ -4015,6 +4136,7 @@ function Runtime:Stop(reason)
     self.TargetEpoch = self.TargetEpoch + 1
     self.CharacterEpoch = self.CharacterEpoch + 1
     self.SafeEpoch = self.SafeEpoch + 1
+    self.SafeModeAtAltitude = false
     self.AimActive = false
     resetTargetTimers()
     table.clear(self.NoProgressCharacters)
