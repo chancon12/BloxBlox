@@ -1,8 +1,11 @@
 -- GitHub-side Auto Bounty module.
 -- External options are intentionally limited to Team, Weapon, Attack, FastTP,
 -- AutoHop, ESP, NoClip, TweenSpeed, SafeModeY, health thresholds, hitbox settings,
--- PlayerFollowTime, RaceV3, RaceV4, and optional ReadSkillCooldown.
+-- PlayerFollowTime, NoDamageTimeout, SkipPreviousTargets, RaceV3, RaceV4,
+-- and optional ReadSkillCooldown.
 -- Race flags belong in Config.Settings and require an explicit true.
+-- NoDamageTimeout is the seconds allowed for the first health drop after entering the hitbox.
+-- SkipPreviousTargets defaults to true; set false to allow previous targets through this filter.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -42,6 +45,7 @@ end
 
 local FastTPEnabled = Settings.FastTP ~= false
 local ESPEnabled = Settings.ESPPlayer ~= false
+local SkipPreviousTargets = Settings.SkipPreviousTargets ~= false
 local RawAutoHop = Settings.AutoHop
 local AutoHopEnabled = RawAutoHop == nil and true or RawAutoHop
 local RawAttack = Settings.Attack
@@ -56,6 +60,8 @@ local LowHealth = tonumber(Settings.LowHealth) or 8000
 local RecoveryHealth = tonumber(Settings.MaxHealth) or 10000
 local RawPlayerFollowTime = Settings.PlayerFollowTime
 local PlayerFollowTime = RawPlayerFollowTime == nil and 30 or tonumber(RawPlayerFollowTime)
+local RawNoDamageTimeout = Settings.NoDamageTimeout
+local NoDamageTimeout = RawNoDamageTimeout == nil and 30 or tonumber(RawNoDamageTimeout)
 
 if type(AutoHopEnabled) ~= "boolean" then
     warn("[AutoBounty] AutoHop must be true or false; using true.")
@@ -85,6 +91,11 @@ end
 if not isFiniteNumber(PlayerFollowTime) or PlayerFollowTime <= 0 then
     warn("[AutoBounty] PlayerFollowTime must be a finite number above 0; using 30 seconds.")
     PlayerFollowTime = 30
+end
+
+if not isFiniteNumber(NoDamageTimeout) or NoDamageTimeout <= 0 then
+    warn("[AutoBounty] NoDamageTimeout must be a finite number above 0; using 30 seconds.")
+    NoDamageTimeout = 30
 end
 
 if not isFiniteNumber(LowHealth) then
@@ -1389,7 +1400,7 @@ local function evaluateTarget(player)
         return false, "self-or-left"
     end
 
-    if Runtime.PreviouslyTargeted[player.UserId] then
+    if SkipPreviousTargets and Runtime.PreviouslyTargeted[player.UserId] then
         return false, "previously-targeted"
     end
 
@@ -1578,7 +1589,7 @@ local function resetTargetTimers()
 end
 
 local function clearTarget(reason)
-    if Runtime.CurrentTarget then
+    if SkipPreviousTargets and Runtime.CurrentTarget then
         Runtime.PreviouslyTargeted[Runtime.CurrentTarget.UserId] = true
     end
 
@@ -3538,7 +3549,7 @@ local function startMovementWorker()
             and not wasInsideHitbox
             and Runtime.DamageCheckEpoch ~= targetEpoch then
 
-            Runtime.DamageCheckDeadline = now + PlayerFollowTime
+            Runtime.DamageCheckDeadline = now + NoDamageTimeout
             Runtime.DamageCheckLastHealth = targetHumanoid.Health
             Runtime.DamageCheckEpoch = targetEpoch
             Runtime.DamageCheckCharacterEpoch = characterEpoch
