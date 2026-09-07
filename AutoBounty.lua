@@ -3212,34 +3212,49 @@ local function startMovementWorker()
         end
 
         if insideHitbox then
-            if Runtime.Mode ~= "ENGAGE" then
-                Runtime.Mode = "ENGAGE"
-                setStatus("Engaging " .. player.Name)
-            end
-        elseif Runtime.Mode ~= "CHASE" then
-            Runtime.Mode = "CHASE"
-            Runtime.AimActive = false
-            releaseAllKeys()
-            setStatus("Chasing " .. player.Name)
-        end
+    local center = targetRoot.Position
+    local hitboxSize = HitboxEnabled and ConfiguredHitboxSize or targetRoot.Size
 
-        local chaseGoal = getPlayerChaseGoal(localRoot, targetRoot)
+    -- Maximum radius: 8 studs. Reduce it to fit smaller hitboxes.
+    local radius = math.min(
+        8,
+        math.min(hitboxSize.X, hitboxSize.Y, hitboxSize.Z) * 0.4
+    )
 
-        if chaseGoal and shouldAdvancePlayerChase(
-            now,
-            targetEpoch,
-            characterEpoch,
-            player,
-            character,
-            targetRoot,
-            localRoot
-        ) then
-            AutoTween(chaseGoal, deltaTime, insideHitbox)
-        end
+    local offset = localRoot.Position - center
+    local angle = math.atan2(offset.Z, offset.X)
 
-        if insideHitbox then
-            faceRootTowardTarget(localRoot, targetRoot)
-        end
+    -- Maximum rotation: 180 degrees/second, limited by your tween speed.
+    local angularSpeed = math.min(
+        math.rad(180),
+        TweenSpeed * INTERNAL.InHitboxSpeedMultiplier * 0.8 / radius
+    )
+
+    angle = angle + angularSpeed * math.clamp(deltaTime, 0, 0.1)
+
+    local orbitPosition = center + Vector3.new(
+        math.cos(angle) * radius,
+        0,
+        math.sin(angle) * radius
+    )
+
+    AutoTween(CFrame.lookAt(orbitPosition, center), deltaTime, true)
+    faceRootTowardTarget(localRoot, targetRoot)
+else
+    local chaseGoal = getPlayerChaseGoal(localRoot, targetRoot)
+
+    if chaseGoal and shouldAdvancePlayerChase(
+        now,
+        targetEpoch,
+        characterEpoch,
+        player,
+        character,
+        targetRoot,
+        localRoot
+    ) then
+        AutoTween(chaseGoal, deltaTime, false)
+    end
+end
     end)
 end
 
