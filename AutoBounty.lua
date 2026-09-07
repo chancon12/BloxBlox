@@ -5,7 +5,8 @@
 -- ClickAttack, HitboxOffset, SafeZoneRadius, combo timings, panic movement,
 -- SeaHeightFirst, SeaHeightStallTimeout, and optional ReadSkillCooldown.
 -- Race flags belong in Config.Settings and require an explicit true.
--- NoDamageTimeout is the seconds allowed for the first health drop after entering the hitbox.
+-- NoDamageTimeout allows time for a target health drop or confirmed local InCombat after hitbox entry.
+-- Either qualifies the current target for this check until a different target acquisition.
 -- SkipPreviousTargets defaults to true; set false to allow previous targets through this filter.
 -- OrbitEnabled defaults to true; set false to follow the target directly without circling.
 -- ClickAttack defaults to true; set false to disable normal attacks while skills are cooling down.
@@ -3934,8 +3935,13 @@ local function startMovementWorker()
             and not Runtime.DamageObserved then
 
             local currentTargetHealth = targetHumanoid.Health
+            local currentInCombat, currentInCombatKnown = readLocalInCombat()
 
-            if not Runtime.DamageCheckExpired
+            if currentInCombatKnown and currentInCombat == true then
+                -- Keep the epoch so this check cannot rearm for the same acquisition.
+                Runtime.DamageCheckDeadline = nil
+                Runtime.DamageCheckExpired = false
+            elseif not Runtime.DamageCheckExpired
                 and now < Runtime.DamageCheckDeadline
                 and Runtime.DamageCheckLastHealth
                 and currentTargetHealth < Runtime.DamageCheckLastHealth then
@@ -3951,7 +3957,7 @@ local function startMovementWorker()
                     and Runtime.CharacterEpoch == characterEpoch then
 
                     Runtime.NoProgressCharacters[player] = character
-                    clearTarget("Target health did not decrease; switching target")
+                    clearTarget("No target health decrease or confirmed local combat; switching target")
                     return
                 end
             end
