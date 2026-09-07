@@ -118,8 +118,6 @@ local INTERNAL = {
     PvPRetryDelay = 0.75,
     PvPMaxAttempts = 5,
     InHitboxSpeedMultiplier = 2 / 7,
-    MovementUpdateInterval = 0.01,
-    MovementMaxDeltaTime = 0.05,
     MinimumTweenY = 0,
     VerticalChaseDistance = 1000,
     SafeZoneRetreatInset = 0.5,
@@ -2781,7 +2779,7 @@ local function startMovementWorker()
         connect(RunService.RenderStepped, faceCameraTowardTarget)
     end
 
-    local function movementStep(deltaTime)
+    connect(RunService.Heartbeat, function(deltaTime)
         if not Runtime.Running then
             return
         end
@@ -3023,31 +3021,6 @@ local function startMovementWorker()
 
         if insideHitbox then
             faceRootTowardTarget(localRoot, targetRoot)
-        end
-    end
-
-    task.spawn(function()
-        local lastStepAt = os.clock() - INTERNAL.MovementUpdateInterval
-
-        while Runtime.Running do
-            local now = os.clock()
-            local deltaTime = math.clamp(
-                now - lastStepAt,
-                0,
-                INTERNAL.MovementMaxDeltaTime
-            )
-            lastStepAt = now
-            local stepOk, stepError = pcall(movementStep, deltaTime)
-
-            if not stepOk then
-                warnOnce(
-                    "movement:step",
-                    "Movement update failed but the 0.01-second worker will continue: "
-                        .. tostring(stepError)
-                )
-            end
-
-            task.wait(INTERNAL.MovementUpdateInterval)
         end
     end)
 end
