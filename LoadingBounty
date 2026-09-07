@@ -1,0 +1,161 @@
+local MODULE_URL = "https://raw.githubusercontent.com/chancon12/BloxBlox/refs/heads/main/AutoBounty.lua"
+local Environment = getgenv()
+local LoaderToken = {}
+
+Environment.__AutoBountyLoaderToken = LoaderToken
+
+local function loaderStillCurrent()
+    return Environment.__AutoBountyLoaderToken == LoaderToken
+end
+
+print("[AutoBounty Loader] Started")
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+if not loaderStillCurrent() then
+    return
+end
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+while not LocalPlayer and loaderStillCurrent() do
+    task.wait(0.1)
+    LocalPlayer = Players.LocalPlayer
+end
+
+if not loaderStillCurrent() then
+    return
+end
+
+assert(LocalPlayer, "[AutoBounty Loader] LocalPlayer is unavailable")
+
+Environment.AutoBountyConfig = {
+    Team = "Pirates", -- "Pirates" or "Marines"
+
+    Weapon = {
+        -- This is the exact switch order used by the one weapon worker.
+        Order = {"Melee", "Blox Fruit", "Sword", "Gun"},
+
+        Melee = {
+            Enabled = true,
+            Name = "Auto", -- Exact tool name, or Auto to match ToolTip == "Melee"
+            Delay = 0.10,
+            Skills = {
+                Z = {Enabled = true, Hold = 0},
+                X = {Enabled = true, Hold = 0},
+                C = {Enabled = true, Hold = 0},
+                V = {Enabled = false, Hold = 0},
+                F = {Enabled = false, Hold = 0},
+            },
+        },
+
+        ["Blox Fruit"] = {
+            Enabled = true,
+            Name = "Auto", -- Exact fruit tool name, or Auto for ToolTip == "Blox Fruit"
+            Delay = 0.10,
+            Skills = {
+                Z = {Enabled = true, Hold = 0},
+                X = {Enabled = true, Hold = 0},
+                C = {Enabled = true, Hold = 0},
+                V = {Enabled = true, Hold = 0},
+                F = {Enabled = false, Hold = 0},
+            },
+        },
+
+        Sword = {
+            Enabled = true,
+            Name = "Auto", -- Example exact name: "Cursed Dual Katana"
+            Delay = 0.10,
+            Skills = {
+                Z = {Enabled = true, Hold = 0},
+                X = {Enabled = true, Hold = 0},
+                C = {Enabled = false, Hold = 0},
+                V = {Enabled = false, Hold = 0},
+                F = {Enabled = false, Hold = 0},
+            },
+        },
+
+        Gun = {
+            Enabled = true,
+            Name = "Auto", -- Example exact name: "Soul Guitar"
+            Delay = 0.10,
+            Skills = {
+                Z = {Enabled = true, Hold = 0},
+                X = {Enabled = true, Hold = 0},
+                C = {Enabled = false, Hold = 0},
+                V = {Enabled = false, Hold = 0},
+                F = {Enabled = false, Hold = 0},
+            },
+        },
+    },
+
+    Settings = {
+        ClickAttack = false,
+        Attack = true, -- master switch for automatic weapon switching and skill casting
+        FastTP = true,
+        ESPPlayer = true,
+        AutoHop = true, -- false keeps hunting in the current server and never loads the hop script
+        NoClip = true, -- disables collision for every Character BasePart and adds BodyClip while moving
+        PlayerFollowTime = 120, -- Switch after 120 seconds without combat
+        NoDamageTimeout = 5,  -- Switch if no health drops within 30 seconds of entering hitbox
+        SkipPreviousTargets = true,
+        SafeModeY = 2000, -- absolute world Y used by the low-health SafeMode tween
+        LowHealth = 8000,
+        MaxHealth = 10000,
+        RaceV3 = true,
+        RaceV4 = true,
+        OrbitEnabled = true,
+        HitboxOffset = Vector3.new(0, 0, 0), -- 5 studs above, 6 behind
+        SafeZoneRadius = 500,
+        SeaHeightFirst = false,
+        ComboDelay = 0, -- No extra delay between skills
+        ComboHold = 0, -- Release each key after the minimum input wait
+
+        Hitbox = {
+            Enabled = true,
+            Size = Vector3.new(30, 30, 30),
+            Transparency = 0.5, -- 0 = visible, 1 = invisible
+        },
+
+        TweenHitbox = {
+        Enabled = true,
+        Size = Vector3.new(200, 200, 200),
+        TimeMultiplier = 0.7,
+        },
+
+        Aimbot = {
+        Gun = true,    -- Aim basic gun shots
+        Skills = true, -- Aim combo skills
+        },
+    },
+}
+
+task.wait(5)
+print("[AutoBounty Loader] Downloading module")
+
+local downloadOk, source = pcall(function()
+    return game:HttpGet(MODULE_URL)
+end)
+
+if not loaderStillCurrent() then
+    print("[AutoBounty Loader] Superseded by a newer loader run")
+    return
+end
+
+assert(downloadOk, "[AutoBounty Loader] Download failed: " .. tostring(source))
+print("[AutoBounty Loader] Downloaded " .. tostring(#source) .. " bytes")
+
+local chunk, compileError = loadstring(source)
+
+assert(chunk, "[AutoBounty Loader] Compile failed: " .. tostring(compileError))
+
+if not loaderStillCurrent() then
+    print("[AutoBounty Loader] Superseded before module start")
+    return
+end
+
+print("[AutoBounty Loader] Starting module")
+return chunk()
