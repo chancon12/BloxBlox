@@ -4,7 +4,7 @@
 -- PlayerFollowTime, NoDamageTimeout, SkipPreviousTargets, OrbitEnabled, RaceV3, RaceV4,
 -- ClickAttack, HitboxOffset, TweenHitbox, SafeZoneRadius, combo timings, panic movement,
 -- SeaHeightFirst, SeaHeightStallTimeout, GunOpenerEnabled, GunEngageDistance, MaxTargetDistance,
--- and optional ReadSkillCooldown.
+-- Aimbot, and optional ReadSkillCooldown.
 -- Race flags belong in Config.Settings and require an explicit true.
 -- NoDamageTimeout allows time for a target health drop or confirmed local InCombat after hitbox entry.
 -- Either qualifies the current target for this check until a different target acquisition.
@@ -27,17 +27,21 @@
 -- TweenHitbox defaults: Enabled=true, Size=Vector3.new(100,100,100), TimeMultiplier=0.2.
 -- This separate target-relative box multiplies chase/orbit tween duration, including the existing hitbox slowdown.
 -- Any finite multiplier above 0 is accepted: 0.2 gives one-fifth duration (5x speed).
--- GunOpenerEnabled defaults to true; fire one RemoteFunctionShoot opener within GunEngageDistance (100 studs).
+-- GunOpenerEnabled defaults to true; send one aimed gun click within GunEngageDistance (100 studs).
 -- Other weapons start inside the combat hitbox. The opener requires Weapon.Gun.Enabled, not Gun skill flags.
--- Gun lookup/equip can retry up to 3 times, 0.25s apart; an invoked shot is never repeated for that acquisition.
+-- Gun lookup/equip/readiness can retry up to 3 times, 0.25s apart; a click is not repeated for that acquisition.
+-- Settings.Aimbot = {Gun=true, Skills=true}; false disables both. Reload after changing these settings.
+-- Gun controls basic-shot camera/cursor aim; Skills controls skill aim/facing. Attacks remain enabled independently.
 -- MaxTargetDistance defaults to 10000 studs (3D): direct targets first, then entrance routes.
+-- With FastTP enabled, new targets also use a closer entrance before chasing when over 300 studs away.
+-- Optional shortcuts are checked once per acquisition; failed shortcuts fall back to direct chasing.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Teams = game:GetService("Teams")
 local RunService = game:GetService("RunService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
-local VirtualUser = game:GetService("VirtualUser")
+local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 
 local Environment = getgenv and getgenv() or _G
@@ -62,6 +66,7 @@ local Settings = type(Config.Settings) == "table" and Config.Settings or {}
 local WeaponConfig = type(Config.Weapon) == "table" and Config.Weapon or {}
 local HitboxConfig = type(Settings.Hitbox) == "table" and Settings.Hitbox or {}
 local TweenHitboxConfig = type(Settings.TweenHitbox) == "table" and Settings.TweenHitbox or {}
+local AimbotConfig = type(Settings.Aimbot) == "table" and Settings.Aimbot or {}
 
 local function isFiniteNumber(value)
     return type(value) == "number"
@@ -76,6 +81,8 @@ local SkipPreviousTargets = Settings.SkipPreviousTargets ~= false
 local OrbitEnabled = Settings.OrbitEnabled ~= false
 local ClickAttackEnabled = Settings.ClickAttack ~= false
 local GunOpenerEnabled = Settings.GunOpenerEnabled ~= false
+local GunAimbotEnabled = Settings.Aimbot ~= false and AimbotConfig.Gun ~= false
+local SkillAimbotEnabled = Settings.Aimbot ~= false and AimbotConfig.Skills ~= false
 local GunEngageDistance = Settings.GunEngageDistance == nil
     and 100 or tonumber(Settings.GunEngageDistance)
 local MaxTargetDistance = Settings.MaxTargetDistance == nil
@@ -253,6 +260,8 @@ local INTERNAL = {
     SeaHeightPauseDuration = 0.1,
     FastTPArrivalTimeout = 3,
     FastTPCooldown = 2,
+    FastTPMinimumDistance = 300,
+    FastTPArrivalTolerance = 100,
     ServerRetryDelay = 3,
     ExternalHopURL = "https://raw.githubusercontent.com/WhiteX1208/Scripts/refs/heads/main/KaitunFindFruit.luau",
     ExternalHopDownloadTimeout = 15,
@@ -531,9 +540,9 @@ local Runtime = {
     DamageCheckCharacterEpoch = nil,
     DamageCheckExpired = false,
     DamageObserved = false,
+    AttackBusy = false,
     AimActive = false,
     GunAimActive = false,
-    GunShotRequest = nil,
     GunShotOwner = nil,
     GunMouseHeld = nil,
     SafeMode = false,
@@ -1038,9 +1047,20 @@ Runtime.ReleaseGunClick = function(owner)
         return
     end
 
+    local held = Runtime.GunMouseHeld
     Runtime.GunMouseHeld = nil
+    local x, y = held.X, held.Y
+
+    if held.ManualCursor then
+        local cursorOk, cursor = pcall(UserInputService.GetMouseLocation, UserInputService)
+
+        if cursorOk and isFiniteNumber(cursor.X) and isFiniteNumber(cursor.Y) then
+            x, y = math.floor(cursor.X + 0.5), math.floor(cursor.Y + 0.5)
+        end
+    end
+
     pcall(function()
-        VirtualUser:Button1Up(Vector2.new(1280, 672))
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 0)
     end)
 end
 
@@ -1411,7 +1431,7 @@ local function findFriendInServer()
     return nil
 end
 
-local function getTargetRoute(player, info)
+local function getTargetRoute(player, info, preferEntrance)
     local localRoot = Runtime.Root
     local targetRoot = info and info.Root
 
@@ -1430,12 +1450,20 @@ local function getTargetRoute(player, info)
     end
 
     local directDistance = (targetRoot.Position - localRoot.Position).Magnitude
+    local directRoute
 
     if directDistance < MaxTargetDistance then
-        return {
+        directRoute = {
             Kind = "direct",
             Distance = directDistance,
         }
+
+        if not preferEntrance
+            or not FastTPEnabled
+            or directDistance <= INTERNAL.FastTPMinimumDistance then
+
+            return directRoute
+        end
     end
 
     if not FastTPEnabled then
@@ -1454,7 +1482,10 @@ local function getTargetRoute(player, info)
         if isFiniteVector3(entrance) then
             local distance = (targetRoot.Position - entrance).Magnitude
 
-            if distance < MaxTargetDistance then
+            if distance < MaxTargetDistance
+                and (not directRoute or (distance < directDistance
+                    and (entrance - localRoot.Position).Magnitude > INTERNAL.FastTPArrivalTolerance)) then
+
                 if failedEntrances and failedEntrances[entrance] then
                     hasFailedRoute = true
                 elseif distance < selectedDistance then
@@ -1470,7 +1501,12 @@ local function getTargetRoute(player, info)
             Kind = "entrance",
             Distance = selectedDistance,
             Entrance = selectedEntrance,
+            Shortcut = directRoute ~= nil,
         }
+    end
+
+    if directRoute then
+        return directRoute
     end
 
     return nil, hasFailedRoute and "entrance-route-failed" or "target-out-of-range"
@@ -1722,6 +1758,7 @@ local function clearTarget(reason)
     end
 
     Runtime.TargetEpoch = Runtime.TargetEpoch + 1
+    Runtime.AttackBusy = false
     Runtime.AimActive = false
     Runtime.GunAimActive = false
     Runtime.AimPosition = nil
@@ -1904,7 +1941,7 @@ local function nearestEntrance(targetPosition)
     return selected, selectedDistance
 end
 
-local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer, entrance)
+local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer, entrance, optionalShortcut)
     if not FastTPEnabled or not entrance or not isFiniteVector3(entrance) then
         return false, "unavailable"
     end
@@ -1950,11 +1987,31 @@ local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer, entr
         return false, "cancelled"
     end
 
-    if (localRoot.Position - targetRoot.Position).Magnitude < MaxTargetDistance then
+    local function targetInRange()
+        return (localRoot.Position - targetRoot.Position).Magnitude < MaxTargetDistance
+    end
+
+    local function arrived()
+        return targetInRange()
+            and (not optionalShortcut
+                or (localRoot.Position - entrance).Magnitude <= INTERNAL.FastTPArrivalTolerance)
+    end
+
+    local function entranceStillUseful()
+        local directDistance = (localRoot.Position - targetRoot.Position).Magnitude
+        local entranceDistance = (entrance - targetRoot.Position).Magnitude
+
+        return entranceDistance < MaxTargetDistance
+            and (not optionalShortcut or (directDistance > INTERNAL.FastTPMinimumDistance
+                and entranceDistance < directDistance
+                and (localRoot.Position - entrance).Magnitude > INTERNAL.FastTPArrivalTolerance))
+    end
+
+    if arrived() then
         return true
     end
 
-    if (entrance - targetRoot.Position).Magnitude >= MaxTargetDistance then
+    if not entranceStillUseful() then
         return false, "route-moved"
     end
 
@@ -1978,26 +2035,26 @@ local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer, entr
             return requestAllowed
                 and os.clock() < deadline
                 and targetStillValid()
-                and (entrance - targetRoot.Position).Magnitude < MaxTargetDistance
-                and (localRoot.Position - targetRoot.Position).Magnitude >= MaxTargetDistance
+                and not arrived()
+                and entranceStillUseful()
         end)
         requestFinished = true
     end)
 
     while os.clock() < deadline and targetStillValid() do
-        -- Success means the target is actually in chase range, not just a 50-stud movement.
-        if (localRoot.Position - targetRoot.Position).Magnitude < MaxTargetDistance then
+        -- Shortcuts must reach the entrance; already being below the range cap is not arrival.
+        if arrived() then
             requestAllowed = false
             return true
         end
 
+        if not entranceStillUseful() then
+            requestAllowed = false
+            return false, "route-moved"
+        end
+
         if requestFinished and not requestSucceeded then
             requestAllowed = false
-
-            if (entrance - targetRoot.Position).Magnitude >= MaxTargetDistance then
-                return false, "route-moved"
-            end
-
             return false, "request-failed"
         end
 
@@ -2010,11 +2067,11 @@ local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer, entr
         return false, "cancelled"
     end
 
-    if (localRoot.Position - targetRoot.Position).Magnitude < MaxTargetDistance then
+    if arrived() then
         return true
     end
 
-    if (entrance - targetRoot.Position).Magnitude >= MaxTargetDistance then
+    if not entranceStillUseful() then
         return false, "route-moved"
     end
 
@@ -2115,8 +2172,20 @@ local function setTarget(player, targetInfo)
 
         startPvPEnable()
 
+        -- Candidate priority stays direct-first; compare travel routes only for this acquisition.
+        route = getTargetRoute(player, preparedInfo, true)
+
+        if not route then
+            clearTarget("Target moved out of range; checking other routes")
+            return
+        end
+
+        preparedInfo.Route = route
+
         if route.Kind == "entrance" then
-            local arrived, failure = fastTeleportForTarget(preparedInfo, targetEpoch, player, route.Entrance)
+            local arrived, failure = fastTeleportForTarget(
+                preparedInfo, targetEpoch, player, route.Entrance, route.Shortcut
+            )
 
             if Runtime.TargetEpoch ~= targetEpoch or Runtime.CurrentTarget ~= player then
                 return
@@ -2134,8 +2203,10 @@ local function setTarget(player, targetInfo)
                     failures.Entrances[route.Entrance] = true
                 end
 
-                clearTarget("Entrance route unavailable; checking other targets or entrances")
-                return
+                if not route.Shortcut or failure == "cancelled" then
+                    clearTarget("Entrance route unavailable; checking other targets or entrances")
+                    return
+                end
             end
         end
 
@@ -2265,12 +2336,12 @@ local function canAttack(targetEpoch, attackMode, readOnly)
     return true
 end
 
-Runtime.IsGunAimAllowed = function()
+Runtime.IsGunAttackAllowed = function()
     local tool = Runtime.CurrentTool
     local gunConfig = WeaponConfig.Gun
 
     if not Runtime.GunAimActive
-        or not Runtime.AimActive
+        or not Runtime.AttackBusy
         or not tool or tool.Parent ~= Runtime.Character
         or type(gunConfig) ~= "table"
         or gunConfig.Enabled ~= true then
@@ -2288,6 +2359,10 @@ Runtime.IsGunAimAllowed = function()
     end
 
     return matches and canAttack(Runtime.TargetEpoch, "GunApproach", true)
+end
+
+Runtime.IsGunAimAllowed = function()
+    return GunAimbotEnabled and Runtime.AimActive and Runtime.IsGunAttackAllowed()
 end
 
 local function getTargetTweenTimeMultiplier(localRoot, targetRoot)
@@ -2755,11 +2830,11 @@ local function getHitboxMovementCFrame(localRoot, targetRoot, requestedPosition)
 
     local flatTarget = Vector3.new(center.X, position.Y, center.Z)
 
-    if (flatTarget - position).Magnitude > 0.001 then
+    if SkillAimbotEnabled and (flatTarget - position).Magnitude > 0.001 then
         return CFrame.lookAt(position, flatTarget)
     end
 
-    -- Directly above/below or at the center: keep the current facing direction.
+    -- Keep the current facing when skill aim is disabled or the target is directly above/below/at this point.
     return CFrame.new(position) * localRoot.CFrame.Rotation
 end
 
@@ -2797,6 +2872,10 @@ local function enforceLocalYFloor()
 end
 
 local function faceRootTowardTarget(localRoot, targetRoot)
+    if not SkillAimbotEnabled then
+        return
+    end
+
     local targetPosition = targetRoot.Position
     local flatTarget = Vector3.new(targetPosition.X, localRoot.Position.Y, targetPosition.Z)
 
@@ -2918,9 +2997,10 @@ local function faceCameraTowardTarget()
     end
 
     local aimingGun = Runtime.IsGunAimAllowed()
+    local aimingSkill = SkillAimbotEnabled and not Runtime.GunAimActive
+        and Runtime.InsideHitbox and Runtime.Mode == "ENGAGE"
 
-    if not aimingGun and (not Runtime.InsideHitbox or Runtime.Mode ~= "ENGAGE") then
-
+    if not aimingGun and not aimingSkill then
         return
     end
 
@@ -3245,6 +3325,7 @@ end
 
 local function castSkill(keyName, skillConfig, targetEpoch, attackMode)
     if not canAttack(targetEpoch, attackMode) then
+        Runtime.AttackBusy = false
         Runtime.AimActive = false
         Runtime.GunAimActive = false
         return false
@@ -3256,17 +3337,20 @@ local function castSkill(keyName, skillConfig, targetEpoch, attackMode)
         local configuredHold = tonumber(skillConfig.Hold)
         holdTime = isFiniteNumber(configuredHold) and math.max(configuredHold, 0) or 0
     end
-    Runtime.AimActive = true
+    Runtime.AttackBusy = true
     Runtime.GunAimActive = attackMode == "GunApproach"
+    Runtime.AimActive = Runtime.GunAimActive and GunAimbotEnabled
+        or (not Runtime.GunAimActive and SkillAimbotEnabled)
 
-    if Runtime.GunAimActive then
-        -- An approach cast can begin between Heartbeats; aim its first input at
+    if Runtime.AimActive then
+        -- A cast can begin between Heartbeats; aim its first input at
         -- the live target instead of waiting for the movement camera update.
         Runtime.AimPosition = Runtime.CurrentTargetInfo.Root.Position
         faceCameraTowardTarget()
     end
 
     if not pressKeyDown(keyName) then
+        Runtime.AttackBusy = false
         Runtime.AimActive = false
         Runtime.GunAimActive = false
         return false
@@ -3282,6 +3366,7 @@ local function castSkill(keyName, skillConfig, targetEpoch, attackMode)
 
     local waitOk, completed = pcall(waitWhileAttackable, holdTime, targetEpoch, attackMode)
     releaseKey(keyName)
+    Runtime.AttackBusy = false
     Runtime.AimActive = false
     Runtime.GunAimActive = false
 
@@ -3507,7 +3592,7 @@ function CombatActions.GetAttackRemotes()
 end
 
 function CombatActions.NormalAttack(targetEpoch)
-    if not ClickAttackEnabled or not canAttack(targetEpoch) or Runtime.AimActive then
+    if not ClickAttackEnabled or not canAttack(targetEpoch) or Runtime.AttackBusy or Runtime.AimActive then
         return false
     end
 
@@ -3571,8 +3656,8 @@ function CombatActions.NormalAttack(targetEpoch)
 end
 
 function CombatActions.GunOpener(tool, targetEpoch, characterEpoch)
-    if Runtime.GunShotRequest then
-        return false, false, "A previous gun request is still pending"
+    if Runtime.GunShotOwner or Runtime.GunMouseHeld then
+        return false, false, "A previous gun click is still active"
     end
 
     if Runtime.CharacterEpoch ~= characterEpoch
@@ -3583,29 +3668,42 @@ function CombatActions.GunOpener(tool, targetEpoch, characterEpoch)
         return false, false, "Gun, character, or approach state changed"
     end
 
-    local remote = tool:FindFirstChild("RemoteFunctionShoot")
+    -- CombatController needs the local weapon model and ammo state. Let its
+    -- normal input path handle weapon data, reloads, validation and firing.
+    local pointer = tool:FindFirstChild("LocalEquippedWeaponPointer")
+    local model = pointer and pointer:IsA("ObjectValue") and pointer.Value
+    local shotsLeft = tool:GetAttribute("LocalShotsLeft")
+    local shotsBefore = tool:GetAttribute("LocalTotalShots")
 
-    if not remote or not remote:IsA("RemoteFunction") then
-        return false, false, "Gun " .. tool.Name .. " has no RemoteFunctionShoot RemoteFunction"
+    if not model or not model.Parent then
+        return false, false, "Local equipped weapon model is not ready"
+    end
+
+    if not isFiniteNumber(shotsLeft) or not isFiniteNumber(shotsBefore) then
+        return false, false, "Gun ammo/shot counter is not ready"
+    end
+
+    if shotsLeft < 1 then
+        return false, false, "Gun has no loaded shots"
+    end
+
+    if not tool.Enabled or tool:GetAttribute("IsReloading_Client") then
+
+        return false, false, "Gun is disabled or reloading"
     end
 
     local targetInfo = Runtime.CurrentTargetInfo
     local targetRoot = targetInfo.Root
-    local request = {Started = false, Finished = false, Success = false, Expired = false}
-    local deadline = os.clock() + 1
-
-    Runtime.GunShotRequest = request
+    local request = {Started = false}
     Runtime.GunShotOwner = request
-    Runtime.AimActive = true
+    Runtime.AttackBusy = true
+    Runtime.AimActive = GunAimbotEnabled
     Runtime.GunAimActive = true
-    Runtime.AimPosition = targetRoot.Position
-    faceCameraTowardTarget()
 
     local function stillValid()
         local currentInfo = Runtime.CurrentTargetInfo
 
-        return not request.Expired
-            and Runtime.GunShotOwner == request
+        return Runtime.GunShotOwner == request
             and Runtime.TargetEpoch == targetEpoch
             and Runtime.CharacterEpoch == characterEpoch
             and currentInfo ~= nil
@@ -3615,93 +3713,120 @@ function CombatActions.GunOpener(tool, targetEpoch, characterEpoch)
             and currentInfo.Root == targetRoot
             and Runtime.CurrentTool == tool
             and tool.Parent == Runtime.Character
-            and remote.Parent == tool
-            and Runtime.IsGunAimAllowed()
+            and pointer.Parent == tool
+            and pointer.Value == model
+            and model.Parent ~= nil
+            and Runtime.IsGunAttackAllowed()
     end
 
-    -- Keep the weapon worker free to enter the combat combo even if this
-    -- game-specific remote yields indefinitely. Only one request may be pending.
-    task.spawn(function()
-        local success, result = pcall(function()
-            if not stillValid() or os.clock() >= deadline then
-                return false
+    local function aimMouse()
+        if not stillValid() then
+            return false, "Gun approach ended while aiming"
+        end
+
+        if not GunAimbotEnabled then
+            local cursor = UserInputService:GetMouseLocation()
+
+            if not isFiniteNumber(cursor.X) or not isFiniteNumber(cursor.Y) then
+                return false, "Current mouse position is invalid"
             end
 
-            local args = {
-                [1] = targetRoot.Position,
-                [2] = targetRoot,
-            }
-            Runtime.AimPosition = args[1]
-            print(string.format(
-                "[AutoBounty][Gun] Requesting RemoteFunctionShoot | Weapon=%s | Target=%s",
-                tostring(tool.Name),
-                tostring(targetInfo.Player.Name)
-            ))
-            request.Started = true
-            remote:InvokeServer(table.unpack(args))
+            request.X = math.floor(cursor.X + 0.5)
+            request.Y = math.floor(cursor.Y + 0.5)
+            request.ManualCursor = true
             return true
-        end)
-
-        request.Success = success and result == true
-        request.Error = not success and tostring(result) or nil
-        request.Finished = true
-
-        if Runtime.GunShotRequest == request then
-            Runtime.GunShotRequest = nil
-        end
-    end)
-
-    local waitSucceeded, clicked = pcall(function()
-        while not request.Finished and os.clock() < deadline and stillValid() do
-            task.wait()
-        end
-
-        if not request.Finished or not request.Success
-            or os.clock() >= deadline or not stillValid() then
-
-            return false
         end
 
         Runtime.AimPosition = targetRoot.Position
         faceCameraTowardTarget()
-        VirtualUser:CaptureController()
+        local camera = Workspace.CurrentCamera
 
-        if not stillValid() then
-            return false
+        if not camera then
+            return false, "CurrentCamera is not ready"
         end
 
+        local point, onScreen = camera:WorldToViewportPoint(targetRoot.Position)
+
+        if not onScreen or not isFiniteVector3(point) or point.Z <= 0 then
+            return false, "Target is outside the camera view"
+        end
+
+        request.X = math.floor(point.X + 0.5)
+        request.Y = math.floor(point.Y + 0.5)
+        VirtualInputManager:SendMouseMoveEvent(request.X, request.Y, game)
+        return true
+    end
+
+    local success, clicked, reason = pcall(function()
+        local aimed, aimReason = aimMouse()
+
+        if not aimed then
+            return false, aimReason
+        end
+
+        -- Allow the normal Mouse.Hit/input update to run before pressing M1.
+        task.wait()
+        aimed, aimReason = aimMouse()
+
+        if not aimed then
+            return false, aimReason
+        end
+
+        local currentShotsLeft = tool:GetAttribute("LocalShotsLeft")
+        if not tool.Enabled or tool:GetAttribute("IsReloading_Client")
+            or not isFiniteNumber(currentShotsLeft) or currentShotsLeft < 1 then
+
+            return false, "Gun became disabled, empty, or reloading before the click"
+        end
+
+        shotsBefore = tool:GetAttribute("LocalTotalShots")
+        if not isFiniteNumber(shotsBefore) then
+            return false, "Gun shot counter is no longer ready"
+        end
+
+        request.Started = true
         Runtime.GunMouseHeld = request
-        VirtualUser:Button1Down(Vector2.new(1280, 672))
+        VirtualInputManager:SendMouseButtonEvent(request.X, request.Y, 0, true, game, 0)
         print(string.format(
-            "[AutoBounty][GunClick] Button1Down sent | Weapon=%s | Target=%s",
-            tostring(tool.Name),
-            tostring(targetInfo.Player.Name)
+            "[AutoBounty][GunClick] MouseButton1 sent | Weapon=%s | Target=%s | Screen=(%d,%d)",
+            tostring(tool.Name), tostring(targetInfo.Player.Name), request.X, request.Y
         ))
-        waitWhileAttackable(0.05, targetEpoch, "GunApproach")
+
+        local releaseAt = os.clock() + 0.05
+        while os.clock() < releaseAt and stillValid() do
+            task.wait()
+        end
+        Runtime.ReleaseGunClick(request)
+
+        local shotsAfter = tool:GetAttribute("LocalTotalShots")
+        if isFiniteNumber(shotsBefore) and isFiniteNumber(shotsAfter) and shotsAfter > shotsBefore then
+            print(string.format(
+                "[AutoBounty][Gun] Controller shot counter advanced | Weapon=%s | Before=%s | After=%s",
+                tostring(tool.Name), tostring(shotsBefore), tostring(shotsAfter)
+            ))
+        else
+            print(string.format(
+                "[AutoBounty][Gun] Click sent; no controller shot-count increase observed | Weapon=%s | Target=%s",
+                tostring(tool.Name), tostring(targetInfo.Player.Name)
+            ))
+        end
         return true
     end)
 
-    request.Expired = true
     Runtime.ReleaseGunClick(request)
-
     if Runtime.GunShotOwner == request then
         Runtime.GunShotOwner = nil
+        Runtime.AttackBusy = false
         Runtime.AimActive = false
         Runtime.GunAimActive = false
     end
 
-    if request.Error then
-        warnOnce("gun:shoot:" .. tool.Name, "Gun opener failed: " .. request.Error)
-    elseif not waitSucceeded then
-        warnOnce("gun:click:" .. tool.Name, "Gun opener input failed: " .. tostring(clicked))
-    elseif not request.Finished and os.clock() >= deadline then
-        warnOnce("gun:timeout:" .. tool.Name, "Gun opener response timed out; continuing the combat combo when in range.")
+    if not success then
+        warnOnce("gun:input:" .. tool.Name, "Gun input failed: " .. tostring(clicked))
+        return false, request.Started, tostring(clicked)
     end
 
-    return waitSucceeded and clicked == true, request.Started,
-        request.Error or (not waitSucceeded and tostring(clicked))
-            or (not request.Started and "Approach changed or timed out before sending the gun request")
-            or nil
+    return clicked == true, request.Started, reason
 end
 
 local function startWeaponWorker()
@@ -3722,7 +3847,6 @@ local function startWeaponWorker()
         local gunPassFinished = false
         local gunPreparationAttempts = 0
         local nextGunPreparationAt = 0
-        local gunPendingReported = false
 
         while Runtime.Running do
             local targetEpoch = Runtime.TargetEpoch
@@ -3735,7 +3859,6 @@ local function startWeaponWorker()
                 gunPassFinished = false
                 gunPreparationAttempts = 0
                 nextGunPreparationAt = 0
-                gunPendingReported = false
                 comboTargetEpoch = targetEpoch
                 comboCharacterEpoch = Runtime.CharacterEpoch
             end
@@ -3757,25 +3880,18 @@ local function startWeaponWorker()
             if not attackable then
                 -- Keep the next step across a brief hitbox/safe-mode interruption.
                 -- Target/character epoch changes reset the pass when attacks resume.
+                Runtime.AttackBusy = false
                 Runtime.AimActive = false
                 Runtime.GunAimActive = false
                 Runtime.CurrentTool = nil
                 releaseAllKeys()
                 task.wait(0.05)
             elseif attackMode == "GunApproach" then
-                if Runtime.GunShotRequest then
-                    if not gunPendingReported then
-                        print("[AutoBounty][Gun] Waiting for the previous gun request; preparation attempts are paused")
-                        gunPendingReported = true
-                    end
-
-                    task.wait(0.03)
-                elseif os.clock() < nextGunPreparationAt then
+                if os.clock() < nextGunPreparationAt then
                     task.wait(0.03)
                 else
-                    -- A failed lookup/equip does not consume the shot. Retry
-                    -- preparation briefly, but never repeat a request once sent.
-                    gunPendingReported = false
+                    -- Retry lookup/equip/readiness failures briefly, but never
+                    -- repeat the mouse-down attempt for the same acquisition.
                     gunPreparationAttempts = gunPreparationAttempts + 1
                     local gunConfig = WeaponConfig.Gun
                     local tool = resolveTool("Gun", gunConfig)
@@ -3818,12 +3934,13 @@ local function startWeaponWorker()
                             print(string.format(
                                 "[AutoBounty][Gun] %s | Target=%s | Attempt=%d/3 | Reason=%s",
                                 gunPassFinished and "Preparation stopped" or "Preparation will retry if still in approach range",
-                                targetName, gunPreparationAttempts, tostring(failureReason or "Request was not sent")
+                                targetName, gunPreparationAttempts, tostring(failureReason or "Gun click was not sent")
                             ))
                         end
                     end
 
                     Runtime.ReleaseGunClick()
+                    Runtime.AttackBusy = false
                     Runtime.AimActive = false
                     Runtime.GunAimActive = false
                     task.wait(0.01)
@@ -3898,6 +4015,7 @@ local function startWeaponWorker()
                     end
                 end
 
+                Runtime.AttackBusy = false
                 Runtime.AimActive = false
                 Runtime.GunAimActive = false
 
@@ -3909,6 +4027,7 @@ local function startWeaponWorker()
             end
         end
 
+        Runtime.AttackBusy = false
         Runtime.AimActive = false
         Runtime.GunAimActive = false
         releaseAllKeys()
@@ -4545,6 +4664,7 @@ local function startMovementWorker()
             end
         elseif Runtime.Mode ~= "CHASE" then
             Runtime.Mode = "CHASE"
+            Runtime.AttackBusy = false
             Runtime.AimActive = false
             Runtime.GunAimActive = false
             releaseAllKeys()
@@ -5558,6 +5678,7 @@ function Runtime:Stop(reason)
     self.CharacterEpoch = self.CharacterEpoch + 1
     self.SafeEpoch = self.SafeEpoch + 1
     self.SafeModeAtAltitude = false
+    self.AttackBusy = false
     self.AimActive = false
     self.GunAimActive = false
     resetTargetTimers()
