@@ -9,7 +9,9 @@
 -- Race V3/V4 activation does not require InCombat or being inside a target hitbox.
 -- NoDamageTimeout allows time for a target health drop or confirmed local InCombat after hitbox entry.
 -- Either qualifies the current target for this check until a different target acquisition.
--- SkipPreviousTargets defaults to true; set false to allow previous targets through this filter.
+-- Keep the selected player through recovery and temporary eligibility changes.
+-- Only NoDamageTimeout abandons a target; PlayerFollowTime no longer switches targets.
+-- SkipPreviousTargets records only abandoned targets. A player leaving is released without a history mark.
 -- OrbitEnabled defaults to true; set false to follow the target directly without circling.
 -- ClickAttack defaults to true; normal attacks fill gaps when no enabled skill can be attempted.
 -- ClickAttack also pauses while the local player's health is below 20% of MaxHealth.
@@ -534,6 +536,10 @@ local Runtime = {
     Status = "Initializing",
     CurrentTarget = nil,
     CurrentTargetInfo = nil,
+    TargetPaused = false,
+    TargetPreparing = false,
+    TargetResumeAt = 0,
+    TargetEntranceUsed = false,
     CurrentTool = nil,
     TargetEpoch = 0,
     CharacterEpoch = 0,
@@ -554,6 +560,8 @@ local Runtime = {
     DamageCheckEpoch = nil,
     DamageCheckCharacterEpoch = nil,
     DamageCheckExpired = false,
+    DamageCheckRemaining = nil,
+    DamageCheckQualified = false,
     DamageObserved = false,
     AttackBusy = false,
     AimActive = false,
@@ -825,7 +833,8 @@ local function setStatus(status)
 end
 
 local function isEmptyListHopReady()
-    return Runtime.SafeZonesFolder ~= nil
+    return Runtime.CurrentTarget == nil
+        and Runtime.SafeZonesFolder ~= nil
         and Runtime.SafeZonesFolder.Parent ~= nil
         and Runtime.SafeZonesReady
         and Runtime.FriendAuditComplete
@@ -1774,14 +1783,94 @@ local function resetTargetTimers()
     Runtime.DamageCheckEpoch = nil
     Runtime.DamageCheckCharacterEpoch = nil
     Runtime.DamageCheckExpired = false
+    Runtime.DamageCheckRemaining = nil
+    Runtime.DamageCheckQualified = false
     Runtime.DamageObserved = false
 end
 
-local function clearTarget(reason)
-    if SkipPreviousTargets and Runtime.CurrentTarget then
+local function pauseTarget(reason)
+    if Runtime.CurrentTarget and (not Runtime.TargetPaused or Runtime.TargetPreparing) then
+        -- Invalidate yielded preparation/attack work before cancelling its effects.
+        Runtime.TargetPaused = true
+        Runtime.TargetPreparing = false
+        Runtime.TargetEpoch = Runtime.TargetEpoch + 1
+
+        if Runtime.DamageCheckDeadline then
+            -- A health event may still be queued when a pause begins. Preserve
+            -- progress already visible now before disconnecting that event.
+            local now = os.clock()
+            local inCombat, known = readLocalInCombat()
+            local info = Runtime.CurrentTargetInfo
+            local humanoid = info and info.Humanoid
+
+            if known and inCombat == true then
+                Runtime.DamageCheckQualified = true
+                Runtime.DamageCheckExpired = false
+            elseif not Runtime.DamageCheckExpired and now < Runtime.DamageCheckDeadline
+                and humanoid and humanoid.Parent == info.Character
+                and Runtime.DamageCheckLastHealth
+                and humanoid.Health < Runtime.DamageCheckLastHealth then
+
+                Runtime.DamageObserved = true
+                Runtime.DamageCheckQualified = true
+            end
+
+            if Runtime.DamageCheckQualified or Runtime.DamageObserved then
+                Runtime.DamageCheckRemaining = nil
+            else
+                Runtime.DamageCheckRemaining = math.max(0, Runtime.DamageCheckDeadline - now)
+            end
+
+            Runtime.DamageCheckDeadline = nil
+        end
+
+        disconnectConnections(Runtime.TargetConnections)
+    end
+
+    stopSeaHeightMovement()
+
+    if not Runtime.Running or not Runtime.SafeMode then
+        stopSafeModeMovement()
+    end
+
+    local recoveryTween = Runtime.SafeMode and Runtime.SafeModeMovement
+        and Runtime.SafeModeMovement.Tween
+
+    if Runtime.ActiveTween and Runtime.ActiveTween ~= recoveryTween then
+        Runtime.ActiveTween:Cancel()
+        Runtime.ActiveTween = nil
+    end
+
+    Runtime.AttackBusy = false
+    Runtime.AimActive = false
+    Runtime.GunAimActive = false
+    Runtime.AimPosition = nil
+    Runtime.InsideHitbox = false
+    Runtime.CurrentTool = nil
+    Runtime.ChaseMoveCycle = nil
+    Runtime.ChaseTweenTimeMultiplier = nil
+    releaseAllKeys()
+    restoreTargetHitbox()
+
+    if not Runtime.SafeMode then
+        restoreLocalCollision()
+    end
+
+    if Runtime.CurrentTarget and not Runtime.SafeMode and not Runtime.LocalDead and not Runtime.HopPending then
+        Runtime.Mode = "TARGET_PAUSED"
+
+        if reason and Runtime.Status ~= reason then
+            setStatus(reason)
+        end
+    end
+end
+
+local function clearTarget(reason, abandon)
+    if abandon and SkipPreviousTargets and Runtime.CurrentTarget then
         Runtime.PreviouslyTargeted[Runtime.CurrentTarget.UserId] = true
     end
 
+    pauseTarget()
     Runtime.TargetEpoch = Runtime.TargetEpoch + 1
     Runtime.AttackBusy = false
     Runtime.AimActive = false
@@ -1796,6 +1885,10 @@ local function clearTarget(reason)
     restoreLocalCollision()
     Runtime.CurrentTarget = nil
     Runtime.CurrentTargetInfo = nil
+    Runtime.TargetPaused = false
+    Runtime.TargetPreparing = false
+    Runtime.TargetResumeAt = 0
+    Runtime.TargetEntranceUsed = false
 
     if not Runtime.SafeMode and not Runtime.LocalDead and not Runtime.HopPending then
         Runtime.Mode = "SCAN"
@@ -2107,9 +2200,55 @@ local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer, entr
     return false, "arrival-timeout"
 end
 
+local function bindTargetHealth(player, info)
+    disconnectConnections(Runtime.TargetConnections)
+    local targetEpoch = Runtime.TargetEpoch
+    local characterEpoch = Runtime.CharacterEpoch
+    local humanoid = info.Humanoid
+
+    local connection = humanoid.HealthChanged:Connect(function(health)
+        if not AttackEnabled or not Runtime.Running or Runtime.TargetPaused
+            or Runtime.TargetPreparing or Runtime.CurrentTarget ~= player
+            or Runtime.TargetEpoch ~= targetEpoch
+            or Runtime.CharacterEpoch ~= characterEpoch
+            or not Runtime.CurrentTargetInfo or Runtime.CurrentTargetInfo.Humanoid ~= humanoid
+            or Runtime.DamageCheckEpoch ~= targetEpoch
+            or Runtime.DamageCheckQualified or Runtime.DamageObserved
+            or not Runtime.DamageCheckDeadline then
+
+            return
+        end
+
+        if os.clock() >= Runtime.DamageCheckDeadline then
+            Runtime.DamageCheckExpired = true
+            return
+        end
+
+        if Runtime.DamageCheckLastHealth and health < Runtime.DamageCheckLastHealth then
+            Runtime.DamageObserved = true
+            Runtime.DamageCheckQualified = true
+            Runtime.DamageCheckDeadline = nil
+            Runtime.DamageCheckRemaining = nil
+        else
+            Runtime.DamageCheckLastHealth = health
+        end
+    end)
+    table.insert(Runtime.TargetConnections, connection)
+end
+
 local function setTarget(player, targetInfo)
     if not Runtime.Running or Runtime.SafeMode or Runtime.LocalDead or Runtime.HopPending then
         return false
+    end
+
+    local resuming = Runtime.CurrentTarget == player
+
+    if Runtime.CurrentTarget and not resuming then
+        return false
+    end
+
+    if resuming and (not Runtime.TargetPaused or Runtime.TargetPreparing) then
+        return true
     end
 
     local eligible, refreshedInfo = evaluateTarget(player)
@@ -2124,47 +2263,21 @@ local function setTarget(player, targetInfo)
         return false
     end
 
-    clearTarget()
+    if not resuming then
+        clearTarget()
+    end
+
     Runtime.CurrentTarget = player
     local preparedInfo = refreshedInfo or targetInfo
     preparedInfo.Route = route
     Runtime.CurrentTargetInfo = preparedInfo
     Runtime.Mode = "PREPARE"
+    Runtime.TargetPaused = true
+    Runtime.TargetPreparing = true
     Runtime.TargetEpoch = Runtime.TargetEpoch + 1
     local targetEpoch = Runtime.TargetEpoch
     local preparationCharacterEpoch = Runtime.CharacterEpoch
     local preparationRoot = Runtime.Root
-    local preparedHumanoid = preparedInfo and preparedInfo.Humanoid
-
-    if preparedHumanoid and preparedHumanoid.Parent then
-        local healthConnection = preparedHumanoid.HealthChanged:Connect(function(health)
-            if not AttackEnabled
-                or not Runtime.Running
-                or Runtime.CurrentTarget ~= player
-                or Runtime.TargetEpoch ~= targetEpoch
-                or Runtime.DamageCheckEpoch ~= targetEpoch
-                or Runtime.DamageObserved
-                or not Runtime.DamageCheckDeadline then
-
-                return
-            end
-
-            local previousHealth = Runtime.DamageCheckLastHealth
-
-            if os.clock() >= Runtime.DamageCheckDeadline then
-                Runtime.DamageCheckExpired = true
-                return
-            end
-
-            if previousHealth and health < previousHealth then
-                Runtime.DamageObserved = true
-                Runtime.DamageCheckDeadline = nil
-            else
-                Runtime.DamageCheckLastHealth = health
-            end
-        end)
-        table.insert(Runtime.TargetConnections, healthConnection)
-    end
 
     updateTargetGUI()
     setStatus("Preparing " .. player.Name)
@@ -2179,6 +2292,7 @@ local function setTarget(player, targetInfo)
                 and not Runtime.LocalDead
                 and not Runtime.SafeMode
                 and not Runtime.HopPending
+                and Runtime.TargetPreparing
                 and Runtime.TargetEpoch == targetEpoch
                 and Runtime.CurrentTarget == player
                 and Runtime.CharacterEpoch == preparationCharacterEpoch
@@ -2193,7 +2307,7 @@ local function setTarget(player, targetInfo)
 
         if not preparationStillValid() then
             if Runtime.TargetEpoch == targetEpoch and Runtime.CurrentTarget == player then
-                clearTarget("Local character changed during target preparation")
+                pauseTarget("Waiting for local character before resuming target")
             end
 
             return
@@ -2202,16 +2316,22 @@ local function setTarget(player, targetInfo)
         startPvPEnable()
 
         -- Candidate priority stays direct-first; compare travel routes only for this acquisition.
-        route = getTargetRoute(player, preparedInfo, true)
+        route = getTargetRoute(player, preparedInfo, not Runtime.TargetEntranceUsed)
 
         if not route then
-            clearTarget("Target moved out of range; checking other routes")
+            pauseTarget("Waiting for selected target to return within range")
             return
         end
 
         preparedInfo.Route = route
 
         if route.Kind == "entrance" then
+            if Runtime.TargetEntranceUsed then
+                pauseTarget("Waiting for selected target to return within range")
+                return
+            end
+
+            Runtime.TargetEntranceUsed = true
             local arrived, failure = fastTeleportForTarget(
                 preparedInfo, targetEpoch, player, route.Entrance, route.Shortcut
             )
@@ -2233,7 +2353,8 @@ local function setTarget(player, targetInfo)
                 end
 
                 if not route.Shortcut or failure == "cancelled" then
-                    clearTarget("Entrance route unavailable; checking other targets or entrances")
+                    Runtime.TargetResumeAt = os.clock() + 1
+                    pauseTarget("Entrance unavailable; waiting to resume selected target")
                     return
                 end
             end
@@ -2241,7 +2362,7 @@ local function setTarget(player, targetInfo)
 
         if not preparationStillValid() then
             if Runtime.TargetEpoch == targetEpoch and Runtime.CurrentTarget == player then
-                clearTarget("Local character changed during target preparation")
+                pauseTarget("Waiting for local character before resuming target")
             end
 
             return
@@ -2250,7 +2371,7 @@ local function setTarget(player, targetInfo)
         local stillEligible, latestInfo = evaluateTarget(player)
 
         if not stillEligible then
-            clearTarget("Target became unavailable")
+            pauseTarget("Waiting for selected target to become eligible")
             return
         end
 
@@ -2258,19 +2379,40 @@ local function setTarget(player, targetInfo)
             or latestInfo.Humanoid ~= preparedInfo.Humanoid
             or latestInfo.Root ~= preparedInfo.Root then
 
-            clearTarget("Target character changed; reacquiring")
+            pauseTarget("Target character changed; waiting to resume the same player")
             return
         end
 
         local latestRoute = getTargetRoute(player, latestInfo)
 
         if not latestRoute or latestRoute.Kind ~= "direct" then
-            clearTarget("Target is outside MaxTargetDistance; checking other routes")
+            pauseTarget("Waiting for selected target to return within range")
             return
         end
 
         latestInfo.Route = latestRoute
         Runtime.CurrentTargetInfo = latestInfo
+
+        if Runtime.DamageCheckEpoch then
+            -- A pause keeps the original budget and qualification across respawns.
+            Runtime.DamageCheckEpoch = targetEpoch
+            Runtime.DamageCheckCharacterEpoch = Runtime.CharacterEpoch
+            Runtime.DamageCheckLastHealth = latestInfo.Humanoid.Health
+
+            if not Runtime.DamageCheckQualified and not Runtime.DamageObserved
+                and Runtime.DamageCheckRemaining ~= nil then
+
+                Runtime.DamageCheckDeadline = os.clock() + Runtime.DamageCheckRemaining
+            end
+        end
+
+        Runtime.DamageCheckRemaining = nil
+        Runtime.TargetPaused = false
+        Runtime.TargetPreparing = false
+        Runtime.TargetResumeAt = 0
+        -- Entrance preparation belongs only to the initial approach, not resumes.
+        Runtime.TargetEntranceUsed = true
+        bindTargetHealth(player, latestInfo)
         applyTargetHitbox(latestInfo.Root)
         Runtime.Mode = "CHASE"
         setStatus("Chasing " .. player.Name)
@@ -2284,6 +2426,8 @@ local function canAttack(targetEpoch, attackMode, readOnly)
 
     if not AttackEnabled
         or not Runtime.Running
+        or Runtime.TargetPaused
+        or Runtime.TargetPreparing
         or Runtime.TargetEpoch ~= targetEpoch
         or not Runtime.CurrentTarget
         or Runtime.SafeMode
@@ -2536,7 +2680,8 @@ local function updateSeaHeightMovement(goalCFrame, now, targetEpoch, characterEp
         end
 
         if movement.RetryCount >= 1 then
-            clearTarget("Sea-height movement stalled after retry; finding another target")
+            Runtime.TargetResumeAt = os.clock() + 1
+            pauseTarget("Sea-height movement stalled; pausing selected target")
             return
         end
 
@@ -4631,7 +4776,7 @@ enterSafeMode = function()
         cancelFollowTimeoutHop("SafeMode reset PlayerFollowTime")
     end
 
-    clearTarget()
+    pauseTarget()
     applyLocalNoClip()
     Runtime.Mode = "SAFE_MODE"
     setStatus(string.format(
@@ -4652,7 +4797,8 @@ exitSafeMode = function()
     Runtime.SafeModeAtAltitude = false
     stopSafeModeMovement()
     restoreLocalCollision()
-    Runtime.Mode = Runtime.HopPending and "HOP_WAIT" or "SCAN"
+    Runtime.Mode = Runtime.HopPending and "HOP_WAIT"
+        or (Runtime.CurrentTarget and "TARGET_PAUSED" or "SCAN")
 
     if not Runtime.HopPending then
         Runtime.EmptySince = nil
@@ -4732,7 +4878,7 @@ local function handleLocalDeath(characterEpoch)
         cancelFollowTimeoutHop("Local death reset PlayerFollowTime")
     end
 
-    clearTarget()
+    pauseTarget()
     Runtime.Mode = "RESPAWN"
     setStatus("Local player died; waiting for respawn")
     Runtime.Character = nil
@@ -4750,7 +4896,7 @@ local function bindCharacter(character)
     Runtime.LocalDead = true
     Runtime.SafeMode = false
     Runtime.SafeModeAtAltitude = false
-    clearTarget()
+    pauseTarget()
     Runtime.Mode = "RESPAWN"
     setStatus("Binding character")
 
@@ -4825,7 +4971,8 @@ local function bindCharacter(character)
         handleHealthChanged(humanoid.Health, characterEpoch)
 
         if not Runtime.SafeMode then
-            Runtime.Mode = Runtime.HopPending and "HOP_WAIT" or "SCAN"
+            Runtime.Mode = Runtime.HopPending and "HOP_WAIT"
+                or (Runtime.CurrentTarget and "TARGET_PAUSED" or "SCAN")
             setStatus(Runtime.HopPending and "Character ready; resuming server hop" or "Character ready; scanning")
         end
     end)
@@ -4901,7 +5048,7 @@ local function startMovementWorker()
 
         if not Runtime.FriendAuditComplete then
             if Runtime.CurrentTarget then
-                clearTarget("Waiting for friend checks")
+                pauseTarget("Waiting for friend checks")
             end
 
             return
@@ -4914,32 +5061,41 @@ local function startMovementWorker()
             return
         end
 
+        if Runtime.TargetPaused or Runtime.TargetPreparing then
+            return
+        end
+
         local character, targetHumanoid, targetRoot = getAliveCharacter(player)
 
         if not character then
-            clearTarget("Target defeated or respawning")
+            pauseTarget("Target defeated or respawning")
+            return
+        end
+
+        if not isFiniteVector3(targetRoot.Position) then
+            pauseTarget("Waiting for selected target position")
             return
         end
 
         if targetRoot.Position.Y < INTERNAL.MinimumTweenY then
-            clearTarget("Target moved below sea level; switching target")
+            pauseTarget("Waiting for selected target to return above sea level")
             return
         end
 
         local targetPvpDisabled = readBooleanAttribute(player, "PvpDisabled", false)
 
         if targetPvpDisabled == true then
-            clearTarget("Target PvP is disabled")
+            pauseTarget("Target PvP is disabled")
             return
         end
 
         local inSafeZone = isInsideSafeZone(targetRoot.Position)
 
         if inSafeZone == nil then
-            clearTarget("Waiting for SafeZones")
+            pauseTarget("Waiting for SafeZones")
             return
         elseif inSafeZone then
-            clearTarget("Target entered the safe-zone radius")
+            pauseTarget("Target entered the safe-zone radius")
             return
         end
 
@@ -4952,7 +5108,7 @@ local function startMovementWorker()
             or not localRoot.Parent
             or not localRoot:IsDescendantOf(localCharacter) then
 
-            stopSeaHeightMovement()
+            pauseTarget("Waiting for local character root; keeping selected target")
             return
         end
 
@@ -4963,7 +5119,7 @@ local function startMovementWorker()
                 or lockedInfo.Humanoid ~= targetHumanoid
                 or lockedInfo.Root ~= targetRoot) then
 
-            clearTarget("Target character changed; reacquiring")
+            pauseTarget("Target character changed; waiting to resume the same player")
             return
         end
 
@@ -4977,59 +5133,6 @@ local function startMovementWorker()
         local now = os.clock()
         local targetEpoch = Runtime.TargetEpoch
         local characterEpoch = Runtime.CharacterEpoch
-        local inCombat, inCombatKnown = readLocalInCombat()
-
-        if inCombatKnown and inCombat == true then
-            Runtime.FollowNoCombatSince = nil
-            Runtime.FollowTimerEpoch = nil
-            Runtime.FollowTimerCharacterEpoch = nil
-        elseif inCombatKnown then
-            if Runtime.FollowTimerEpoch ~= targetEpoch
-                or Runtime.FollowTimerCharacterEpoch ~= characterEpoch
-                or not Runtime.FollowNoCombatSince then
-
-                Runtime.FollowNoCombatSince = now
-                Runtime.FollowTimerEpoch = targetEpoch
-                Runtime.FollowTimerCharacterEpoch = characterEpoch
-            elseif now - Runtime.FollowNoCombatSince >= PlayerFollowTime then
-                local finalInCombat, finalInCombatKnown = readLocalInCombat()
-
-                if Runtime.Running
-                    and Runtime.CurrentTarget == player
-                    and Runtime.TargetEpoch == targetEpoch
-                    and Runtime.CharacterEpoch == characterEpoch
-                    and not Runtime.SafeMode
-                    and not Runtime.LocalDead
-                    and not Runtime.HopPending
-                    and finalInCombatKnown
-                    and finalInCombat == false then
-
-                    Runtime.FollowTimeoutCharacters[player] = character
-                    clearTarget("PlayerFollowTime expired; switching to nearest target")
-
-                    local remainingCandidates = rebuildCandidates()
-
-                    if #remainingCandidates > 0 then
-                        local nearestPlayer = remainingCandidates[1]
-                        setTarget(nearestPlayer, Runtime.CandidateInfo[nearestPlayer])
-                    elseif Runtime.PendingCandidateCount > 0 then
-                        setStatus("PlayerFollowTime expired; waiting for player data or respawn")
-                    else
-                        setStatus("PlayerFollowTime expired; no remaining eligible target")
-                    end
-
-                    return
-                end
-
-                Runtime.FollowNoCombatSince = nil
-                Runtime.FollowTimerEpoch = nil
-                Runtime.FollowTimerCharacterEpoch = nil
-            end
-        else
-            Runtime.FollowNoCombatSince = nil
-            Runtime.FollowTimerEpoch = nil
-            Runtime.FollowTimerCharacterEpoch = nil
-        end
 
         if Runtime.Mode ~= "CHASE" and Runtime.Mode ~= "ENGAGE" then
             stopSeaHeightMovement()
@@ -5063,6 +5166,8 @@ local function startMovementWorker()
             Runtime.DamageCheckEpoch = targetEpoch
             Runtime.DamageCheckCharacterEpoch = characterEpoch
             Runtime.DamageCheckExpired = false
+            Runtime.DamageCheckRemaining = nil
+            Runtime.DamageCheckQualified = false
             Runtime.DamageObserved = false
         end
 
@@ -5070,6 +5175,7 @@ local function startMovementWorker()
             and Runtime.DamageCheckEpoch == targetEpoch
             and Runtime.DamageCheckCharacterEpoch == characterEpoch
             and Runtime.DamageCheckDeadline
+            and not Runtime.DamageCheckQualified
             and not Runtime.DamageObserved then
 
             local currentTargetHealth = targetHumanoid.Health
@@ -5078,6 +5184,8 @@ local function startMovementWorker()
             if currentInCombatKnown and currentInCombat == true then
                 -- Keep the epoch so this check cannot rearm for the same acquisition.
                 Runtime.DamageCheckDeadline = nil
+                Runtime.DamageCheckQualified = true
+                Runtime.DamageCheckRemaining = nil
                 Runtime.DamageCheckExpired = false
             elseif not Runtime.DamageCheckExpired
                 and now < Runtime.DamageCheckDeadline
@@ -5085,6 +5193,7 @@ local function startMovementWorker()
                 and currentTargetHealth < Runtime.DamageCheckLastHealth then
 
                 Runtime.DamageObserved = true
+                Runtime.DamageCheckQualified = true
                 Runtime.DamageCheckDeadline = nil
             else
                 Runtime.DamageCheckLastHealth = currentTargetHealth
@@ -5095,7 +5204,7 @@ local function startMovementWorker()
                     and Runtime.CharacterEpoch == characterEpoch then
 
                     Runtime.NoProgressCharacters[player] = character
-                    clearTarget("No target health decrease or confirmed local combat; switching target")
+                    clearTarget("NoDamageTimeout expired; abandoning selected target", true)
                     return
                 end
             end
@@ -5349,10 +5458,6 @@ determineHopReason = function()
         return "friend", friend.Name
     end
 
-    if Runtime.FollowTimeoutHopDetail then
-        return "follow-timeout", Runtime.FollowTimeoutHopDetail
-    end
-
     if isEmptyListHopReady() then
         return "empty", "No eligible players"
     end
@@ -5382,8 +5487,8 @@ local function stopHopPending(message)
     Runtime.FollowTimeoutHopDetail = nil
 
     if Runtime.Running and not Runtime.SafeMode and not Runtime.LocalDead then
-        Runtime.Mode = "SCAN"
-        setStatus(message or "Hop cancelled; scanning")
+        Runtime.Mode = Runtime.CurrentTarget and "TARGET_PAUSED" or "SCAN"
+        setStatus(message or (Runtime.CurrentTarget and "Hop cancelled; resuming selected target" or "Hop cancelled; scanning"))
     end
 end
 
@@ -5672,7 +5777,7 @@ local function runHopWorker()
 
     task.spawn(function()
         while Runtime.Running and Runtime.HopPending do
-            clearTarget()
+            pauseTarget()
 
             while Runtime.Running
                 and Runtime.HopPending
@@ -5925,15 +6030,15 @@ requestHop = function(reason, detail)
         return false
     end
 
+    if reason == "follow-timeout" or (reason == "empty" and Runtime.CurrentTarget) then
+        return false
+    end
+
     local currentPriority = HOP_PRIORITY[Runtime.HopReason] or 0
     local requestedPriority = HOP_PRIORITY[reason] or 0
 
     if Runtime.HopPending and requestedPriority < currentPriority then
         return
-    end
-
-    if reason == "follow-timeout" then
-        Runtime.FollowTimeoutHopDetail = detail or "PlayerFollowTime expired"
     end
 
     if not Runtime.HopPending then
@@ -5943,7 +6048,7 @@ requestHop = function(reason, detail)
     Runtime.HopPending = true
     Runtime.HopReason = reason
     Runtime.HopDetail = detail
-    clearTarget()
+    pauseTarget()
 
     if Runtime.SafeMode then
         Runtime.Mode = "SAFE_MODE"
@@ -5969,7 +6074,7 @@ local function startFriendWorker()
         Runtime.FriendAuditComplete = false
 
         if Runtime.CurrentTarget then
-            clearTarget("Checking newly joined player for friend status")
+            pauseTarget("Checking newly joined player for friend status")
         end
 
         requestFriendCheck(player)
@@ -6029,29 +6134,38 @@ local function startTargetWorker()
             local candidates = rebuildCandidates()
 
             if Runtime.CurrentTarget then
-                local currentInfo = Runtime.CandidateInfo[Runtime.CurrentTarget]
+                local player = Runtime.CurrentTarget
+                local currentInfo = Runtime.CandidateInfo[player]
 
-                if not Runtime.FriendAuditComplete then
-                    clearTarget("Waiting for initial friend checks")
-                elseif currentInfo then
-                    local lockedInfo = Runtime.CurrentTargetInfo
-
-                    if (Runtime.Mode == "CHASE" or Runtime.Mode == "ENGAGE")
-                        and currentInfo.Route
-                        and currentInfo.Route.Kind ~= "direct" then
-
-                        clearTarget("Target moved outside MaxTargetDistance; checking other routes")
-                    elseif lockedInfo
-                        and (lockedInfo.Character ~= currentInfo.Character
-                            or lockedInfo.Humanoid ~= currentInfo.Humanoid
-                            or lockedInfo.Root ~= currentInfo.Root) then
-
-                        clearTarget("Target character changed; reacquiring")
+                if player.Parent ~= Players then
+                    clearTarget("Target left the server")
+                elseif not Runtime.SafeMode and not Runtime.LocalDead and not Runtime.HopPending then
+                    if not Runtime.FriendAuditComplete then
+                        pauseTarget("Waiting for friend checks; keeping selected target")
+                    elseif not currentInfo then
+                        local reason = Runtime.CandidateReasons[player] or "player data"
+                        pauseTarget("Waiting for selected target: " .. tostring(reason))
                     else
-                        Runtime.CurrentTargetInfo = currentInfo
+                        local lockedInfo = Runtime.CurrentTargetInfo
+                        local changed = lockedInfo
+                            and (lockedInfo.Character ~= currentInfo.Character
+                                or lockedInfo.Humanoid ~= currentInfo.Humanoid
+                                or lockedInfo.Root ~= currentInfo.Root)
+
+                        if changed and (not Runtime.TargetPaused or Runtime.TargetPreparing) then
+                            pauseTarget("Target character changed; waiting to resume the same player")
+                        elseif not Runtime.TargetPreparing then
+                            if currentInfo.Route.Kind ~= "direct" and Runtime.TargetEntranceUsed then
+                                pauseTarget("Waiting for selected target to return within range")
+                            elseif Runtime.TargetPaused then
+                                if os.clock() >= Runtime.TargetResumeAt then
+                                    setTarget(player, currentInfo)
+                                end
+                            else
+                                Runtime.CurrentTargetInfo = currentInfo
+                            end
+                        end
                     end
-                else
-                    clearTarget("Current target no longer qualifies")
                 end
             end
 
@@ -6062,7 +6176,7 @@ local function startTargetWorker()
             local listIsEmpty = #candidates == 0
                 and Runtime.PendingCandidateCount == 0
 
-            if not emptyInputsReady or not listIsEmpty then
+            if Runtime.CurrentTarget or not emptyInputsReady or not listIsEmpty then
                 Runtime.EmptySince = nil
             elseif not Runtime.LocalDead
                 and not Runtime.SafeMode
@@ -6071,7 +6185,8 @@ local function startTargetWorker()
                 Runtime.EmptySince = os.clock()
             end
 
-            if not Runtime.LocalDead and not Runtime.SafeMode and not Runtime.HopPending then
+            if not Runtime.CurrentTarget
+                and not Runtime.LocalDead and not Runtime.SafeMode and not Runtime.HopPending then
                 if not Runtime.FriendAuditComplete then
                     setStatus("Checking players for friends")
                 elseif not Runtime.SafeZonesFolder or not Runtime.SafeZonesReady then
