@@ -4,7 +4,7 @@
 -- PlayerFollowTime, NoDamageTimeout, SkipPreviousTargets, OrbitEnabled, RaceV3, RaceV4,
 -- ClickAttack, HitboxOffset, TweenHitbox, SafeZoneRadius, combo timings, panic movement,
 -- SeaHeightFirst, SeaHeightStallTimeout, GunOpenerEnabled, GunEngageDistance, MaxTargetDistance,
--- Aimbot, and optional ReadSkillCooldown.
+-- Aimbot, optional Config.Combo, and optional ReadSkillCooldown.
 -- Race flags belong in Config.Settings and require an explicit true.
 -- NoDamageTimeout allows time for a target health drop or confirmed local InCombat after hitbox entry.
 -- Either qualifies the current target for this check until a different target acquisition.
@@ -22,6 +22,13 @@
 -- ComboDelay defaults to 0.03 seconds, replacing weapon Delay between casts.
 -- Optional ComboHold overrides every skill Hold; omit it to keep per-skill holds.
 -- ComboRetryDelay defaults to 1 second when cooldown activation cannot be confirmed.
+-- Config.Combo = {Enabled=true, RequiredWeapons={"godhuman", "curseddualkatana"},
+--     Steps={{Weapon="Godhuman", Key="Z", Hold=0.1}, {Weapon="Cursed Dual Katana", Key="X", Hold=0.3}}}.
+-- RequiredWeapons checks actual WeaponName attributes; all must be present. Case/spaces/punctuation are ignored.
+-- Steps run in array order, skipping disabled/cooling skills. Missing requirements/tools pause custom attacks.
+-- Each step's optional Hold overrides Settings.ComboHold; omit it to keep the normal hold settings.
+-- Optional step.Tool is an explicit Tool-name alias, e.g. Weapon="icesword", Tool="Ice-Ice".
+-- Weapon category/skill Enabled flags still apply. Explicit Gun steps run in the hitbox, independent of the basic opener.
 -- SeaHeightStallTimeout defaults to 3 seconds without vertical progress: retry once, then switch.
 -- SeaHeightFirst defaults to false for direct chasing; set true to restore the sea-level stage.
 -- TweenHitbox defaults: Enabled=true, Size=Vector3.new(100,100,100), TimeMultiplier=0.2.
@@ -3393,7 +3400,7 @@ local function equipTool(tool, targetEpoch, attackMode)
     return false
 end
 
-local function castSkill(keyName, skillConfig, targetEpoch, attackMode)
+local function castSkill(keyName, skillConfig, targetEpoch, attackMode, holdOverride)
     if not canAttack(targetEpoch, attackMode) then
         Runtime.AttackBusy = false
         Runtime.AimActive = false
@@ -3401,7 +3408,8 @@ local function castSkill(keyName, skillConfig, targetEpoch, attackMode)
         return false
     end
 
-    local holdTime = getComboNumberSetting("ComboHold", nil)
+    local holdTime = isFiniteNumber(holdOverride) and math.max(holdOverride, 0)
+        or getComboNumberSetting("ComboHold", nil)
 
     if holdTime == nil then
         local configuredHold = tonumber(skillConfig.Hold)
@@ -3538,7 +3546,262 @@ function CombatActions.MarkAttempt(entry)
     attempt.NextAttemptAt = os.clock() + getComboNumberSetting("ComboRetryDelay", 1)
 end
 
+function CombatActions.GetComboConfig()
+    local combo = type(Config) == "table" and Config.Combo
+    return type(combo) == "table" and combo.Enabled == true and combo or nil
+end
+
+function CombatActions.NormalizeWeaponName(value)
+    if type(value) ~= "string" then
+        return nil
+    end
+
+    local normalized = string.lower(value):gsub("[%s%p]", "")
+    return normalized ~= "" and normalized or nil
+end
+
+function CombatActions.IsOwnedTool(tool)
+    if not tool or not tool:IsA("Tool") or not tool.Parent then
+        return false
+    end
+
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
+    return tool.Parent == Runtime.Character or (backpack ~= nil and tool.Parent == backpack)
+end
+
+function CombatActions.GetOwnedWeaponModel(tool)
+    if not CombatActions.IsOwnedTool(tool) then
+        return nil
+    end
+
+    local pointer = tool:FindFirstChild("LocalEquippedWeaponPointer")
+    local model = pointer and pointer:IsA("ObjectValue") and pointer.Value
+
+    -- The owned Tool's explicit pointer also supports locally rendered models outside Character.
+    if model and model.Parent then
+        return model
+    end
+
+    return nil
+end
+
+function CombatActions.ComboRequirementsMet(combo)
+    if type(combo.RequiredWeapons) ~= "table" or #combo.RequiredWeapons == 0 then
+        return false, "RequiredWeapons must contain at least one WeaponName"
+    end
+
+    local found = {}
+    local function readAttribute(object)
+        local name = CombatActions.NormalizeWeaponName(object:GetAttribute("WeaponName"))
+
+        if name then
+            found[name] = true
+        end
+    end
+
+    local function readContainer(container)
+        if not container then
+            return
+        end
+
+        readAttribute(container)
+
+        for _, object in ipairs(container:GetDescendants()) do
+            readAttribute(object)
+        end
+    end
+
+    readContainer(Runtime.Character)
+
+    for _, tool in ipairs(collectTools()) do
+        -- Equipped tools are already covered by the character scan.
+        if tool.Parent ~= Runtime.Character then
+            readContainer(tool)
+        end
+
+        local model = CombatActions.GetOwnedWeaponModel(tool)
+
+        if model then
+            readAttribute(model)
+        end
+    end
+
+    local missing = {}
+
+    for _, value in ipairs(combo.RequiredWeapons) do
+        local name = CombatActions.NormalizeWeaponName(value)
+
+        if not name then
+            return false, "RequiredWeapons entries must be nonempty strings"
+        end
+
+        if not found[name] then
+            table.insert(missing, value)
+        end
+    end
+
+    if #missing > 0 then
+        return false, "Missing WeaponName: " .. table.concat(missing, ", ")
+    end
+
+    return true
+end
+
+function CombatActions.ResolveComboTool(step)
+    local requested = CombatActions.NormalizeWeaponName(step.Tool or step.Weapon)
+
+    if not requested then
+        return nil
+    end
+
+    local nameMatch
+
+    for _, tool in ipairs(collectTools()) do
+        local named = CombatActions.NormalizeWeaponName(tool.Name) == requested
+
+        if step.Tool ~= nil then
+            if named then
+                return tool
+            end
+        else
+            local model = CombatActions.GetOwnedWeaponModel(tool)
+            local toolName = CombatActions.NormalizeWeaponName(tool:GetAttribute("WeaponName"))
+            local modelName = model and CombatActions.NormalizeWeaponName(model:GetAttribute("WeaponName"))
+
+            if toolName == requested or modelName == requested then
+                return tool
+            end
+
+            if named and not nameMatch then
+                nameMatch = tool
+            end
+        end
+    end
+
+    return nameMatch
+end
+
+function CombatActions.ComboBlocked(reason)
+    warnOnce(
+        "combo:blocked:" .. tostring(Runtime.CharacterEpoch) .. ":" .. tostring(reason),
+        "Custom combo paused: " .. tostring(reason)
+    )
+    return {}
+end
+
+function CombatActions.GetCustomSkills(combo)
+    local ready, reason = CombatActions.ComboRequirementsMet(combo)
+
+    if not ready then
+        return CombatActions.ComboBlocked(reason)
+    end
+
+    if type(combo.Steps) ~= "table" or #combo.Steps == 0 then
+        return CombatActions.ComboBlocked("Steps must contain at least one weapon/skill entry")
+    end
+
+    local entries = {}
+    local validKeys = {Z = true, X = true, C = true, V = true, F = true}
+
+    for index, step in ipairs(combo.Steps) do
+        if type(step) ~= "table" then
+            return CombatActions.ComboBlocked("Step " .. tostring(index) .. " must be a table")
+        end
+
+        if step.Enabled ~= false then
+            if not CombatActions.NormalizeWeaponName(step.Weapon) then
+                return CombatActions.ComboBlocked("Step " .. tostring(index) .. " needs a Weapon name")
+            end
+
+            local key = type(step.Key) == "string" and string.upper(step.Key)
+
+            if not validKeys[key] then
+                return CombatActions.ComboBlocked("Step " .. tostring(index) .. " needs Key Z, X, C, V, or F")
+            end
+
+            local tool = CombatActions.ResolveComboTool(step)
+
+            if not tool then
+                return CombatActions.ComboBlocked("No owned Tool for step " .. tostring(index)
+                    .. " (" .. tostring(step.Weapon) .. "); set Tool to its display name if needed")
+            end
+
+            local category = step.Category or tool.ToolTip
+            local categoryConfig = WeaponConfig[category]
+
+            if not VALID_WEAPON_CATEGORY[category] then
+                return CombatActions.ComboBlocked("Step " .. tostring(index) .. " needs a valid ToolTip or Category")
+            end
+
+            local skills = type(categoryConfig) == "table" and categoryConfig.Skills
+            local skillConfig = type(skills) == "table" and skills[key]
+
+            if type(categoryConfig) == "table" and categoryConfig.Enabled == true
+                and type(skillConfig) == "table" and skillConfig.Enabled == true then
+
+                local holdOverride = step.Hold ~= nil and tonumber(step.Hold) or nil
+
+                if step.Hold ~= nil and (not isFiniteNumber(holdOverride) or holdOverride < 0) then
+                    return CombatActions.ComboBlocked("Step " .. tostring(index) .. " Hold must be finite and at least 0")
+                end
+
+                local cooling = CombatActions.ReadCooldown(tool, key)
+                CombatActions.ObserveCooldown(tool, key, cooling)
+                table.insert(entries, {
+                    Tool = tool,
+                    Category = category,
+                    CategoryConfig = categoryConfig,
+                    Key = key,
+                    Config = skillConfig,
+                    Cooling = cooling,
+                    ComboConfig = combo,
+                    ComboStep = step,
+                    StepIndex = index,
+                    HoldOverride = holdOverride,
+                })
+            end
+        end
+    end
+
+    return entries
+end
+
+function CombatActions.CustomEntryValid(entry)
+    local combo = CombatActions.GetComboConfig()
+    local step = entry.ComboStep
+
+    if not combo or combo ~= entry.ComboConfig
+        or type(combo.Steps) ~= "table"
+        or combo.Steps[entry.StepIndex] ~= step
+        or step.Enabled == false
+        or string.upper(tostring(step.Key)) ~= entry.Key
+        or not CombatActions.IsOwnedTool(entry.Tool)
+        or WeaponConfig[entry.Category] ~= entry.CategoryConfig
+        or entry.CategoryConfig.Enabled ~= true
+        or type(entry.CategoryConfig.Skills) ~= "table"
+        or entry.CategoryConfig.Skills[entry.Key] ~= entry.Config
+        or entry.Config.Enabled ~= true then
+
+        return false
+    end
+
+    local ready, reason = CombatActions.ComboRequirementsMet(combo)
+
+    if not ready then
+        CombatActions.ComboBlocked(reason)
+        return false
+    end
+
+    return CombatActions.ResolveComboTool(step) == entry.Tool
+end
+
 function CombatActions.GetSkills(weaponOrder)
+    local combo = CombatActions.GetComboConfig()
+
+    if combo then
+        return CombatActions.GetCustomSkills(combo)
+    end
+
     local entries = {}
 
     for _, category in ipairs(weaponOrder) do
@@ -4016,18 +4279,30 @@ local function startWeaponWorker()
                     task.wait(0.01)
                 end
             else
+                local customCombo = CombatActions.GetComboConfig()
+
+                if comboEntries and comboEntries[1]
+                    and comboEntries[1].ComboConfig ~= customCombo then
+
+                    comboEntries = nil
+                end
+
                 if not comboEntries then
                     comboEntries = CombatActions.GetSkills(combatWeaponOrder)
                     skillCursor = 1
                 end
 
+                local customBlocked = customCombo ~= nil and #comboEntries == 0
                 local entry, entryIndex = CombatActions.SelectSkill(comboEntries, skillCursor)
                 local castCompleted = false
 
                 skillCursor = entryIndex + 1
 
                 if entry then
-                    if equipTool(entry.Tool, targetEpoch, attackMode)
+                    if entry.ComboConfig and not CombatActions.CustomEntryValid(entry) then
+                        comboEntries = nil
+                        skillCursor = 1
+                    elseif equipTool(entry.Tool, targetEpoch, attackMode)
                         and canAttack(targetEpoch, attackMode)
                         and Runtime.CharacterEpoch == comboCharacterEpoch
                         and entry.Tool.Parent == Runtime.Character
@@ -4036,7 +4311,10 @@ local function startWeaponWorker()
 
                         -- Equipping yields; recheck this exact combo step before
                         -- key-down, without restarting the order at the first skill.
-                        if CombatActions.CanAttempt(entry) then
+                        if entry.ComboConfig and not CombatActions.CustomEntryValid(entry) then
+                            comboEntries = nil
+                            skillCursor = 1
+                        elseif CombatActions.CanAttempt(entry) then
                             if entry.Cooling == nil then
                                 warnOnce(
                                     "skill:cooldown-unknown:" .. entry.Tool.Name .. ":" .. entry.Key,
@@ -4046,7 +4324,7 @@ local function startWeaponWorker()
                             end
 
                             CombatActions.MarkAttempt(entry)
-                            castCompleted = castSkill(entry.Key, entry.Config, targetEpoch, attackMode)
+                            castCompleted = castSkill(entry.Key, entry.Config, targetEpoch, attackMode, entry.HoldOverride)
 
                             if castCompleted then
                                 local delay = getComboNumberSetting("ComboDelay", 0.03)
@@ -4092,7 +4370,7 @@ local function startWeaponWorker()
                 -- Successful casts already yield during Hold/ComboDelay. Cooling
                 -- skills are skipped together without sleeping for each key.
                 if not castCompleted then
-                    task.wait(0.01)
+                    task.wait(customBlocked and 0.1 or 0.01)
                 end
             end
         end
