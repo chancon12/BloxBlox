@@ -2,7 +2,7 @@
 -- External options are intentionally limited to Team, Weapon, Attack, FastTP,
 -- AutoHop, ESP, NoClip, TweenSpeed, SafeModeY, health thresholds, hitbox settings,
 -- PlayerFollowTime, NoDamageTimeout, SkipPreviousTargets, OrbitEnabled, RaceV3, RaceV4,
--- ClickAttack, HitboxOffset, SafeZoneRadius, combo timings, panic movement,
+-- ClickAttack, HitboxOffset, TweenHitbox, SafeZoneRadius, combo timings, panic movement,
 -- SeaHeightFirst, SeaHeightStallTimeout, and optional ReadSkillCooldown.
 -- Race flags belong in Config.Settings and require an explicit true.
 -- NoDamageTimeout allows time for a target health drop or confirmed local InCombat after hitbox entry.
@@ -23,6 +23,8 @@
 -- ComboRetryDelay defaults to 1 second when cooldown activation cannot be confirmed.
 -- SeaHeightStallTimeout defaults to 3 seconds without vertical progress: retry once, then switch.
 -- SeaHeightFirst defaults to false for direct chasing; set true to restore the sea-level stage.
+-- TweenHitbox defaults: Enabled=true, Size=Vector3.new(100,100,100), TimeMultiplier=2.
+-- This separate target-relative box multiplies chase/orbit tween duration, including the existing hitbox slowdown.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -52,6 +54,7 @@ assert(
 local Settings = type(Config.Settings) == "table" and Config.Settings or {}
 local WeaponConfig = type(Config.Weapon) == "table" and Config.Weapon or {}
 local HitboxConfig = type(Settings.Hitbox) == "table" and Settings.Hitbox or {}
+local TweenHitboxConfig = type(Settings.TweenHitbox) == "table" and Settings.TweenHitbox or {}
 
 local function isFiniteNumber(value)
     return type(value) == "number"
@@ -65,6 +68,10 @@ local ESPEnabled = Settings.ESPPlayer ~= false
 local SkipPreviousTargets = Settings.SkipPreviousTargets ~= false
 local OrbitEnabled = Settings.OrbitEnabled ~= false
 local ClickAttackEnabled = Settings.ClickAttack ~= false
+local TweenHitboxEnabled = TweenHitboxConfig.Enabled ~= false
+local TweenHitboxSize = TweenHitboxConfig.Size or Vector3.new(100, 100, 100)
+local TweenHitboxTimeMultiplier = TweenHitboxConfig.TimeMultiplier == nil
+    and 2 or tonumber(TweenHitboxConfig.TimeMultiplier)
 local RawAutoHop = Settings.AutoHop
 local AutoHopEnabled = RawAutoHop == nil and true or RawAutoHop
 local RawAttack = Settings.Attack
@@ -87,6 +94,23 @@ local NoDamageTimeout = RawNoDamageTimeout == nil and 30 or tonumber(RawNoDamage
 local RawSafeZoneRadius = Settings.SafeZoneRadius
 local SafeZoneRadius = RawSafeZoneRadius == nil and 100 or tonumber(RawSafeZoneRadius)
 local HitboxOffset = Settings.HitboxOffset
+
+if typeof(TweenHitboxSize) ~= "Vector3"
+    or not isFiniteNumber(TweenHitboxSize.X)
+    or not isFiniteNumber(TweenHitboxSize.Y)
+    or not isFiniteNumber(TweenHitboxSize.Z)
+    or TweenHitboxSize.X <= 0
+    or TweenHitboxSize.Y <= 0
+    or TweenHitboxSize.Z <= 0 then
+
+    warn("[AutoBounty] Settings.TweenHitbox.Size is invalid; using Vector3.new(100, 100, 100).")
+    TweenHitboxSize = Vector3.new(100, 100, 100)
+end
+
+if not isFiniteNumber(TweenHitboxTimeMultiplier) or TweenHitboxTimeMultiplier < 1 then
+    warn("[AutoBounty] Settings.TweenHitbox.TimeMultiplier must be finite and at least 1; using 2.")
+    TweenHitboxTimeMultiplier = 2
+end
 
 if HitboxOffset == nil then
     HitboxOffset = Vector3.new(0, 0, 0)
@@ -473,6 +497,7 @@ local Runtime = {
     Root = nil,
     InsideHitbox = false,
     ChaseMoveCycle = nil,
+    ChaseTweenTimeMultiplier = nil,
     SeaHeightMove = nil,
     ActiveTween = nil,
     FollowNoCombatSince = nil,
@@ -1566,6 +1591,7 @@ local function resetTargetTimers()
 
     stopSeaHeightMovement()
     Runtime.ChaseMoveCycle = nil
+    Runtime.ChaseTweenTimeMultiplier = nil
     Runtime.FollowNoCombatSince = nil
     Runtime.FollowTimerEpoch = nil
     Runtime.FollowTimerCharacterEpoch = nil
@@ -2029,7 +2055,30 @@ local function canAttack(targetEpoch)
     return true
 end
 
-local function AutoTween(goalCFrame, deltaTime, insideHitbox)
+local function getTargetTweenTimeMultiplier(localRoot, targetRoot)
+    if not TweenHitboxEnabled
+        or not localRoot or not localRoot.Parent
+        or not targetRoot or not targetRoot.Parent
+        or not isFiniteVector3(localRoot.Position)
+        or not isFiniteVector3(targetRoot.Position) then
+
+        return 1
+    end
+
+    local offset = targetRoot.CFrame:PointToObjectSpace(localRoot.Position)
+    local halfSize = TweenHitboxSize * 0.5
+
+    if math.abs(offset.X) <= halfSize.X
+        and math.abs(offset.Y) <= halfSize.Y
+        and math.abs(offset.Z) <= halfSize.Z then
+
+        return TweenHitboxTimeMultiplier
+    end
+
+    return 1
+end
+
+local function AutoTween(goalCFrame, deltaTime, insideHitbox, timeMultiplier)
     stopSeaHeightMovement()
     local root = Runtime.Root
 
@@ -2053,11 +2102,12 @@ local function AutoTween(goalCFrame, deltaTime, insideHitbox)
         return
     end
 
+    local duration = (distance / speed) * (timeMultiplier or 1)
     root.CFrame = currentCFrame
 
     Runtime.ActiveTween = game:GetService("TweenService"):Create(
         root,
-        TweenInfo.new(distance / speed, Enum.EasingStyle.Linear),
+        TweenInfo.new(duration, Enum.EasingStyle.Linear),
         { CFrame = safeGoalCFrame }
     )
     Runtime.ActiveTween:Play()
@@ -3975,6 +4025,8 @@ local function startMovementWorker()
             setStatus("Chasing " .. player.Name)
         end
             
+        local chaseTimeMultiplier = getTargetTweenTimeMultiplier(localRoot, targetRoot)
+
         if insideHitbox and OrbitEnabled then
     local center = getHitboxMovementCFrame(
         localRoot,
@@ -3996,7 +4048,7 @@ local function startMovementWorker()
     local angularSpeed = math.min(
         math.rad(180),
         TweenSpeed * INTERNAL.InHitboxSpeedMultiplier * 0.8 / radius
-    )
+    ) / chaseTimeMultiplier
 
     angle = angle + angularSpeed * math.clamp(deltaTime, 0, 0.1)
 
@@ -4006,7 +4058,8 @@ local function startMovementWorker()
         math.sin(angle) * radius
     )
 
-    AutoTween(getHitboxMovementCFrame(localRoot, targetRoot, orbitPosition), deltaTime, true)
+    AutoTween(getHitboxMovementCFrame(localRoot, targetRoot, orbitPosition), deltaTime, true, chaseTimeMultiplier)
+    Runtime.ChaseTweenTimeMultiplier = chaseTimeMultiplier
     faceRootTowardTarget(localRoot, targetRoot)
 else
     local chaseGoal
@@ -4027,16 +4080,22 @@ else
     else
         stopSeaHeightMovement()
 
-        if chaseGoal and shouldAdvancePlayerChase(
-            now,
-            targetEpoch,
-            characterEpoch,
-            player,
-            character,
-            targetRoot,
-            localRoot
-        ) then
-            AutoTween(chaseGoal, deltaTime, insideHitbox)
+        if chaseGoal then
+            local shouldAdvance = shouldAdvancePlayerChase(
+                now,
+                targetEpoch,
+                characterEpoch,
+                player,
+                character,
+                targetRoot,
+                localRoot
+            )
+
+            -- Entering/leaving the movement box must also retime an active tween during a pause.
+            if shouldAdvance or Runtime.ChaseTweenTimeMultiplier ~= chaseTimeMultiplier then
+                AutoTween(chaseGoal, deltaTime, insideHitbox, chaseTimeMultiplier)
+                Runtime.ChaseTweenTimeMultiplier = chaseTimeMultiplier
+            end
         end
     end
 
