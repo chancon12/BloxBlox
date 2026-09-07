@@ -1,6 +1,6 @@
 -- GitHub-side Auto Bounty module.
 -- External options are intentionally limited to Team, Weapon, FastTP, ESP,
--- health thresholds, hitbox settings, and PlayerFollowTime.
+-- TweenSpeed, health thresholds, hitbox settings, and PlayerFollowTime.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -41,10 +41,17 @@ end
 
 local FastTPEnabled = Settings.FastTP ~= false
 local ESPEnabled = Settings.ESPPlayer ~= false
+local RawTweenSpeed = Settings.TweenSpeed
+local TweenSpeed = RawTweenSpeed == nil and 180 or tonumber(RawTweenSpeed)
 local LowHealth = tonumber(Settings.LowHealth) or 8000
 local RecoveryHealth = tonumber(Settings.MaxHealth) or 10000
 local RawPlayerFollowTime = Settings.PlayerFollowTime
 local PlayerFollowTime = RawPlayerFollowTime == nil and 30 or tonumber(RawPlayerFollowTime)
+
+if not isFiniteNumber(TweenSpeed) or TweenSpeed <= 0 then
+    warn("[AutoBounty] TweenSpeed must be a finite number above 0; using 180 studs per second.")
+    TweenSpeed = 180
+end
 
 if not isFiniteNumber(PlayerFollowTime) or PlayerFollowTime <= 0 then
     warn("[AutoBounty] PlayerFollowTime must be a finite number above 0; using 30 seconds.")
@@ -104,13 +111,17 @@ local INTERNAL = {
     NonFriendCacheTTL = 300,
     PvPRetryDelay = 0.75,
     PvPMaxAttempts = 5,
-    TweenTime = 0.10,
-    InHitboxTweenTime = 0.35,
+    InHitboxSpeedMultiplier = 2 / 7,
     FastTPArrivalTimeout = 3,
     FastTPCooldown = 2,
     ServerRetryDelay = 3,
+    ServerPageDelay = 0.03,
+    ServerInvokeTimeout = 5,
     TeleportStartTimeout = 8,
     TeleportTransferTimeout = 30,
+    FailedServerCooldown = 30,
+    MaxServerPages = 100,
+    MaxServerPlayers = 12,
     SafeEntrance = Vector3.new(
         -5083.26025390625,
         314.6056823730469,
@@ -165,6 +176,14 @@ assert(CommF, "[AutoBounty] ReplicatedStorage.Remotes.CommF_ was not found withi
 
 if not bootstrapStillCurrent() then
     return
+end
+
+local ServerBrowser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
+local ServerInvokeSlots = Environment.__AutoBountyServerInvokeSlots
+
+if type(ServerInvokeSlots) ~= "table" then
+    ServerInvokeSlots = {}
+    Environment.__AutoBountyServerInvokeSlots = ServerInvokeSlots
 end
 
 local PreviousRuntime = Environment.__AutoBountyRuntime
@@ -362,6 +381,9 @@ local Runtime = {
     FollowTimeoutHopDetail = nil,
     HopWorkerRunning = false,
     HopAttemptEpoch = 0,
+    ServerScanBusy = false,
+    FailedServers = {},
+    ServerInvokeSlots = ServerInvokeSlots,
     EmptySince = nil,
     Candidates = {},
     CandidateInfo = {},
@@ -1578,8 +1600,12 @@ local function AutoTween(goalCFrame, deltaTime, insideHitbox)
         return
     end
 
-    local tweenTime = insideHitbox and INTERNAL.InHitboxTweenTime or INTERNAL.TweenTime
-    local alpha = tweenTime <= 0 and 1 or (1 - math.exp(-deltaTime / tweenTime))
+    local distance = (goalCFrame.Position - root.Position).Magnitude
+    local speed = insideHitbox
+        and TweenSpeed * INTERNAL.InHitboxSpeedMultiplier
+        or TweenSpeed
+    local maxStep = speed * math.max(deltaTime, 0)
+    local alpha = distance <= 0.001 and 1 or math.min(maxStep / distance, 1)
     root.CFrame = root.CFrame:Lerp(goalCFrame, math.clamp(alpha, 0, 1))
 end
 
@@ -2522,6 +2548,261 @@ local function startESPWorker()
     end)
 end
 
+local function getServerBrowser()
+    local browser = ServerBrowser
+
+    if not browser or not browser.Parent then
+        browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
+        ServerBrowser = browser
+    end
+
+    return browser
+end
+
+local function invokeServerBrowser(browser, timeout, slotKey, guard, ...)
+    local previousCall = ServerInvokeSlots[slotKey]
+
+    if previousCall and not previousCall.Finished then
+        return nil, "A previous server-browser invocation is still pending", false, true
+    end
+
+    if previousCall then
+        ServerInvokeSlots[slotKey] = nil
+    end
+
+    local arguments = table.pack(...)
+    local call = {
+        Finished = false,
+        Cancelled = false,
+        Started = false,
+        Success = nil,
+        Result = nil,
+    }
+
+    ServerInvokeSlots[slotKey] = call
+
+    task.spawn(function()
+        local function finish(success, result)
+            call.Success = success
+            call.Result = result
+            call.Finished = true
+
+            if ServerInvokeSlots[slotKey] == call then
+                ServerInvokeSlots[slotKey] = nil
+            end
+        end
+
+        if call.Cancelled then
+            finish(false, "Invocation cancelled before it started")
+            return
+        end
+
+        if not Runtime.Running
+            or not Runtime.HopPending
+            or Runtime.SafeMode
+            or Runtime.LocalDead then
+
+            finish(false, "Invocation blocked by runtime state")
+            return
+        end
+
+        if guard then
+            local guardOk, allowed = pcall(guard)
+
+            if not guardOk or not allowed then
+                finish(
+                    false,
+                    guardOk and "Invocation blocked by state validation" or allowed
+                )
+                return
+            end
+        end
+
+        if call.Cancelled then
+            finish(false, "Invocation cancelled before it was sent")
+            return
+        end
+
+        call.Started = true
+        local callSuccess, callResult = pcall(function()
+            return browser:InvokeServer(table.unpack(arguments, 1, arguments.n))
+        end)
+
+        finish(callSuccess, callResult)
+    end)
+
+    local deadline = os.clock() + timeout
+
+    while Runtime.Running
+        and Runtime.HopPending
+        and not Runtime.SafeMode
+        and not Runtime.LocalDead
+        and not call.Finished
+        and os.clock() < deadline do
+
+        task.wait(0.05)
+    end
+
+    if call.Finished then
+        return call.Success, call.Result, true, false
+    end
+
+    call.Cancelled = true
+    return nil, "Server-browser invocation timed out or was cancelled", false, false
+end
+
+local function getCurrentJob(browser)
+    if not browser then
+        return tostring(game.JobId)
+    end
+
+    local success, jobId = invokeServerBrowser(
+        browser,
+        INTERNAL.ServerInvokeTimeout,
+        "read",
+        nil,
+        "getjob"
+    )
+
+    if success and type(jobId) == "string" and jobId ~= "" then
+        return jobId
+    end
+
+    return tostring(game.JobId)
+end
+
+local function scanServers()
+    while Runtime.Running and Runtime.HopPending and Runtime.ServerScanBusy do
+        task.wait(0.1)
+    end
+
+    if not Runtime.Running or not Runtime.HopPending then
+        return {}, "cancelled"
+    end
+
+    local browser = getServerBrowser()
+
+    if not browser then
+        warnOnce(
+            "server-browser:missing",
+            "ReplicatedStorage.__ServerBrowser is missing; server hopping will retry."
+        )
+        return {}, "missing"
+    end
+
+    Runtime.ServerScanBusy = true
+
+    local currentJob = getCurrentJob(browser)
+    local gameJob = tostring(game.JobId)
+    local available = {}
+    local seenJobs = {}
+    local scanStatus = "ok"
+
+    for jobId, failedUntil in pairs(Runtime.FailedServers) do
+        if type(failedUntil) ~= "number" or failedUntil <= os.clock() then
+            Runtime.FailedServers[jobId] = nil
+        end
+    end
+
+    for page = 1, INTERNAL.MaxServerPages do
+        if not Runtime.Running
+            or not Runtime.HopPending
+            or Runtime.SafeMode
+            or Runtime.LocalDead then
+
+            scanStatus = "cancelled"
+            break
+        end
+
+        local success, servers, invokeFinished = invokeServerBrowser(
+            browser,
+            INTERNAL.ServerInvokeTimeout,
+            "read",
+            nil,
+            page
+        )
+
+        if not invokeFinished then
+            scanStatus = Runtime.Running
+                and Runtime.HopPending
+                and not Runtime.SafeMode
+                and not Runtime.LocalDead
+                and "failed"
+                or "cancelled"
+
+            if scanStatus == "failed" then
+                warnOnce(
+                    "server-browser:page-timeout",
+                    "A server-browser page request timed out."
+                )
+            end
+
+            break
+        elseif not success then
+            scanStatus = "failed"
+            warnOnce(
+                "server-browser:page",
+                "A server-browser page request failed: " .. tostring(servers)
+            )
+            break
+        elseif type(servers) ~= "table" then
+            scanStatus = "failed"
+            warnOnce(
+                "server-browser:schema",
+                "The server browser returned an unexpected page format."
+            )
+            break
+        end
+
+        local pageHadEntries = false
+
+        for key, info in pairs(servers) do
+            if type(info) == "table" then
+                pageHadEntries = true
+
+                local jobId = info.JobId or info.Id
+
+                if (type(jobId) ~= "string" or jobId == "") and type(key) == "string" then
+                    jobId = key
+                end
+
+                local count = tonumber(info.Count or info.Playing or info.Players)
+                local maxPlayers = tonumber(info.MaxPlayers or info.Capacity)
+                    or INTERNAL.MaxServerPlayers
+
+                if type(jobId) == "string"
+                    and jobId ~= ""
+                    and jobId ~= currentJob
+                    and jobId ~= gameJob
+                    and not seenJobs[jobId]
+                    and isFiniteNumber(count)
+                    and count >= 0
+                    and isFiniteNumber(maxPlayers)
+                    and maxPlayers > 0
+                    and count < maxPlayers
+                    and not Runtime.FailedServers[jobId] then
+
+                    seenJobs[jobId] = true
+                    table.insert(available, {
+                        JobId = jobId,
+                        Count = count,
+                        MaxPlayers = maxPlayers,
+                    })
+                end
+            end
+        end
+
+        if not pageHadEntries then
+            break
+        end
+
+        task.wait(INTERNAL.ServerPageDelay)
+    end
+
+    Runtime.ServerScanBusy = false
+    return available, scanStatus
+end
+
 local function determineHopReason()
     local friend = findFriendInServer()
 
@@ -2670,7 +2951,28 @@ local function runHopWorker()
 
             Runtime.HopReason = reason
             Runtime.HopDetail = detail
-            setStatus("Preparing random Roblox server hop (" .. reason .. ")")
+            setStatus("Scanning available servers (" .. reason .. ")")
+            local servers, scanStatus = scanServers()
+
+            if not Runtime.Running or not Runtime.HopPending then
+                break
+            end
+
+            if Runtime.SafeMode or Runtime.LocalDead then
+                task.wait(0.1)
+                continue
+            end
+
+            rebuildCandidates()
+            reason, detail = determineHopReason()
+
+            if not reason then
+                stopHopPending("Hop condition cleared; scanning")
+                break
+            end
+
+            Runtime.HopReason = reason
+            Runtime.HopDetail = detail
 
             local currentInCombat, currentInCombatKnown = readLocalInCombat()
 
@@ -2685,7 +2987,18 @@ local function runHopWorker()
             elseif not currentInCombatKnown or currentInCombat == true then
                 setStatus("Combat state blocks server hop")
                 task.wait(0.25)
+            elseif #servers == 0 then
+                if scanStatus == "missing" then
+                    setStatus("Server browser unavailable; retrying")
+                elseif scanStatus == "failed" then
+                    setStatus("Server browser scan failed; retrying")
+                else
+                    setStatus("No available server found; retrying")
+                end
+
+                task.wait(INTERNAL.ServerRetryDelay)
             else
+                local chosen = servers[math.random(1, #servers)]
                 Runtime.HopAttemptEpoch = Runtime.HopAttemptEpoch + 1
                 local attemptEpoch = Runtime.HopAttemptEpoch
                 local teleportStarted = false
@@ -2717,7 +3030,7 @@ local function runHopWorker()
                     end
                 end)
 
-                -- Final race check immediately before the Roblox teleport request.
+                -- Final race check immediately before the server-browser teleport request.
                 local finalInCombat, finalInCombatKnown = readLocalInCombat()
 
                 if not finalInCombatKnown
@@ -2739,44 +3052,69 @@ local function runHopWorker()
                     task.wait(0.25)
                 else
                     Runtime.Mode = "HOPPING"
-                    setStatus("Joining a random Roblox server (" .. reason .. ")")
+                    setStatus(string.format(
+                        "Joining server (%d/%d, %s)",
+                        chosen.Count,
+                        chosen.MaxPlayers,
+                        reason
+                    ))
                     Runtime.Teleporting = true
 
                     local requestDeadline = os.clock() + INTERNAL.TeleportStartTimeout
                     local invokeBlocked = false
                     local invokeReasonCleared = false
+                    local invokeBrowserMissing = false
+                    local invokeStateBlocked = false
                     local success
                     local result
+                    local invokeFinished = false
+                    local invokeAttempted = false
                     local teleportCharacter = Runtime.Character
                     local teleportCharacterEpoch = Runtime.CharacterEpoch
-                    rebuildCandidates()
-                    local invokeReason, invokeDetail = determineHopReason()
-                    local invokeInCombat, invokeInCombatKnown = readLocalInCombat()
-                    local mayTeleport = Runtime.Running
-                        and Runtime.HopPending
-                        and Runtime.HopAttemptEpoch == attemptEpoch
-                        and invokeReason ~= nil
-                        and not Runtime.SafeMode
-                        and not Runtime.LocalDead
-                        and Runtime.Character == teleportCharacter
-                        and Runtime.CharacterEpoch == teleportCharacterEpoch
-                        and invokeInCombatKnown
-                        and invokeInCombat == false
+                    local browser = getServerBrowser()
+                    local function validateTeleportInvocation()
+                        rebuildCandidates()
 
-                    if mayTeleport then
-                        Runtime.HopReason = invokeReason
-                        Runtime.HopDetail = invokeDetail
-                        success, result = pcall(function()
-                            return TeleportService:Teleport(game.PlaceId, LocalPlayer)
-                        end)
-                    else
+                        local invokeReason, invokeDetail = determineHopReason()
+                        local invokeInCombat, invokeInCombatKnown = readLocalInCombat()
+                        local mayTeleport = Runtime.Running
+                            and Runtime.HopPending
+                            and Runtime.HopAttemptEpoch == attemptEpoch
+                            and invokeReason ~= nil
+                            and not Runtime.SafeMode
+                            and not Runtime.LocalDead
+                            and Runtime.Character == teleportCharacter
+                            and Runtime.CharacterEpoch == teleportCharacterEpoch
+                            and invokeInCombatKnown
+                            and invokeInCombat == false
+                            and browser ~= nil
+                            and browser.Parent ~= nil
+
+                        if mayTeleport then
+                            Runtime.HopReason = invokeReason
+                            Runtime.HopDetail = invokeDetail
+                            invokeAttempted = true
+                            return true
+                        end
+
                         invokeBlocked = true
                         invokeReasonCleared = invokeReason == nil
-                        success = false
-                        result = invokeReasonCleared
-                            and "Hop condition cleared before teleport"
-                            or "Combat or character state changed before teleport"
+                        invokeBrowserMissing = not invokeReasonCleared
+                            and (not browser or not browser.Parent)
+                        invokeStateBlocked = not invokeReasonCleared
+                            and not invokeBrowserMissing
+                        return false
                     end
+
+                    local invokePending
+                    success, result, invokeFinished, invokePending = invokeServerBrowser(
+                        browser,
+                        INTERNAL.TeleportStartTimeout,
+                        "teleport",
+                        validateTeleportInvocation,
+                        "teleport",
+                        chosen.JobId
+                    )
 
                     while Runtime.Running
                         and Runtime.HopAttemptEpoch == attemptEpoch
@@ -2784,7 +3122,8 @@ local function runHopWorker()
                         and not Runtime.SafeMode
                         and not Runtime.LocalDead do
 
-                        if success == false
+                        if invokePending
+                            or (invokeFinished and success == false)
                             or (not teleportStarted and os.clock() >= requestDeadline)
                             or (teleportStarted
                                 and teleportStartedDeadline
@@ -2813,7 +3152,8 @@ local function runHopWorker()
                     local hopConditionCleared = invokeBlocked
                         and invokeReasonCleared
                         and activeReason == nil
-                    local followTimerReset = invokeBlocked and activeReason == "follow-timeout"
+                    local followTimerReset = invokeStateBlocked
+                        and activeReason == "follow-timeout"
 
                     if hopConditionCleared then
                         stopHopPending("Hop condition cleared; scanning")
@@ -2827,22 +3167,62 @@ local function runHopWorker()
                         -- A fresh target and full timer are required.
                     elseif interrupted then
                         setStatus(Runtime.SafeMode and "SafeMode active; server hop queued" or "Respawn interrupted server hop")
+                    elseif invokeBrowserMissing then
+                        setStatus("Server browser unavailable; server hop remains queued")
+                    elseif invokePending then
+                        setStatus("Previous server-browser teleport request is still pending")
                     elseif invokeBlocked then
                         setStatus("Combat/character state changed; server hop remains queued")
                     end
 
-                    if hopConditionCleared or followTimerReset or invokeBlocked then
+                    if not hopConditionCleared
+                        and not followTimerReset
+                        and not invokeBlocked
+                        and invokeAttempted
+                        and not interrupted then
+
+                        Runtime.FailedServers[chosen.JobId] = os.clock()
+                            + INTERNAL.FailedServerCooldown
+                    end
+
+                    if hopConditionCleared
+                        or followTimerReset
+                        or invokeBlocked
+                        or invokePending then
+
                         -- No teleport request was sent.
                     elseif interrupted then
                         -- The queued hop resumes after SafeMode/respawn.
-                    elseif not success then
-                        warnOnce("random-hop:teleport", "Random Roblox server hop failed: " .. tostring(result))
                     elseif teleportFailed then
-                        warnOnce("random-hop:teleport-state", "Random Roblox server hop failed after starting: " .. tostring(teleportFailureMessage))
+                        warnOnce(
+                            "server-browser:teleport-state:" .. chosen.JobId,
+                            "Server-browser teleport failed after starting: "
+                                .. tostring(teleportFailureMessage)
+                        )
                     elseif teleportStarted then
-                        warnOnce("random-hop:stalled", "Random Roblox server hop stalled during transfer; retrying.")
+                        warnOnce(
+                            "server-browser:stalled:" .. chosen.JobId,
+                            "Server-browser teleport stalled during transfer; retrying."
+                        )
+                    elseif not invokeFinished then
+                        warnOnce(
+                            "server-browser:invoke-timeout:" .. chosen.JobId,
+                            "Server-browser teleport request timed out; retrying."
+                        )
+                    elseif not success then
+                        warnOnce(
+                            "server-browser:teleport:" .. chosen.JobId,
+                            "Server-browser teleport failed: " .. tostring(result)
+                        )
                     else
-                        warnOnce("random-hop:no-start", "Random Roblox server hop did not start; retrying.")
+                        warnOnce(
+                            "server-browser:no-start:" .. chosen.JobId,
+                            "Server-browser teleport did not start; retrying."
+                        )
+                    end
+
+                    if Runtime.HopAttemptEpoch == attemptEpoch then
+                        Runtime.HopAttemptEpoch = Runtime.HopAttemptEpoch + 1
                     end
 
                     task.wait(INTERNAL.ServerRetryDelay)
