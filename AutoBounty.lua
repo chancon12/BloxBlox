@@ -3,7 +3,7 @@
 -- AutoHop, ESP, NoClip, TweenSpeed, SafeModeY, health thresholds, hitbox settings,
 -- PlayerFollowTime, NoDamageTimeout, SkipPreviousTargets, OrbitEnabled, RaceV3, RaceV4,
 -- ClickAttack, HitboxOffset, SafeZoneRadius, combo timings, panic movement,
--- SeaHeightStallTimeout, and optional ReadSkillCooldown.
+-- SeaHeightFirst, SeaHeightStallTimeout, and optional ReadSkillCooldown.
 -- Race flags belong in Config.Settings and require an explicit true.
 -- NoDamageTimeout is the seconds allowed for the first health drop after entering the hitbox.
 -- SkipPreviousTargets defaults to true; set false to allow previous targets through this filter.
@@ -21,6 +21,7 @@
 -- Optional ComboHold overrides every skill Hold; omit it to keep per-skill holds.
 -- ComboRetryDelay defaults to 1 second when cooldown activation cannot be confirmed.
 -- SeaHeightStallTimeout defaults to 3 seconds without vertical progress: retry once, then switch.
+-- SeaHeightFirst defaults to false for direct chasing; set true to restore the sea-level stage.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -2405,6 +2406,12 @@ local function getPlayerChaseGoal(localRoot, targetRoot)
     end
 
     local targetCFrame = targetRoot.CFrame
+
+    if Settings.SeaHeightFirst ~= true then
+        stopSeaHeightMovement()
+        return targetCFrame, false
+    end
+
     local targetPosition = targetCFrame.Position
     local localCFrame = localRoot.CFrame
     local localPosition = localCFrame.Position
