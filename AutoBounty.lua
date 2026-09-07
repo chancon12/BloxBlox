@@ -2044,7 +2044,7 @@ local function AutoTween(goalCFrame, deltaTime, insideHitbox)
     end
 
     root.CFrame = currentCFrame
-    root.achored = true
+    root.anchored = true
 
     game:GetService("TweenService"):Create(
         root,
