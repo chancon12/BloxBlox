@@ -25,7 +25,9 @@
 -- Config.Combo = {Enabled=true, RequiredWeapons={"Godhuman", "Cursed Dual Katana"},
 --     Steps={{Weapon="Godhuman", Key="Z", Hold=0.1}, {Weapon="Cursed Dual Katana", Key="X", Hold=0.3}}}.
 -- RequiredWeapons checks owned Tool names in Character/Backpack; all must be present. Case/spaces/punctuation are ignored.
--- Steps run in array order, skipping disabled/cooling skills. Missing requirements/tools pause custom attacks.
+-- Steps run in array order, skipping disabled/cooling skills. Missing required Tools select the default combo.
+-- When all required Tools are available again, the custom combo resumes from its first step.
+-- Malformed custom steps or an unavailable step Tool outside RequiredWeapons still pause custom attacks.
 -- Each step's optional Hold overrides Settings.ComboHold; omit it to keep the normal hold settings.
 -- Each step.Weapon uses the Tool display name (e.g. "Ice-Ice"); optional step.Tool overrides that lookup name.
 -- Weapon category/skill Enabled flags still apply. Explicit Gun steps run in the hitbox, independent of the basic opener.
@@ -3599,10 +3601,24 @@ function CombatActions.ComboRequirementsMet(combo)
     end
 
     if #missing > 0 then
-        return false, "Missing owned Tool: " .. table.concat(missing, ", ")
+        return false, "Missing owned Tool: " .. table.concat(missing, ", "), "missing-tools"
     end
 
     return true
+end
+
+function CombatActions.GetActiveComboConfig()
+    local combo = CombatActions.GetComboConfig()
+
+    if combo then
+        local ready, _, reason = CombatActions.ComboRequirementsMet(combo)
+
+        if not ready and reason == "missing-tools" then
+            return nil
+        end
+    end
+
+    return combo
 end
 
 function CombatActions.ResolveComboTool(step)
@@ -3725,10 +3741,13 @@ function CombatActions.CustomEntryValid(entry)
         return false
     end
 
-    local ready, reason = CombatActions.ComboRequirementsMet(combo)
+    local ready, reason, requirementState = CombatActions.ComboRequirementsMet(combo)
 
     if not ready then
-        CombatActions.ComboBlocked(reason)
+        if requirementState ~= "missing-tools" then
+            CombatActions.ComboBlocked(reason)
+        end
+
         return false
     end
 
@@ -3736,7 +3755,7 @@ function CombatActions.CustomEntryValid(entry)
 end
 
 function CombatActions.GetSkills(weaponOrder)
-    local combo = CombatActions.GetComboConfig()
+    local combo = CombatActions.GetActiveComboConfig()
 
     if combo then
         return CombatActions.GetCustomSkills(combo)
@@ -4219,7 +4238,7 @@ local function startWeaponWorker()
                     task.wait(0.01)
                 end
             else
-                local customCombo = CombatActions.GetComboConfig()
+                local customCombo = CombatActions.GetActiveComboConfig()
 
                 if comboEntries and comboEntries[1]
                     and comboEntries[1].ComboConfig ~= customCombo then
@@ -4239,7 +4258,9 @@ local function startWeaponWorker()
                 skillCursor = entryIndex + 1
 
                 if entry then
-                    if entry.ComboConfig and not CombatActions.CustomEntryValid(entry) then
+                    if entry.ComboConfig ~= CombatActions.GetActiveComboConfig()
+                        or (entry.ComboConfig and not CombatActions.CustomEntryValid(entry)) then
+
                         comboEntries = nil
                         skillCursor = 1
                     elseif equipTool(entry.Tool, targetEpoch, attackMode)
@@ -4251,7 +4272,9 @@ local function startWeaponWorker()
 
                         -- Equipping yields; recheck this exact combo step before
                         -- key-down, without restarting the order at the first skill.
-                        if entry.ComboConfig and not CombatActions.CustomEntryValid(entry) then
+                        if entry.ComboConfig ~= CombatActions.GetActiveComboConfig()
+                            or (entry.ComboConfig and not CombatActions.CustomEntryValid(entry)) then
+
                             comboEntries = nil
                             skillCursor = 1
                         elseif CombatActions.CanAttempt(entry) then
