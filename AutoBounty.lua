@@ -190,7 +190,7 @@ local INTERNAL = {
     FastTPArrivalTimeout = 3,
     FastTPCooldown = 2,
     ServerRetryDelay = 3,
-    ExternalHopURL = "https://raw.githubusercontent.com/WhiteX1208/Scripts/refs/heads/main/KaitunFindFruit.luau",
+    ExternalHopURL = "loadstring(game:HttpGet("https://raw.githubusercontent.com/acsu123/HOHO_H/main/Loading_UI"))()",
     ExternalHopDownloadTimeout = 15,
     ExternalHopMaxAbandonedDownloads = 3,
 }
