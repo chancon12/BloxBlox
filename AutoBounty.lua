@@ -3212,6 +3212,18 @@ local function startMovementWorker()
         end
 
         if insideHitbox then
+            if Runtime.Mode ~= "ENGAGE" then
+                Runtime.Mode = "ENGAGE"
+                setStatus("Engaging " .. player.Name)
+            end
+        elseif Runtime.Mode ~= "CHASE" then
+            Runtime.Mode = "CHASE"
+            Runtime.AimActive = false
+            releaseAllKeys()
+            setStatus("Chasing " .. player.Name)
+        end
+            
+        if insideHitbox then
     local center = targetRoot.Position
     local hitboxSize = HitboxEnabled and ConfiguredHitboxSize or targetRoot.Size
 
