@@ -35,6 +35,7 @@
 -- MaxTargetDistance defaults to 10000 studs (3D): direct targets first, then entrance routes.
 -- With FastTP enabled, new targets also use a closer entrance before chasing when over 300 studs away.
 -- Optional shortcuts are checked once per acquisition; failed shortcuts fall back to direct chasing.
+-- Empty-target hops attempt an entrance first (5s timeout), then wait for known InCombat=false.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -262,6 +263,7 @@ local INTERNAL = {
     FastTPCooldown = 2,
     FastTPMinimumDistance = 300,
     FastTPArrivalTolerance = 100,
+    EmptyHopEntranceTimeout = 5,
     ServerRetryDelay = 3,
     ExternalHopURL = "https://raw.githubusercontent.com/WhiteX1208/Scripts/refs/heads/main/KaitunFindFruit.luau",
     ExternalHopDownloadTimeout = 15,
@@ -1854,7 +1856,7 @@ local function startPvPEnable()
     end)
 end
 
-local function invokeEntrance(position, purpose, targetEpoch, validityCheck)
+local function invokeEntrance(position, purpose, targetEpoch, validityCheck, beforeInvoke)
     local function stillValid()
         if not validityCheck then
             return true
@@ -1899,6 +1901,10 @@ local function invokeEntrance(position, purpose, targetEpoch, validityCheck)
     Runtime.EntranceBusy = true
 
     local success, result = pcall(function()
+        if beforeInvoke then
+            beforeInvoke()
+        end
+
         return CommF:InvokeServer("requestEntrance", position)
     end)
 
@@ -2884,52 +2890,107 @@ local function faceRootTowardTarget(localRoot, targetRoot)
     end
 end
 
+local function emptyHopEntranceFinished()
+    if Runtime.ExternalHopLaunched or not isEmptyListHopReady() then
+        return true
+    end
+
+    local attempt = Runtime.EmptyCombatEntranceAttempt
+
+    return attempt ~= nil
+        and attempt.EmptySince == Runtime.EmptySince
+        and attempt.CharacterEpoch == Runtime.CharacterEpoch
+        and attempt.Root == Runtime.Root
+        and attempt.Done == true
+end
+
 local function updateEmptyCombatEntrance()
+    if Runtime.ExternalHopLaunched then
+        return true
+    end
+
     local character = Runtime.Character
     local characterEpoch = Runtime.CharacterEpoch
     local root = Runtime.Root
     local humanoid = Runtime.Humanoid
-    local inCombat, inCombatKnown = readLocalInCombat()
+    local emptySince = Runtime.EmptySince
 
-    if not Runtime.Running
-        or not Runtime.HopPending
-        or Runtime.SafeMode
-        or Runtime.LocalDead
-        or not isEmptyListHopReady()
-        or not inCombatKnown
-        or inCombat ~= true
-        or Runtime.CurrentTarget ~= nil
-        or not character
-        or character ~= LocalPlayer.Character
-        or not root
-        or not root.Parent
-        or not root:IsDescendantOf(character)
-        or not isFiniteVector3(root.Position)
-        or not humanoid
-        or humanoid.Parent ~= character
-        or humanoid.Health <= 0 then
+    local function contextStillValid()
+        return Runtime.Running
+            and Runtime.HopPending
+            and not Runtime.SafeMode
+            and not Runtime.LocalDead
+            and not Runtime.ExternalHopLaunched
+            and Runtime.CurrentTarget == nil
+            and Runtime.EmptySince == emptySince
+            and Runtime.CharacterEpoch == characterEpoch
+            and character ~= nil
+            and Runtime.Character == character
+            and LocalPlayer.Character == character
+            and root ~= nil
+            and Runtime.Root == root
+            and root.Parent ~= nil
+            and root:IsDescendantOf(character)
+            and isFiniteVector3(root.Position)
+            and humanoid ~= nil
+            and Runtime.Humanoid == humanoid
+            and humanoid.Parent == character
+            and humanoid.Health > 0
+            and isEmptyListHopReady()
+    end
 
+    if not contextStillValid() then
         return false
     end
 
-    local previousAttempt = Runtime.EmptyCombatEntranceAttempt
+    local function finish(attempt, state, message)
+        if attempt.Done then
+            return
+        end
 
-    if previousAttempt
-        and previousAttempt.EmptySince == Runtime.EmptySince
-        and previousAttempt.CharacterEpoch == characterEpoch then
+        attempt.Done = true
+        attempt.State = state
 
-        return true
+        if Runtime.EmptyCombatEntranceAttempt == attempt and contextStillValid() then
+            print("[AutoBounty][HopEntrance] " .. message)
+            setStatus(message)
+        end
     end
 
-    -- Latch before spawning: Heartbeat must not issue duplicate requests.
-    local attempt = {
-        EmptySince = Runtime.EmptySince,
+    local attempt = Runtime.EmptyCombatEntranceAttempt
+
+    if attempt
+        and attempt.EmptySince == emptySince
+        and attempt.CharacterEpoch == characterEpoch
+        and attempt.Root == root then
+
+        if not attempt.Done then
+            if attempt.Started
+                and (root.Position - attempt.Entrance).Magnitude <= INTERNAL.FastTPArrivalTolerance then
+
+                finish(attempt, "arrived", "Entrance position reached; checking combat before hopping")
+            elseif os.clock() >= attempt.Deadline then
+                local message = attempt.Started
+                    and "Entrance arrival timed out; checking combat before hopping"
+                    or "Entrance request timed out while queued; checking combat before hopping"
+                finish(attempt, "timeout", message)
+            end
+        end
+
+        return attempt.Done == true
+    end
+
+    -- One bounded attempt per empty episode/character/root, independent of combat's value/type.
+    attempt = {
+        EmptySince = emptySince,
         CharacterEpoch = characterEpoch,
+        Root = root,
+        Deadline = os.clock() + INTERNAL.EmptyHopEntranceTimeout,
+        Started = false,
+        Done = false,
     }
     Runtime.EmptyCombatEntranceAttempt = attempt
     Runtime.Mode = "HOP_WAIT"
-
-    -- An old chase tween must not pull us back after requestEntrance.
     stopSeaHeightMovement()
 
     if Runtime.ActiveTween then
@@ -2938,53 +2999,62 @@ local function updateEmptyCombatEntrance()
     end
 
     restoreLocalCollision()
-    local entrance = nearestEntrance(root.Position)
+    attempt.Entrance = nearestEntrance(root.Position)
 
-    if not entrance then
-        setStatus("No entrance available; waiting for InCombat to turn off before hopping")
-        return false
+    if not attempt.Entrance then
+        finish(attempt, "unavailable", "No entrance available; checking combat before hopping")
+        return true
     end
+
+    local rawCombat = character:GetAttribute("InCombat")
+    print(string.format(
+        "[AutoBounty][HopEntrance] Preparing | Entrance=%s | InCombat=%s | Type=%s",
+        tostring(attempt.Entrance), tostring(rawCombat), typeof(rawCombat)
+    ))
+    setStatus("No eligible targets; preparing entrance before server hop")
 
     local function stillValid()
-        local currentInCombat, currentInCombatKnown = readLocalInCombat()
-
-        return Runtime.Running
-            and Runtime.HopPending
-            and not Runtime.SafeMode
-            and not Runtime.LocalDead
+        return not attempt.Done
+            and os.clock() < attempt.Deadline
             and Runtime.EmptyCombatEntranceAttempt == attempt
-            and Runtime.EmptySince == attempt.EmptySince
-            and Runtime.CharacterEpoch == characterEpoch
-            and Runtime.Character == character
-            and LocalPlayer.Character == character
-            and Runtime.Humanoid == humanoid
-            and humanoid.Parent == character
-            and humanoid.Health > 0
-            and Runtime.Root == root
-            and root.Parent ~= nil
-            and root:IsDescendantOf(character)
-            and isFiniteVector3(root.Position)
-            and Runtime.CurrentTarget == nil
-            and isEmptyListHopReady()
-            and currentInCombatKnown
-            and currentInCombat == true
+            and contextStillValid()
     end
 
-    setStatus("InCombat with no eligible targets; requesting nearest entrance")
-
     task.spawn(function()
-        local success = invokeEntrance(entrance, "EmptyCombat", nil, stillValid)
+        local success = invokeEntrance(attempt.Entrance, "EmptyCombat", nil, stillValid, function()
+            attempt.Started = true
+            print("[AutoBounty][HopEntrance] requestEntrance dispatched | Entrance=" .. tostring(attempt.Entrance))
+        end)
 
-        if not stillValid() then
+        if attempt.Done or Runtime.EmptyCombatEntranceAttempt ~= attempt then
             return
         end
 
-        setStatus(success
-            and "Entrance requested; waiting for InCombat to turn off before hopping"
-            or "Entrance request failed; waiting for InCombat to turn off before hopping")
+        if not contextStillValid() then
+            attempt.Done = true
+            attempt.State = "cancelled"
+
+            -- A cancelled queued operation has not used this episode's entrance request.
+            if not attempt.Started then
+                Runtime.EmptyCombatEntranceAttempt = nil
+            end
+
+            return
+        end
+
+        attempt.Returned = true
+        attempt.Success = success
+
+        if os.clock() >= attempt.Deadline then
+            finish(attempt, "timeout", "Entrance request timed out; checking combat before hopping")
+        elseif not success then
+            finish(attempt, "failed", "Entrance request failed; checking combat before hopping")
+        else
+            print("[AutoBounty][HopEntrance] Request returned; waiting for entrance position")
+        end
     end)
 
-    return true
+    return attempt.Done == true
 end
 
 local function faceCameraTowardTarget()
@@ -4451,7 +4521,6 @@ local function startMovementWorker()
         end
 
         if Runtime.HopPending then
-            updateEmptyCombatEntrance()
             return
         end
 
@@ -4994,7 +5063,7 @@ local function validateExternalHopLaunch(launch)
     local reason, detail = determineHopReason()
     local inCombat, inCombatKnown = readLocalInCombat()
 
-    if not reason or not inCombatKnown or inCombat ~= false then
+    if not reason or not emptyHopEntranceFinished() or not inCombatKnown or inCombat ~= false then
         return false
     end
 
@@ -5252,6 +5321,10 @@ local function runHopWorker()
             Runtime.Mode = "HOP_WAIT"
 
             while Runtime.Running and Runtime.HopPending do
+                if Runtime.SafeMode or Runtime.LocalDead then
+                    break
+                end
+
                 rebuildCandidates()
 
                 local activeReason = determineHopReason()
@@ -5271,18 +5344,16 @@ local function runHopWorker()
                     break
                 end
 
-                if inCombatKnown and inCombat == false then
+                local entranceReady = not isEmptyListHopReady() or updateEmptyCombatEntrance()
+
+                if entranceReady and inCombatKnown and inCombat == false then
                     break
                 end
 
-                local emptyWhileInCombat = isEmptyListHopReady()
-                    and inCombatKnown
-                    and inCombat == true
-
-                if not emptyWhileInCombat then
+                if entranceReady then
                     setStatus(inCombatKnown
                         and "Waiting for InCombat to turn off before external hop"
-                        or "Waiting for Character.InCombat before external hop")
+                        or "Waiting for a boolean Character.InCombat before external hop")
                 end
 
                 task.wait(0.25)
@@ -5305,6 +5376,11 @@ local function runHopWorker()
             if not reason then
                 stopHopPending("Hop condition cleared; scanning")
                 break
+            end
+
+            if isEmptyListHopReady() and not updateEmptyCombatEntrance() then
+                task.wait(0.05)
+                continue
             end
 
             if not inCombatKnown or inCombat ~= false then
