@@ -1,11 +1,12 @@
 -- GitHub-side Auto Bounty module.
 -- External options are intentionally limited to Team, Weapon, Attack, FastTP,
 -- AutoHop, ESP, NoClip, TweenSpeed, SafeModeY, health thresholds, hitbox settings,
--- PlayerFollowTime, NoDamageTimeout, SkipPreviousTargets, RaceV3, RaceV4,
+-- PlayerFollowTime, NoDamageTimeout, SkipPreviousTargets, OrbitEnabled, RaceV3, RaceV4,
 -- and optional ReadSkillCooldown.
 -- Race flags belong in Config.Settings and require an explicit true.
 -- NoDamageTimeout is the seconds allowed for the first health drop after entering the hitbox.
 -- SkipPreviousTargets defaults to true; set false to allow previous targets through this filter.
+-- OrbitEnabled defaults to true; set false to follow the target directly without circling.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -46,6 +47,7 @@ end
 local FastTPEnabled = Settings.FastTP ~= false
 local ESPEnabled = Settings.ESPPlayer ~= false
 local SkipPreviousTargets = Settings.SkipPreviousTargets ~= false
+local OrbitEnabled = Settings.OrbitEnabled ~= false
 local RawAutoHop = Settings.AutoHop
 local AutoHopEnabled = RawAutoHop == nil and true or RawAutoHop
 local RawAttack = Settings.Attack
@@ -3599,7 +3601,7 @@ local function startMovementWorker()
             setStatus("Chasing " .. player.Name)
         end
             
-        if insideHitbox then
+        if insideHitbox and OrbitEnabled then
     local center = targetRoot.Position
     local hitboxSize = HitboxEnabled and ConfiguredHitboxSize or targetRoot.Size
 
@@ -3640,7 +3642,11 @@ else
         targetRoot,
         localRoot
     ) then
-        AutoTween(chaseGoal, deltaTime, false)
+        AutoTween(chaseGoal, deltaTime, insideHitbox)
+    end
+
+    if insideHitbox then
+        faceRootTowardTarget(localRoot, targetRoot)
     end
 end
     end)
