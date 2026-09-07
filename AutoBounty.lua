@@ -1,6 +1,6 @@
 -- GitHub-side Auto Bounty module.
 -- External options are intentionally limited to Team, Weapon, FastTP, ESP,
--- NoClip, TweenSpeed, health thresholds, hitbox settings, and PlayerFollowTime.
+-- AutoHop, NoClip, TweenSpeed, health thresholds, hitbox settings, and PlayerFollowTime.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -40,6 +40,8 @@ end
 
 local FastTPEnabled = Settings.FastTP ~= false
 local ESPEnabled = Settings.ESPPlayer ~= false
+local RawAutoHop = Settings.AutoHop
+local AutoHopEnabled = RawAutoHop == nil and true or RawAutoHop
 local RawNoClip = Settings.NoClip
 local NoClipEnabled = RawNoClip == nil and true or RawNoClip
 local RawTweenSpeed = Settings.TweenSpeed
@@ -48,6 +50,11 @@ local LowHealth = tonumber(Settings.LowHealth) or 8000
 local RecoveryHealth = tonumber(Settings.MaxHealth) or 10000
 local RawPlayerFollowTime = Settings.PlayerFollowTime
 local PlayerFollowTime = RawPlayerFollowTime == nil and 30 or tonumber(RawPlayerFollowTime)
+
+if type(AutoHopEnabled) ~= "boolean" then
+    warn("[AutoBounty] AutoHop must be true or false; using true.")
+    AutoHopEnabled = true
+end
 
 if type(NoClipEnabled) ~= "boolean" then
     warn("[AutoBounty] NoClip must be true or false; using true.")
@@ -120,6 +127,8 @@ local INTERNAL = {
     InHitboxSpeedMultiplier = 2 / 7,
     MinimumTweenY = 0,
     VerticalChaseDistance = 1000,
+    ChaseMoveDuration = 1,
+    ChasePauseDuration = 0.1,
     SafeZoneRetreatInset = 0.5,
     FastTPArrivalTimeout = 3,
     FastTPCooldown = 2,
@@ -387,6 +396,7 @@ local Runtime = {
     Humanoid = nil,
     Root = nil,
     InsideHitbox = false,
+    ChaseMoveCycle = nil,
     FollowNoCombatSince = nil,
     FollowTimerEpoch = nil,
     FollowTimerCharacterEpoch = nil,
@@ -426,6 +436,7 @@ local Runtime = {
     HitboxSnapshot = nil,
     LocalCollisionSnapshot = {},
     LocalCollisionCharacter = nil,
+    AutoHopEnabled = AutoHopEnabled,
     NoClipEnabled = NoClipEnabled,
     BodyClip = nil,
     BodyClipRoot = nil,
@@ -1537,6 +1548,7 @@ local function rebuildCandidates()
 end
 
 local function resetTargetTimers()
+    Runtime.ChaseMoveCycle = nil
     Runtime.FollowNoCombatSince = nil
     Runtime.FollowTimerEpoch = nil
     Runtime.FollowTimerCharacterEpoch = nil
@@ -2008,6 +2020,56 @@ local function AutoTween(goalCFrame, deltaTime, insideHitbox)
     if safeNextCFrame then
         root.CFrame = safeNextCFrame
     end
+end
+
+local function shouldAdvancePlayerChase(
+    now,
+    targetEpoch,
+    characterEpoch,
+    player,
+    targetCharacter,
+    targetRoot,
+    localRoot
+)
+    local cycle = Runtime.ChaseMoveCycle
+
+    if not cycle
+        or cycle.TargetEpoch ~= targetEpoch
+        or cycle.CharacterEpoch ~= characterEpoch
+        or cycle.Player ~= player
+        or cycle.TargetCharacter ~= targetCharacter
+        or cycle.TargetRoot ~= targetRoot
+        or cycle.LocalRoot ~= localRoot then
+
+        cycle = {
+            TargetEpoch = targetEpoch,
+            CharacterEpoch = characterEpoch,
+            Player = player,
+            TargetCharacter = targetCharacter,
+            TargetRoot = targetRoot,
+            LocalRoot = localRoot,
+            MoveUntil = now + INTERNAL.ChaseMoveDuration,
+            PauseUntil = nil,
+        }
+        Runtime.ChaseMoveCycle = cycle
+    end
+
+    if cycle.PauseUntil then
+        if now < cycle.PauseUntil then
+            return false
+        end
+
+        cycle.PauseUntil = nil
+        cycle.MoveUntil = now + INTERNAL.ChaseMoveDuration
+        return true
+    end
+
+    if now >= cycle.MoveUntil then
+        cycle.PauseUntil = now + INTERNAL.ChasePauseDuration
+        return false
+    end
+
+    return true
 end
 
 local function getPlayerChaseGoal(localRoot, targetRoot)
@@ -3026,7 +3088,15 @@ local function startMovementWorker()
 
         local chaseGoal = getPlayerChaseGoal(localRoot, targetRoot)
 
-        if chaseGoal then
+        if chaseGoal and shouldAdvancePlayerChase(
+            now,
+            targetEpoch,
+            characterEpoch,
+            player,
+            character,
+            targetRoot,
+            localRoot
+        ) then
             AutoTween(chaseGoal, deltaTime, insideHitbox)
         end
 
@@ -3179,6 +3249,10 @@ local function startESPWorker()
 end
 
 determineHopReason = function()
+    if not AutoHopEnabled then
+        return nil
+    end
+
     local friend = findFriendInServer()
 
     if friend then
@@ -3244,6 +3318,7 @@ end
 
 local function validateExternalHopLaunch(launch)
     if type(launch) ~= "table"
+        or not AutoHopEnabled
         or launch.Cancelled
         or launch.Executed
         or type(launch.DownloadDeadline) ~= "number"
@@ -3297,6 +3372,10 @@ local function recordExternalHopAbandonedDownload(launch)
 end
 
 local function beginExternalHopLaunch(reason, detail)
+    if not AutoHopEnabled then
+        return nil, false, "auto-hop-disabled"
+    end
+
     local existing = Environment.__AutoBountyExternalHopLaunch
 
     if type(existing) == "table"
@@ -3487,6 +3566,14 @@ local function beginExternalHopLaunch(reason, detail)
 end
 
 local function runHopWorker()
+    if not AutoHopEnabled then
+        if Runtime.HopPending then
+            stopHopPending("AutoHop disabled; scanning")
+        end
+
+        return
+    end
+
     if Runtime.HopWorkerRunning then
         return
     end
@@ -3738,8 +3825,8 @@ local function runHopWorker()
 end
 
 requestHop = function(reason, detail)
-    if not Runtime.Running then
-        return
+    if not Runtime.Running or not AutoHopEnabled then
+        return false
     end
 
     local currentPriority = HOP_PRIORITY[Runtime.HopReason] or 0
@@ -3770,6 +3857,7 @@ requestHop = function(reason, detail)
     end
 
     runHopWorker()
+    return true
 end
 
 local function startFriendWorker()
@@ -3888,6 +3976,8 @@ local function startTargetWorker()
                     end
                 elseif Runtime.PendingCandidateCount > 0 then
                     setStatus("Waiting for player data or respawn")
+                elseif not AutoHopEnabled then
+                    setStatus("No eligible players; AutoHop disabled")
                 else
                     local elapsed = Runtime.EmptySince
                         and (os.clock() - Runtime.EmptySince)
