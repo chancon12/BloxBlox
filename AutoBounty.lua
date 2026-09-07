@@ -1812,9 +1812,16 @@ local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer)
             and isInsideSafeZone(targetRoot.Position) == false
     end
 
-    local entrance = nearestEntrance(targetRoot.Position)
+    local entrance, entranceDistance = nearestEntrance(targetRoot.Position)
 
     if not entrance then
+        return false
+    end
+
+    local currentDistance = (localRoot.Position - targetRoot.Position).Magnitude
+
+    -- Skip the entrance if you are already closer to the target.
+    if currentDistance <= entranceDistance then
         return false
     end
 
