@@ -2,12 +2,14 @@
 -- External options are intentionally limited to Team, Weapon, Attack, FastTP,
 -- AutoHop, ESP, NoClip, TweenSpeed, SafeModeY, health thresholds, hitbox settings,
 -- PlayerFollowTime, NoDamageTimeout, SkipPreviousTargets, OrbitEnabled, RaceV3, RaceV4,
--- ClickAttack, and optional ReadSkillCooldown.
+-- ClickAttack, HitboxOffset, and optional ReadSkillCooldown.
 -- Race flags belong in Config.Settings and require an explicit true.
 -- NoDamageTimeout is the seconds allowed for the first health drop after entering the hitbox.
 -- SkipPreviousTargets defaults to true; set false to allow previous targets through this filter.
 -- OrbitEnabled defaults to true; set false to follow the target directly without circling.
 -- ClickAttack defaults to true; set false to disable normal attacks while skills are cooling down.
+-- HitboxOffset defaults to Vector3.new(0, 0, 0), relative to the target's CFrame:
+-- +X right, +Y up, -Z front, +Z behind. Positions stay inside the hitbox and above sea level.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -66,6 +68,18 @@ local RawPlayerFollowTime = Settings.PlayerFollowTime
 local PlayerFollowTime = RawPlayerFollowTime == nil and 30 or tonumber(RawPlayerFollowTime)
 local RawNoDamageTimeout = Settings.NoDamageTimeout
 local NoDamageTimeout = RawNoDamageTimeout == nil and 30 or tonumber(RawNoDamageTimeout)
+local HitboxOffset = Settings.HitboxOffset
+
+if HitboxOffset == nil then
+    HitboxOffset = Vector3.new(0, 0, 0)
+elseif typeof(HitboxOffset) ~= "Vector3"
+    or not isFiniteNumber(HitboxOffset.X)
+    or not isFiniteNumber(HitboxOffset.Y)
+    or not isFiniteNumber(HitboxOffset.Z) then
+
+    warn("[AutoBounty] Settings.HitboxOffset must be a finite Vector3; using Vector3.new(0, 0, 0).")
+    HitboxOffset = Vector3.new(0, 0, 0)
+end
 
 if type(AutoHopEnabled) ~= "boolean" then
     warn("[AutoBounty] AutoHop must be true or false; using true.")
@@ -155,11 +169,14 @@ local INTERNAL = {
     NonFriendCacheTTL = 300,
     PvPRetryDelay = 0.75,
     PvPMaxAttempts = 5,
-    InHitboxSpeedMultiplier = 1,
+    InHitboxSpeedMultiplier = 2 / 7,
     MinimumTweenY = 0,
     VerticalChaseDistance = 1000,
     ChaseMoveDuration = 1,
     ChasePauseDuration = 0.1,
+    SeaHeightTweenSpeed = 50,
+    SeaHeightMoveDuration = 0.5,
+    SeaHeightPauseDuration = 0.1,
     SafeZoneRetreatInset = 0.5,
     FastTPArrivalTimeout = 3,
     FastTPCooldown = 2,
@@ -423,6 +440,7 @@ local Runtime = {
     Root = nil,
     InsideHitbox = false,
     ChaseMoveCycle = nil,
+    SeaHeightMove = nil,
     FollowNoCombatSince = nil,
     FollowTimerEpoch = nil,
     FollowTimerCharacterEpoch = nil,
@@ -1579,7 +1597,27 @@ local function rebuildCandidates()
     return candidates
 end
 
+local function stopSeaHeightMovement()
+    local movement = Runtime.SeaHeightMove
+    Runtime.SeaHeightMove = nil
+
+    if not movement then
+        return
+    end
+
+    if movement.Connection then
+        movement.Connection:Disconnect()
+        movement.Connection = nil
+    end
+
+    if movement.Tween then
+        movement.Tween:Cancel()
+        movement.Tween = nil
+    end
+end
+
 local function resetTargetTimers()
+    stopSeaHeightMovement()
     Runtime.ChaseMoveCycle = nil
     Runtime.FollowNoCombatSince = nil
     Runtime.FollowTimerEpoch = nil
@@ -2046,6 +2084,7 @@ local function canAttack(targetEpoch)
 end
 
 local function AutoTween(goalCFrame, deltaTime, insideHitbox)
+    stopSeaHeightMovement()
     local root = Runtime.Root
 
     if not root or not root.Parent or typeof(goalCFrame) ~= "CFrame" then
@@ -2069,12 +2108,117 @@ local function AutoTween(goalCFrame, deltaTime, insideHitbox)
     end
 
     root.CFrame = currentCFrame
+    root.Anchored = true
 
     game:GetService("TweenService"):Create(
         root,
         TweenInfo.new(distance / speed, Enum.EasingStyle.Linear),
         { CFrame = safeGoalCFrame }
     ):Play()
+end
+
+local function updateSeaHeightMovement(goalCFrame, now, targetEpoch, characterEpoch, localRoot)
+    if not Runtime.Running
+        or Runtime.SafeMode
+        or Runtime.LocalDead
+        or Runtime.HopPending
+        or Runtime.TargetEpoch ~= targetEpoch
+        or Runtime.CharacterEpoch ~= characterEpoch
+        or not Runtime.CurrentTarget
+        or Runtime.Root ~= localRoot
+        or not localRoot
+        or not localRoot.Parent
+        or not isFiniteVector3(localRoot.Position)
+        or typeof(goalCFrame) ~= "CFrame" then
+
+        stopSeaHeightMovement()
+        return
+    end
+
+    local movement = Runtime.SeaHeightMove
+
+    if movement
+        and (movement.TargetEpoch ~= targetEpoch
+            or movement.CharacterEpoch ~= characterEpoch
+            or movement.Root ~= localRoot) then
+
+        stopSeaHeightMovement()
+        movement = nil
+    end
+
+    if not movement then
+        movement = {
+            TargetEpoch = targetEpoch,
+            CharacterEpoch = characterEpoch,
+            Root = localRoot,
+            ResumeAt = now,
+        }
+        Runtime.SeaHeightMove = movement
+        Runtime.ChaseMoveCycle = nil
+    end
+
+    if movement.Tween or now < movement.ResumeAt then
+        return
+    end
+
+    local currentCFrame = clampCFrameAboveSea(localRoot.CFrame)
+    local safeGoal = clampCFrameAboveSea(goalCFrame)
+
+    if not currentCFrame or not safeGoal then
+        stopSeaHeightMovement()
+        return
+    end
+
+    local position = currentCFrame.Position
+    local differenceY = safeGoal.Position.Y - position.Y
+    local distance = math.abs(differenceY)
+
+    if distance <= 0.001 then
+        stopSeaHeightMovement()
+        return
+    end
+
+    -- A completed segment cannot continue moving during the following pause.
+    local step = math.min(distance, INTERNAL.SeaHeightTweenSpeed * INTERNAL.SeaHeightMoveDuration)
+    local nextY = position.Y + (differenceY < 0 and -step or step)
+    local stepGoal = CFrame.new(position.X, nextY, position.Z) * currentCFrame.Rotation
+
+    localRoot.CFrame = currentCFrame
+    localRoot.Anchored = true
+
+    local tween = game:GetService("TweenService"):Create(
+        localRoot,
+        TweenInfo.new(step / INTERNAL.SeaHeightTweenSpeed, Enum.EasingStyle.Linear),
+        { CFrame = stepGoal }
+    )
+    movement.Tween = tween
+    movement.Connection = tween.Completed:Connect(function(playbackState)
+        if Runtime.SeaHeightMove ~= movement or movement.Tween ~= tween then
+            return
+        end
+
+        movement.Connection:Disconnect()
+        movement.Connection = nil
+        movement.Tween = nil
+
+        if playbackState ~= Enum.PlaybackState.Completed
+            or not Runtime.Running
+            or Runtime.SafeMode
+            or Runtime.LocalDead
+            or Runtime.HopPending
+            or Runtime.TargetEpoch ~= targetEpoch
+            or Runtime.CharacterEpoch ~= characterEpoch
+            or Runtime.Root ~= localRoot
+            or not localRoot.Parent
+            or localRoot.Position.Y <= INTERNAL.MinimumTweenY + 0.001 then
+
+            stopSeaHeightMovement()
+            return
+        end
+
+        movement.ResumeAt = os.clock() + INTERNAL.SeaHeightPauseDuration
+    end)
+    tween:Play()
 end
 
 local function updateSafeModeMovement(deltaTime)
@@ -2228,25 +2372,30 @@ local function getPlayerChaseGoal(localRoot, targetRoot)
 
     local targetCFrame = targetRoot.CFrame
     local targetPosition = targetCFrame.Position
+    local localCFrame = localRoot.CFrame
+    local localPosition = localCFrame.Position
+    local seaMovement = Runtime.SeaHeightMove
+    local finishingSeaHeight = seaMovement
+        and seaMovement.TargetEpoch == Runtime.TargetEpoch
+        and seaMovement.CharacterEpoch == Runtime.CharacterEpoch
+        and seaMovement.Root == localRoot
+        and localPosition.Y > INTERNAL.MinimumTweenY + 0.001
     local horizontalOffset = Vector3.new(
         targetPosition.X - localRoot.Position.X,
         0,
         targetPosition.Z - localRoot.Position.Z
     )
 
-    if horizontalOffset.Magnitude <= INTERNAL.VerticalChaseDistance then
+    if not finishingSeaHeight and horizontalOffset.Magnitude <= INTERNAL.VerticalChaseDistance then
         return targetCFrame
     end
-
-    local localCFrame = localRoot.CFrame
-    local localPosition = localCFrame.Position
 
     if localPosition.Y > INTERNAL.MinimumTweenY + 0.001 then
         return CFrame.new(
             localPosition.X,
             INTERNAL.MinimumTweenY,
             localPosition.Z
-        ) * localCFrame.Rotation
+        ) * localCFrame.Rotation, true
     end
 
     return CFrame.new(
@@ -2254,6 +2403,36 @@ local function getPlayerChaseGoal(localRoot, targetRoot)
         INTERNAL.MinimumTweenY,
         targetPosition.Z
     ) * targetCFrame.Rotation
+end
+
+local function getHitboxMovementCFrame(localRoot, targetRoot, requestedPosition)
+    local targetCFrame = targetRoot.CFrame
+    local hitboxSize = HitboxEnabled and ConfiguredHitboxSize or targetRoot.Size
+    -- Leave 10% of each half-extent as a margin against the hitbox boundary.
+    local limit = hitboxSize * 0.45
+    local requestedOffset = targetCFrame:PointToObjectSpace(requestedPosition)
+    local boundedOffset = Vector3.new(
+        math.clamp(requestedOffset.X, -limit.X, limit.X),
+        math.clamp(requestedOffset.Y, -limit.Y, limit.Y),
+        math.clamp(requestedOffset.Z, -limit.Z, limit.Z)
+    )
+    local position = targetCFrame:PointToWorldSpace(boundedOffset)
+    local center = targetCFrame.Position
+
+    if position.Y < INTERNAL.MinimumTweenY and center.Y >= INTERNAL.MinimumTweenY then
+        -- Move along a segment inside the box, including for tilted targets.
+        local alpha = (center.Y - INTERNAL.MinimumTweenY) / (center.Y - position.Y)
+        position = center + (position - center) * math.clamp(alpha, 0, 1)
+    end
+
+    local flatTarget = Vector3.new(center.X, position.Y, center.Z)
+
+    if (flatTarget - position).Magnitude > 0.001 then
+        return CFrame.lookAt(position, flatTarget)
+    end
+
+    -- Directly above/below or at the center: keep the current facing direction.
+    return CFrame.new(position) * localRoot.CFrame.Rotation
 end
 
 local function enforceLocalYFloor()
@@ -3353,12 +3532,14 @@ local function startMovementWorker()
 
     connect(RunService.Heartbeat, function(deltaTime)
         if not Runtime.Running then
+            stopSeaHeightMovement()
             return
         end
 
         enforceLocalYFloor()
 
         if Runtime.LocalDead then
+            stopSeaHeightMovement()
             return
         end
 
@@ -3407,6 +3588,7 @@ local function startMovementWorker()
         local player = Runtime.CurrentTarget
 
         if not player then
+            stopSeaHeightMovement()
             return
         end
 
@@ -3448,6 +3630,7 @@ local function startMovementWorker()
             or not localRoot.Parent
             or not localRoot:IsDescendantOf(localCharacter) then
 
+            stopSeaHeightMovement()
             return
         end
 
@@ -3527,6 +3710,7 @@ local function startMovementWorker()
         end
 
         if Runtime.Mode ~= "CHASE" and Runtime.Mode ~= "ENGAGE" then
+            stopSeaHeightMovement()
             return
         end
 
@@ -3603,7 +3787,11 @@ local function startMovementWorker()
         end
             
         if insideHitbox and OrbitEnabled then
-    local center = targetRoot.Position
+    local center = getHitboxMovementCFrame(
+        localRoot,
+        targetRoot,
+        targetRoot.CFrame:PointToWorldSpace(HitboxOffset)
+    ).Position
     local hitboxSize = HitboxEnabled and ConfiguredHitboxSize or targetRoot.Size
 
     -- Maximum radius: 8 studs. Reduce it to fit smaller hitboxes.
@@ -3629,21 +3817,38 @@ local function startMovementWorker()
         math.sin(angle) * radius
     )
 
-    AutoTween(CFrame.lookAt(orbitPosition, center), deltaTime, true)
+    AutoTween(getHitboxMovementCFrame(localRoot, targetRoot, orbitPosition), deltaTime, true)
     faceRootTowardTarget(localRoot, targetRoot)
 else
-    local chaseGoal = getPlayerChaseGoal(localRoot, targetRoot)
+    local chaseGoal
+    local movingToSeaHeight = false
 
-    if chaseGoal and shouldAdvancePlayerChase(
-        now,
-        targetEpoch,
-        characterEpoch,
-        player,
-        character,
-        targetRoot,
-        localRoot
-    ) then
-        AutoTween(chaseGoal, deltaTime, insideHitbox)
+    if insideHitbox then
+        chaseGoal = getHitboxMovementCFrame(
+            localRoot,
+            targetRoot,
+            targetRoot.CFrame:PointToWorldSpace(HitboxOffset)
+        )
+    else
+        chaseGoal, movingToSeaHeight = getPlayerChaseGoal(localRoot, targetRoot)
+    end
+
+    if movingToSeaHeight and chaseGoal then
+        updateSeaHeightMovement(chaseGoal, now, targetEpoch, characterEpoch, localRoot)
+    else
+        stopSeaHeightMovement()
+
+        if chaseGoal and shouldAdvancePlayerChase(
+            now,
+            targetEpoch,
+            characterEpoch,
+            player,
+            character,
+            targetRoot,
+            localRoot
+        ) then
+            AutoTween(chaseGoal, deltaTime, insideHitbox)
+        end
     end
 
     if insideHitbox then
