@@ -6,6 +6,7 @@
 -- SeaHeightFirst, SeaHeightStallTimeout, GunOpenerEnabled, GunEngageDistance, MaxTargetDistance,
 -- Aimbot, optional Config.Combo, and optional ReadSkillCooldown.
 -- Race flags belong in Config.Settings and require an explicit true.
+-- Race V3/V4 activation does not require InCombat or being inside a target hitbox.
 -- NoDamageTimeout allows time for a target health drop or confirmed local InCombat after hitbox entry.
 -- Either qualifies the current target for this check until a different target acquisition.
 -- SkipPreviousTargets defaults to true; set false to allow previous targets through this filter.
@@ -4508,7 +4509,7 @@ local function startRaceWorker()
 
     Runtime.ReleaseRaceKey = releaseRaceKey
 
-    local function getCombatCharacter()
+    local function getRaceCharacter()
         local character = Runtime.Character
         local humanoid = Runtime.Humanoid
 
@@ -4528,12 +4529,6 @@ local function startRaceWorker()
             return nil
         end
 
-        local inCombat, inCombatKnown = readLocalInCombat()
-
-        if not inCombatKnown or inCombat ~= true then
-            return nil
-        end
-
         return character
     end
 
@@ -4542,7 +4537,7 @@ local function startRaceWorker()
 
         -- Key-up has its own deadline; no sleeping or blocking of V3 checks.
         if heldRaceKey then
-            local character = getCombatCharacter()
+            local character = getRaceCharacter()
 
             if now >= heldRaceKey.ReleaseAt
                 or Settings.RaceV4 ~= true
@@ -4563,7 +4558,7 @@ local function startRaceWorker()
             return
         end
 
-        local character = getCombatCharacter()
+        local character = getRaceCharacter()
 
         if not character then
             return
