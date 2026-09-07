@@ -1779,6 +1779,10 @@ local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer)
         return false
     end
 
+    if (localRoot.Position - targetRoot.Position).Magnitude <= 300 then
+        return false
+    end
+    
     local function targetStillValid()
         local currentInfo = Runtime.CurrentTargetInfo
 
