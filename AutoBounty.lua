@@ -1,6 +1,6 @@
 -- GitHub-side Auto Bounty module.
 -- External options are intentionally limited to Team, Weapon, FastTP, ESP,
--- TweenSpeed, health thresholds, hitbox settings, and PlayerFollowTime.
+-- NoClip, TweenSpeed, health thresholds, hitbox settings, and PlayerFollowTime.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -41,12 +41,19 @@ end
 
 local FastTPEnabled = Settings.FastTP ~= false
 local ESPEnabled = Settings.ESPPlayer ~= false
+local RawNoClip = Settings.NoClip
+local NoClipEnabled = RawNoClip == nil and true or RawNoClip
 local RawTweenSpeed = Settings.TweenSpeed
 local TweenSpeed = RawTweenSpeed == nil and 180 or tonumber(RawTweenSpeed)
 local LowHealth = tonumber(Settings.LowHealth) or 8000
 local RecoveryHealth = tonumber(Settings.MaxHealth) or 10000
 local RawPlayerFollowTime = Settings.PlayerFollowTime
 local PlayerFollowTime = RawPlayerFollowTime == nil and 30 or tonumber(RawPlayerFollowTime)
+
+if type(NoClipEnabled) ~= "boolean" then
+    warn("[AutoBounty] NoClip must be true or false; using true.")
+    NoClipEnabled = true
+end
 
 if not isFiniteNumber(TweenSpeed) or TweenSpeed <= 0 then
     warn("[AutoBounty] TweenSpeed must be a finite number above 0; using 180 studs per second.")
@@ -167,7 +174,7 @@ local ENTRANCES = {
         Vector3.new(-6508.5581054688, 5000.034996032715, -132.83953857422),
         Vector3.new(2284.912109375, 15.537666320801, 905.48291015625),
     },
-    [100117331123089] = {
+    [7449423635] = {
         Vector3.new(-5083.26025390625, 314.6056823730469, -3175.673095703125),
         Vector3.new(-12471.169921875, 374.94024658203, -7551.677734375),
     },
@@ -424,6 +431,9 @@ local Runtime = {
     PressedKeys = {},
     HitboxSnapshot = nil,
     LocalCollisionSnapshot = {},
+    NoClipEnabled = NoClipEnabled,
+    BodyClip = nil,
+    BodyClipRoot = nil,
     FriendCache = {},
     FriendCheckedAt = {},
     FriendAuditComplete = false,
@@ -1074,7 +1084,22 @@ local function applyTargetHitbox(root)
     end)
 end
 
+local function destroyLocalBodyClip()
+    local bodyClip = Runtime.BodyClip
+
+    Runtime.BodyClip = nil
+    Runtime.BodyClipRoot = nil
+
+    if bodyClip then
+        pcall(function()
+            bodyClip:Destroy()
+        end)
+    end
+end
+
 local function restoreLocalCollision()
+    destroyLocalBodyClip()
+
     for part, canCollide in pairs(Runtime.LocalCollisionSnapshot) do
         if part.Parent and part.CanCollide == false then
             pcall(function()
@@ -1089,8 +1114,18 @@ end
 local function applyLocalNoClip()
     local root = Runtime.Root
 
-    if not root or not root.Parent then
+    if not NoClipEnabled then
+        restoreLocalCollision()
         return
+    end
+
+    if not root or not root.Parent then
+        restoreLocalCollision()
+        return
+    end
+
+    if Runtime.BodyClipRoot and Runtime.BodyClipRoot ~= root then
+        restoreLocalCollision()
     end
 
     if Runtime.LocalCollisionSnapshot[root] == nil then
@@ -1098,6 +1133,47 @@ local function applyLocalNoClip()
     end
 
     root.CanCollide = false
+
+    local bodyClip = Runtime.BodyClip
+
+    if not bodyClip
+        or not bodyClip:IsA("BodyVelocity")
+        or bodyClip.Parent ~= root then
+
+        destroyLocalBodyClip()
+
+        local foreignBodyClip = false
+
+        for _, child in ipairs(root:GetChildren()) do
+            if child.Name == "BodyClip" and child:GetAttribute("__AutoBountyOwned") == true then
+                pcall(function()
+                    child:Destroy()
+                end)
+            elseif child.Name == "BodyClip" then
+                foreignBodyClip = true
+                warnOnce(
+                    "noclip:foreign-bodyclip:" .. tostring(Runtime.CharacterEpoch),
+                    "A non-AutoBounty object named BodyClip already exists on the local HumanoidRootPart; leaving it unchanged and not creating a duplicate."
+                )
+            end
+        end
+
+        if foreignBodyClip then
+            return
+        end
+
+        bodyClip = Instance.new("BodyVelocity")
+        bodyClip.Name = "BodyClip"
+        bodyClip.MaxForce = Vector3.new(100000, 100000, 100000)
+        bodyClip.Velocity = Vector3.new(0, 0, 0)
+        bodyClip:SetAttribute("__AutoBountyOwned", true)
+        bodyClip.Parent = root
+        Runtime.BodyClip = bodyClip
+        Runtime.BodyClipRoot = root
+    else
+        bodyClip.MaxForce = Vector3.new(100000, 100000, 100000)
+        bodyClip.Velocity = Vector3.new(0, 0, 0)
+    end
 end
 
 local function stopSafeZoneRetreat()
