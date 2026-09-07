@@ -2260,27 +2260,38 @@ local function installAimHook()
             and (method == "FireServer" or method == "InvokeServer")
             and typeof(remote) == "Instance" then
 
-            local belongsToTool = false
-            pcall(function()
-                belongsToTool = remote:IsDescendantOf(runtime.CurrentTool)
-            end)
+            local arguments = table.pack(...)
+            local aimArgumentIndex = nil
+            local replacement = nil
 
-            if belongsToTool then
-                local arguments = table.pack(...)
+            for index = 1, arguments.n do
+                local argumentType = typeof(arguments[index])
 
-                for index = 1, arguments.n do
-                    local argumentType = typeof(arguments[index])
-
-                    if argumentType == "Vector3" then
-                        arguments[index] = runtime.AimPosition
-                        break
-                    elseif argumentType == "CFrame" then
-                        arguments[index] = CFrame.new(runtime.AimPosition) * arguments[index].Rotation
-                        break
-                    end
+                if argumentType == "Vector3" then
+                    aimArgumentIndex = index
+                    replacement = runtime.AimPosition
+                    break
+                elseif argumentType == "CFrame" then
+                    aimArgumentIndex = index
+                    replacement = CFrame.new(runtime.AimPosition) * arguments[index].Rotation
+                    break
                 end
+            end
 
-                return oldNamecall(remote, unpackArguments(arguments, 1, arguments.n))
+            -- Boolean-only activation/deactivation calls must pass through untouched.
+            -- Use direct method invocation here so this check does not overwrite the
+            -- FireServer/InvokeServer namecall that oldNamecall must forward.
+            if aimArgumentIndex and typeof(runtime.CurrentTool) == "Instance" then
+                local checkSucceeded, belongsToTool = pcall(
+                    remote.IsDescendantOf,
+                    remote,
+                    runtime.CurrentTool
+                )
+
+                if checkSucceeded and belongsToTool == true then
+                    arguments[aimArgumentIndex] = replacement
+                    return oldNamecall(remote, unpackArguments(arguments, 1, arguments.n))
+                end
             end
         end
 
