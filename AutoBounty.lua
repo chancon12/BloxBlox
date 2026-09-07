@@ -190,7 +190,7 @@ local INTERNAL = {
     FastTPArrivalTimeout = 3,
     FastTPCooldown = 2,
     ServerRetryDelay = 3,
-    ExternalHopURL = "loadstring(game:HttpGet("https://raw.githubusercontent.com/acsu123/HOHO_H/main/Loading_UI"))()",
+    ExternalHopURL = "https://raw.githubusercontent.com/WhiteX1208/Scripts/refs/heads/main/KaitunFindFruit.luau",
     ExternalHopDownloadTimeout = 15,
     ExternalHopMaxAbandonedDownloads = 3,
 }
@@ -2248,7 +2248,6 @@ local function updateSeaHeightMovement(goalCFrame, now, targetEpoch, characterEp
     local stepGoal = CFrame.new(position.X, nextY, position.Z) * currentCFrame.Rotation
 
     localRoot.CFrame = currentCFrame
-    localRoot.Anchored = true
 
     local tween = game:GetService("TweenService"):Create(
         localRoot,
