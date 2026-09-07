@@ -3,7 +3,8 @@
 -- AutoHop, ESP, NoClip, TweenSpeed, SafeModeY, health thresholds, hitbox settings,
 -- PlayerFollowTime, NoDamageTimeout, SkipPreviousTargets, OrbitEnabled, RaceV3, RaceV4,
 -- ClickAttack, HitboxOffset, TweenHitbox, SafeZoneRadius, combo timings, panic movement,
--- SeaHeightFirst, SeaHeightStallTimeout, and optional ReadSkillCooldown.
+-- SeaHeightFirst, SeaHeightStallTimeout, GunOpenerEnabled, GunEngageDistance, MaxTargetDistance,
+-- and optional ReadSkillCooldown.
 -- Race flags belong in Config.Settings and require an explicit true.
 -- NoDamageTimeout allows time for a target health drop or confirmed local InCombat after hitbox entry.
 -- Either qualifies the current target for this check until a different target acquisition.
@@ -25,12 +26,16 @@
 -- SeaHeightFirst defaults to false for direct chasing; set true to restore the sea-level stage.
 -- TweenHitbox defaults: Enabled=true, Size=Vector3.new(100,100,100), TimeMultiplier=2.
 -- This separate target-relative box multiplies chase/orbit tween duration, including the existing hitbox slowdown.
+-- GunOpenerEnabled defaults to true; fire one RemoteFunctionShoot opener within GunEngageDistance (100 studs).
+-- Other weapons start inside the combat hitbox. The opener requires Weapon.Gun.Enabled, not Gun skill flags.
+-- MaxTargetDistance defaults to 10000 studs (3D): direct targets first, then entrance routes.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Teams = game:GetService("Teams")
 local RunService = game:GetService("RunService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
+local VirtualUser = game:GetService("VirtualUser")
 local Workspace = game:GetService("Workspace")
 
 local Environment = getgenv and getgenv() or _G
@@ -68,6 +73,11 @@ local ESPEnabled = Settings.ESPPlayer ~= false
 local SkipPreviousTargets = Settings.SkipPreviousTargets ~= false
 local OrbitEnabled = Settings.OrbitEnabled ~= false
 local ClickAttackEnabled = Settings.ClickAttack ~= false
+local GunOpenerEnabled = Settings.GunOpenerEnabled ~= false
+local GunEngageDistance = Settings.GunEngageDistance == nil
+    and 100 or tonumber(Settings.GunEngageDistance)
+local MaxTargetDistance = Settings.MaxTargetDistance == nil
+    and 10000 or tonumber(Settings.MaxTargetDistance)
 local TweenHitboxEnabled = TweenHitboxConfig.Enabled ~= false
 local TweenHitboxSize = TweenHitboxConfig.Size or Vector3.new(100, 100, 100)
 local TweenHitboxTimeMultiplier = TweenHitboxConfig.TimeMultiplier == nil
@@ -94,6 +104,16 @@ local NoDamageTimeout = RawNoDamageTimeout == nil and 30 or tonumber(RawNoDamage
 local RawSafeZoneRadius = Settings.SafeZoneRadius
 local SafeZoneRadius = RawSafeZoneRadius == nil and 100 or tonumber(RawSafeZoneRadius)
 local HitboxOffset = Settings.HitboxOffset
+
+if not isFiniteNumber(GunEngageDistance) or GunEngageDistance <= 0 then
+    warn("[AutoBounty] GunEngageDistance must be a finite number above 0; using 100 studs.")
+    GunEngageDistance = 100
+end
+
+if not isFiniteNumber(MaxTargetDistance) or MaxTargetDistance <= 0 then
+    warn("[AutoBounty] MaxTargetDistance must be a finite number above 0; using 10000 studs.")
+    MaxTargetDistance = 10000
+end
 
 if typeof(TweenHitboxSize) ~= "Vector3"
     or not isFiniteNumber(TweenHitboxSize.X)
@@ -510,6 +530,10 @@ local Runtime = {
     DamageCheckExpired = false,
     DamageObserved = false,
     AimActive = false,
+    GunAimActive = false,
+    GunShotRequest = nil,
+    GunShotOwner = nil,
+    GunMouseHeld = nil,
     SafeMode = false,
     SafeModeAtAltitude = false,
     SafeModeMovement = nil,
@@ -536,6 +560,7 @@ local Runtime = {
     NoProgressCharacters = {},
     FollowTimeoutCharacters = {},
     PreviouslyTargeted = {},
+    RouteFailures = {},
     TargetConnections = {},
     Connections = {},
     CharacterConnections = {},
@@ -1006,7 +1031,20 @@ local function isInsideSafeZone(worldPosition)
     return false
 end
 
+Runtime.ReleaseGunClick = function(owner)
+    if not Runtime.GunMouseHeld or (owner and Runtime.GunMouseHeld ~= owner) then
+        return
+    end
+
+    Runtime.GunMouseHeld = nil
+    pcall(function()
+        VirtualUser:Button1Up(Vector2.new(1280, 672))
+    end)
+end
+
 local function releaseAllKeys()
+    Runtime.ReleaseGunClick()
+
     for keyName, keyCode in pairs(Runtime.PressedKeys) do
         pcall(function()
             VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
@@ -1371,6 +1409,71 @@ local function findFriendInServer()
     return nil
 end
 
+local function getTargetRoute(player, info)
+    local localRoot = Runtime.Root
+    local targetRoot = info and info.Root
+
+    if not localRoot
+        or not localRoot.Parent
+        or not isFiniteVector3(localRoot.Position) then
+
+        return nil, "local-position-pending"
+    end
+
+    if not targetRoot
+        or not targetRoot.Parent
+        or not isFiniteVector3(targetRoot.Position) then
+
+        return nil, "invalid-position"
+    end
+
+    local directDistance = (targetRoot.Position - localRoot.Position).Magnitude
+
+    if directDistance < MaxTargetDistance then
+        return {
+            Kind = "direct",
+            Distance = directDistance,
+        }
+    end
+
+    if not FastTPEnabled then
+        return nil, "target-out-of-range"
+    end
+
+    local failedRoutes = Runtime.RouteFailures[player]
+    local failedEntrances = failedRoutes
+        and failedRoutes.Character == info.Character
+        and failedRoutes.Entrances
+    local selectedEntrance
+    local selectedDistance = math.huge
+    local hasFailedRoute = false
+
+    for _, entrance in ipairs(ENTRANCES[game.PlaceId] or {}) do
+        if isFiniteVector3(entrance) then
+            local distance = (targetRoot.Position - entrance).Magnitude
+
+            if distance < MaxTargetDistance then
+                if failedEntrances and failedEntrances[entrance] then
+                    hasFailedRoute = true
+                elseif distance < selectedDistance then
+                    selectedEntrance = entrance
+                    selectedDistance = distance
+                end
+            end
+        end
+    end
+
+    if selectedEntrance then
+        return {
+            Kind = "entrance",
+            Distance = selectedDistance,
+            Entrance = selectedEntrance,
+        }
+    end
+
+    return nil, hasFailedRoute and "entrance-route-failed" or "target-out-of-range"
+end
+
 local function evaluateTarget(player)
     if not player or player == LocalPlayer or player.Parent ~= Players then
         return false, "self-or-left"
@@ -1469,10 +1572,12 @@ local PENDING_TARGET_REASON = {
     ["level-pending"] = true,
     ["dead-or-respawning"] = true,
     ["safe-zones-pending"] = true,
+    ["local-position-pending"] = true,
 }
 
 local function rebuildCandidates()
-    local candidates = {}
+    local directCandidates = {}
+    local entranceCandidates = {}
     local candidateInfo = {}
     local candidateReasons = {}
     local pendingCount = 0
@@ -1483,11 +1588,26 @@ local function rebuildCandidates()
             local eligible, result = evaluateTarget(player)
 
             if eligible then
-                table.insert(candidates, player)
-                candidateInfo[player] = result
-                candidateReasons[player] = "eligible"
-                Runtime.PendingSince[player] = nil
-            elseif player ~= LocalPlayer then
+                local route, routeReason = getTargetRoute(player, result)
+
+                if route then
+                    result.Route = route
+                    candidateInfo[player] = result
+                    candidateReasons[player] = "eligible-" .. route.Kind
+                    Runtime.PendingSince[player] = nil
+
+                    if route.Kind == "direct" then
+                        table.insert(directCandidates, player)
+                    else
+                        table.insert(entranceCandidates, player)
+                    end
+                else
+                    eligible = false
+                    result = routeReason
+                end
+            end
+
+            if not eligible and player ~= LocalPlayer then
                 candidateReasons[player] = result
 
                 if PENDING_TARGET_REASON[result] then
@@ -1501,7 +1621,9 @@ local function rebuildCandidates()
                         Runtime.PendingSince[player] = pending
                     end
 
-                    if now - pending.Since < INTERNAL.PendingTargetGrace then
+                    if result == "local-position-pending"
+                        or now - pending.Since < INTERNAL.PendingTargetGrace then
+
                         pendingCount = pendingCount + 1
                     end
                 else
@@ -1517,27 +1639,16 @@ local function rebuildCandidates()
         end
     end
 
-    local localRoot = Runtime.Root
+    local candidates = #directCandidates > 0 and directCandidates or entranceCandidates
 
     table.sort(candidates, function(firstPlayer, secondPlayer)
         local firstInfo = candidateInfo[firstPlayer]
         local secondInfo = candidateInfo[secondPlayer]
-        local firstRoot = firstInfo and firstInfo.Root
-        local secondRoot = secondInfo and secondInfo.Root
+        local firstDistance = firstInfo.Route.Distance
+        local secondDistance = secondInfo.Route.Distance
 
-        if localRoot
-            and localRoot.Parent
-            and firstRoot
-            and firstRoot.Parent
-            and secondRoot
-            and secondRoot.Parent then
-
-            local firstDistance = (firstRoot.Position - localRoot.Position).Magnitude
-            local secondDistance = (secondRoot.Position - localRoot.Position).Magnitude
-
-            if firstDistance ~= secondDistance then
-                return firstDistance < secondDistance
-            end
+        if firstDistance ~= secondDistance then
+            return firstDistance < secondDistance
         end
 
         return firstPlayer.UserId < secondPlayer.UserId
@@ -1610,6 +1721,7 @@ local function clearTarget(reason)
 
     Runtime.TargetEpoch = Runtime.TargetEpoch + 1
     Runtime.AimActive = false
+    Runtime.GunAimActive = false
     Runtime.AimPosition = nil
     Runtime.InsideHitbox = false
     Runtime.CurrentTool = nil
@@ -1790,34 +1902,15 @@ local function nearestEntrance(targetPosition)
     return selected, selectedDistance
 end
 
-local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer)
-    if not FastTPEnabled then
-        return false
-    end
-
-    if Runtime.TargetEpoch ~= targetEpoch or Runtime.CurrentTarget ~= targetPlayer then
-        return false
+local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer, entrance)
+    if not FastTPEnabled or not entrance or not isFiniteVector3(entrance) then
+        return false, "unavailable"
     end
 
     local localRoot = Runtime.Root
     local targetRoot = targetInfo and targetInfo.Root
+    local characterEpoch = Runtime.CharacterEpoch
 
-    if not localRoot
-        or not localRoot.Parent
-        or not targetRoot
-        or not targetRoot.Parent
-        or not isFiniteVector3(targetRoot.Position)
-        or targetRoot.Position.Y < INTERNAL.MinimumTweenY then
-
-        return false
-    end
-
-    task.wait(1)
-    
-    if (localRoot.Position - targetRoot.Position).Magnitude <= 300 then
-        return false
-    end
-    
     local function targetStillValid()
         local currentInfo = Runtime.CurrentTargetInfo
 
@@ -1826,7 +1919,12 @@ local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer)
             and not Runtime.LocalDead
             and not Runtime.HopPending
             and Runtime.TargetEpoch == targetEpoch
+            and Runtime.CharacterEpoch == characterEpoch
             and Runtime.CurrentTarget == targetPlayer
+            and Runtime.Root == localRoot
+            and localRoot ~= nil
+            and localRoot.Parent ~= nil
+            and isFiniteVector3(localRoot.Position)
             and currentInfo ~= nil
             and currentInfo.Character == targetInfo.Character
             and currentInfo.Humanoid == targetInfo.Humanoid
@@ -1837,6 +1935,7 @@ local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer)
             and targetInfo.Humanoid ~= nil
             and targetInfo.Humanoid.Parent == targetInfo.Character
             and targetInfo.Humanoid.Health > 0
+            and targetRoot ~= nil
             and targetRoot.Parent ~= nil
             and targetRoot:IsDescendantOf(targetInfo.Character)
             and isFiniteVector3(targetRoot.Position)
@@ -1845,51 +1944,79 @@ local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer)
             and isInsideSafeZone(targetRoot.Position) == false
     end
 
-    local entrance, entranceDistance = nearestEntrance(targetRoot.Position)
-
-    if not entrance then
-        return false
-    end
-
-    local currentDistance = (localRoot.Position - targetRoot.Position).Magnitude
-
-    -- Skip the entrance if you are already closer to the target.
-    if currentDistance <= entranceDistance then
-        return false
-    end
-
     if not targetStillValid() then
-        return false
+        return false, "cancelled"
+    end
+
+    if (localRoot.Position - targetRoot.Position).Magnitude < MaxTargetDistance then
+        return true
+    end
+
+    if (entrance - targetRoot.Position).Magnitude >= MaxTargetDistance then
+        return false, "route-moved"
     end
 
     Runtime.Mode = "FAST_TP"
-    setStatus("FastTP toward " .. targetPlayer.Name)
+    setStatus("Entrance route toward " .. targetPlayer.Name)
+    stopSeaHeightMovement()
 
-    local startPosition = localRoot.Position
-    local success = invokeEntrance(
-        entrance,
-        "FastTP",
-        targetEpoch,
-        targetStillValid
-    )
-
-    if not success then
-        return false
+    if Runtime.ActiveTween then
+        Runtime.ActiveTween:Cancel()
+        Runtime.ActiveTween = nil
     end
 
-    local deadline = os.clock() + INTERNAL.FastTPArrivalTimeout
+    local deadline = os.clock() + INTERNAL.FastTPCooldown + INTERNAL.FastTPArrivalTimeout
+    local requestAllowed = true
+    local requestFinished = false
+    local requestSucceeded = false
 
-    while Runtime.Running and Runtime.TargetEpoch == targetEpoch and os.clock() < deadline do
-        local currentRoot = Runtime.Root
+    -- InvokeServer can yield; bound how long target preparation waits for this route.
+    task.spawn(function()
+        requestSucceeded = invokeEntrance(entrance, "FastTP", targetEpoch, function()
+            return requestAllowed
+                and os.clock() < deadline
+                and targetStillValid()
+                and (entrance - targetRoot.Position).Magnitude < MaxTargetDistance
+                and (localRoot.Position - targetRoot.Position).Magnitude >= MaxTargetDistance
+        end)
+        requestFinished = true
+    end)
 
-        if currentRoot and currentRoot.Parent and (currentRoot.Position - startPosition).Magnitude >= 50 then
-            break
+    while os.clock() < deadline and targetStillValid() do
+        -- Success means the target is actually in chase range, not just a 50-stud movement.
+        if (localRoot.Position - targetRoot.Position).Magnitude < MaxTargetDistance then
+            requestAllowed = false
+            return true
+        end
+
+        if requestFinished and not requestSucceeded then
+            requestAllowed = false
+
+            if (entrance - targetRoot.Position).Magnitude >= MaxTargetDistance then
+                return false, "route-moved"
+            end
+
+            return false, "request-failed"
         end
 
         task.wait(0.05)
     end
 
-    return true
+    requestAllowed = false
+
+    if not targetStillValid() then
+        return false, "cancelled"
+    end
+
+    if (localRoot.Position - targetRoot.Position).Magnitude < MaxTargetDistance then
+        return true
+    end
+
+    if (entrance - targetRoot.Position).Magnitude >= MaxTargetDistance then
+        return false, "route-moved"
+    end
+
+    return false, "arrival-timeout"
 end
 
 local function setTarget(player, targetInfo)
@@ -1903,13 +2030,22 @@ local function setTarget(player, targetInfo)
         return false
     end
 
+    local route = getTargetRoute(player, refreshedInfo or targetInfo)
+
+    if not route then
+        return false
+    end
+
     clearTarget()
     Runtime.CurrentTarget = player
     local preparedInfo = refreshedInfo or targetInfo
+    preparedInfo.Route = route
     Runtime.CurrentTargetInfo = preparedInfo
     Runtime.Mode = "PREPARE"
     Runtime.TargetEpoch = Runtime.TargetEpoch + 1
     local targetEpoch = Runtime.TargetEpoch
+    local preparationCharacterEpoch = Runtime.CharacterEpoch
+    local preparationRoot = Runtime.Root
     local preparedHumanoid = preparedInfo and preparedInfo.Humanoid
 
     if preparedHumanoid and preparedHumanoid.Parent then
@@ -1950,20 +2086,61 @@ local function setTarget(player, targetInfo)
             return
         end
 
+        local function preparationStillValid()
+            return Runtime.Running
+                and not Runtime.LocalDead
+                and not Runtime.SafeMode
+                and not Runtime.HopPending
+                and Runtime.TargetEpoch == targetEpoch
+                and Runtime.CurrentTarget == player
+                and Runtime.CharacterEpoch == preparationCharacterEpoch
+                and Runtime.Root == preparationRoot
+                and preparationRoot ~= nil
+                and preparationRoot.Parent ~= nil
+                and Runtime.Humanoid ~= nil
+                and Runtime.Humanoid.Health > 0
+        end
+
         ensureCombatAttributes()
 
-        if Runtime.TargetEpoch ~= targetEpoch or Runtime.CurrentTarget ~= player then
+        if not preparationStillValid() then
+            if Runtime.TargetEpoch == targetEpoch and Runtime.CurrentTarget == player then
+                clearTarget("Local character changed during target preparation")
+            end
+
             return
         end
 
         startPvPEnable()
-        fastTeleportForTarget(preparedInfo, targetEpoch, player)
 
-        if not Runtime.Running
-            or Runtime.TargetEpoch ~= targetEpoch
-            or Runtime.CurrentTarget ~= player
-            or Runtime.SafeMode
-            or Runtime.HopPending then
+        if route.Kind == "entrance" then
+            local arrived, failure = fastTeleportForTarget(preparedInfo, targetEpoch, player, route.Entrance)
+
+            if Runtime.TargetEpoch ~= targetEpoch or Runtime.CurrentTarget ~= player then
+                return
+            end
+
+            if not arrived then
+                if failure ~= "cancelled" and failure ~= "route-moved" then
+                    local failures = Runtime.RouteFailures[player]
+
+                    if not failures or failures.Character ~= preparedInfo.Character then
+                        failures = {Character = preparedInfo.Character, Entrances = {}}
+                        Runtime.RouteFailures[player] = failures
+                    end
+
+                    failures.Entrances[route.Entrance] = true
+                end
+
+                clearTarget("Entrance route unavailable; checking other targets or entrances")
+                return
+            end
+        end
+
+        if not preparationStillValid() then
+            if Runtime.TargetEpoch == targetEpoch and Runtime.CurrentTarget == player then
+                clearTarget("Local character changed during target preparation")
+            end
 
             return
         end
@@ -1983,6 +2160,14 @@ local function setTarget(player, targetInfo)
             return
         end
 
+        local latestRoute = getTargetRoute(player, latestInfo)
+
+        if not latestRoute or latestRoute.Kind ~= "direct" then
+            clearTarget("Target is outside MaxTargetDistance; checking other routes")
+            return
+        end
+
+        latestInfo.Route = latestRoute
         Runtime.CurrentTargetInfo = latestInfo
         applyTargetHitbox(latestInfo.Root)
         Runtime.Mode = "CHASE"
@@ -1992,7 +2177,9 @@ local function setTarget(player, targetInfo)
     return true
 end
 
-local function canAttack(targetEpoch)
+local function canAttack(targetEpoch, attackMode, readOnly)
+    local gunApproach = attackMode == "GunApproach"
+
     if not AttackEnabled
         or not Runtime.Running
         or Runtime.TargetEpoch ~= targetEpoch
@@ -2000,10 +2187,23 @@ local function canAttack(targetEpoch)
         or Runtime.SafeMode
         or Runtime.LocalDead
         or Runtime.HopPending
-        or not Runtime.FriendAuditComplete
-        or Runtime.Mode ~= "ENGAGE"
-        or not Runtime.InsideHitbox then
+        or not Runtime.FriendAuditComplete then
 
+        return false
+    end
+
+    if gunApproach then
+        local gunConfig = WeaponConfig.Gun
+
+        if not GunOpenerEnabled
+            or type(gunConfig) ~= "table"
+            or gunConfig.Enabled ~= true
+            or Runtime.Mode ~= "CHASE"
+            or Runtime.InsideHitbox then
+
+            return false
+        end
+    elseif Runtime.Mode ~= "ENGAGE" or not Runtime.InsideHitbox then
         return false
     end
 
@@ -2034,25 +2234,58 @@ local function canAttack(targetEpoch)
         or targetHumanoid.Health <= 0
         or not localRoot
         or not localRoot.Parent
-        or not localRoot:IsDescendantOf(localCharacter)
+        or not localRoot.IsDescendantOf(localRoot, localCharacter)
+        or not isFiniteVector3(localRoot.Position)
         or localRoot.Position.Y < INTERNAL.MinimumTweenY
         or not targetRoot
-        or not targetRoot:IsDescendantOf(targetCharacter)
+        or not targetRoot.IsDescendantOf(targetRoot, targetCharacter)
+        or not isFiniteVector3(targetRoot.Position)
         or targetRoot.Position.Y < INTERNAL.MinimumTweenY then
 
         return false
     end
 
-    if LocalPlayer:GetAttribute("PvpDisabled") == true then
-        startPvPEnable()
+    if gunApproach and (localRoot.Position - targetRoot.Position).Magnitude > GunEngageDistance then
         return false
     end
 
-    if Runtime.CurrentTarget:GetAttribute("PvpDisabled") == true then
+    if LocalPlayer.GetAttribute(LocalPlayer, "PvpDisabled") == true then
+        if not readOnly then
+            startPvPEnable()
+        end
+        return false
+    end
+
+    if Runtime.CurrentTarget.GetAttribute(Runtime.CurrentTarget, "PvpDisabled") == true then
         return false
     end
 
     return true
+end
+
+Runtime.IsGunAimAllowed = function()
+    local tool = Runtime.CurrentTool
+    local gunConfig = WeaponConfig.Gun
+
+    if not Runtime.GunAimActive
+        or not Runtime.AimActive
+        or not tool or tool.Parent ~= Runtime.Character
+        or type(gunConfig) ~= "table"
+        or gunConfig.Enabled ~= true then
+
+        return false
+    end
+
+    local configuredName = tostring(gunConfig.Name or "Auto")
+    local matches = configuredName == "" or string.lower(configuredName) == "auto"
+
+    if matches then
+        matches = tool.ToolTip == "Gun"
+    else
+        matches = tool.Name == configuredName
+    end
+
+    return matches and canAttack(Runtime.TargetEpoch, "GunApproach", true)
 end
 
 local function getTargetTweenTimeMultiplier(localRoot, targetRoot)
@@ -2677,9 +2910,14 @@ local function faceCameraTowardTarget()
     if not Runtime.Running
         or Runtime.LocalDead
         or Runtime.SafeMode
-        or Runtime.HopPending
-        or not Runtime.InsideHitbox
-        or Runtime.Mode ~= "ENGAGE" then
+        or Runtime.HopPending then
+
+        return
+    end
+
+    local aimingGun = Runtime.IsGunAimAllowed()
+
+    if not aimingGun and (not Runtime.InsideHitbox or Runtime.Mode ~= "ENGAGE") then
 
         return
     end
@@ -2718,7 +2956,9 @@ local function faceCameraTowardTarget()
 end
 
 local function installAimHook()
-    if Environment.__AutoBountyAimHookInstalled then
+    if Environment.__AutoBountyAimHookInstalled
+        and (tonumber(Environment.__AutoBountyAimHookVersion) or 0) >= 2 then
+
         return
     end
 
@@ -2728,6 +2968,8 @@ local function installAimHook()
     end
 
     local oldNamecall
+    -- A pre-v2 hook can still handle inside-hitbox calls; this wrapper adds gun approach aim.
+    local hasLegacyHook = Environment.__AutoBountyAimHookInstalled == true
     local unpackArguments = table.unpack or unpack
     local function handler(remote, ...)
         local runtime = Environment.__AutoBountyRuntime
@@ -2737,11 +2979,27 @@ local function installAimHook()
             and runtime.Running
             and runtime.AttackEnabled
             and runtime.AimActive
-            and runtime.InsideHitbox
+            and not runtime.SafeMode
+            and not runtime.LocalDead
+            and not runtime.HopPending
             and runtime.AimPosition
             and runtime.CurrentTool
             and (method == "FireServer" or method == "InvokeServer")
             and typeof(remote) == "Instance" then
+
+            local mayRedirect = runtime.InsideHitbox and not hasLegacyHook
+
+            if not runtime.InsideHitbox
+                and type(runtime.IsGunAimAllowed) == "function" then
+
+                -- The validator uses direct method calls so namecall forwarding stays intact.
+                local validCheck, allowed = pcall(runtime.IsGunAimAllowed)
+                mayRedirect = validCheck and allowed == true
+            end
+
+            if not mayRedirect then
+                return oldNamecall(remote, ...)
+            end
 
             local arguments = table.pack(...)
             local aimArgumentIndex = nil
@@ -2788,6 +3046,7 @@ local function installAimHook()
 
     if success and type(oldNamecall) == "function" then
         Environment.__AutoBountyAimHookInstalled = true
+        Environment.__AutoBountyAimHookVersion = 2
     else
         warnOnce("aimbot:install", "Aimbot hook installation failed: " .. tostring(result))
     end
@@ -2921,7 +3180,7 @@ local function resolveTool(category, categoryConfig)
     return nil
 end
 
-local function waitWhileAttackable(duration, targetEpoch)
+local function waitWhileAttackable(duration, targetEpoch, attackMode)
     local deadline = os.clock() + math.max(tonumber(duration) or 0, 0)
     local yielded = false
 
@@ -2929,7 +3188,7 @@ local function waitWhileAttackable(duration, targetEpoch)
         task.wait()
         yielded = true
 
-        if not canAttack(targetEpoch) then
+        if not canAttack(targetEpoch, attackMode) then
             return false
         end
     until os.clock() >= deadline and yielded
@@ -2937,8 +3196,8 @@ local function waitWhileAttackable(duration, targetEpoch)
     return true
 end
 
-local function equipTool(tool, targetEpoch)
-    if not tool or not tool.Parent or not canAttack(targetEpoch) then
+local function equipTool(tool, targetEpoch, attackMode)
+    if not tool or not tool.Parent or not canAttack(targetEpoch, attackMode) then
         return false
     end
 
@@ -2958,7 +3217,7 @@ local function equipTool(tool, targetEpoch)
         humanoid:UnequipTools()
         RunService.Heartbeat:Wait()
 
-        if canAttack(targetEpoch) and tool.Parent then
+        if canAttack(targetEpoch, attackMode) and tool.Parent then
             humanoid:EquipTool(tool)
         end
     end)
@@ -2970,7 +3229,7 @@ local function equipTool(tool, targetEpoch)
 
     local deadline = os.clock() + 1
 
-    while Runtime.Running and canAttack(targetEpoch) and os.clock() < deadline do
+    while Runtime.Running and canAttack(targetEpoch, attackMode) and os.clock() < deadline do
         if tool.Parent == character then
             Runtime.CurrentTool = tool
             return true
@@ -2982,8 +3241,10 @@ local function equipTool(tool, targetEpoch)
     return false
 end
 
-local function castSkill(keyName, skillConfig, targetEpoch)
-    if not canAttack(targetEpoch) then
+local function castSkill(keyName, skillConfig, targetEpoch, attackMode)
+    if not canAttack(targetEpoch, attackMode) then
+        Runtime.AimActive = false
+        Runtime.GunAimActive = false
         return false
     end
 
@@ -2994,15 +3255,25 @@ local function castSkill(keyName, skillConfig, targetEpoch)
         holdTime = isFiniteNumber(configuredHold) and math.max(configuredHold, 0) or 0
     end
     Runtime.AimActive = true
+    Runtime.GunAimActive = attackMode == "GunApproach"
+
+    if Runtime.GunAimActive then
+        -- An approach cast can begin between Heartbeats; aim its first input at
+        -- the live target instead of waiting for the movement camera update.
+        Runtime.AimPosition = Runtime.CurrentTargetInfo.Root.Position
+        faceCameraTowardTarget()
+    end
 
     if not pressKeyDown(keyName) then
         Runtime.AimActive = false
+        Runtime.GunAimActive = false
         return false
     end
 
-    local waitOk, completed = pcall(waitWhileAttackable, holdTime, targetEpoch)
+    local waitOk, completed = pcall(waitWhileAttackable, holdTime, targetEpoch, attackMode)
     releaseKey(keyName)
     Runtime.AimActive = false
+    Runtime.GunAimActive = false
 
     if not waitOk then
         warnOnce("skill:hold:" .. keyName, "Skill hold for " .. keyName .. " failed: " .. tostring(completed))
@@ -3283,42 +3554,207 @@ function CombatActions.NormalAttack(targetEpoch)
     return success
 end
 
+function CombatActions.GunOpener(tool, targetEpoch, characterEpoch)
+    if Runtime.GunShotRequest
+        or Runtime.CharacterEpoch ~= characterEpoch
+        or not canAttack(targetEpoch, "GunApproach")
+        or not tool or tool.Parent ~= Runtime.Character
+        or Runtime.CurrentTool ~= tool then
+
+        return false
+    end
+
+    local remote = tool:FindFirstChild("RemoteFunctionShoot")
+
+    if not remote or not remote:IsA("RemoteFunction") then
+        warnOnce("gun:remote:" .. tool.Name, "Gun " .. tool.Name .. " has no RemoteFunctionShoot; skipping its opener.")
+        return false
+    end
+
+    local targetInfo = Runtime.CurrentTargetInfo
+    local targetRoot = targetInfo.Root
+    local request = {Finished = false, Success = false, Expired = false}
+    local deadline = os.clock() + 1
+
+    Runtime.GunShotRequest = request
+    Runtime.GunShotOwner = request
+    Runtime.AimActive = true
+    Runtime.GunAimActive = true
+    Runtime.AimPosition = targetRoot.Position
+    faceCameraTowardTarget()
+
+    local function stillValid()
+        local currentInfo = Runtime.CurrentTargetInfo
+
+        return not request.Expired
+            and Runtime.GunShotOwner == request
+            and Runtime.TargetEpoch == targetEpoch
+            and Runtime.CharacterEpoch == characterEpoch
+            and currentInfo ~= nil
+            and currentInfo.Player == targetInfo.Player
+            and currentInfo.Character == targetInfo.Character
+            and currentInfo.Humanoid == targetInfo.Humanoid
+            and currentInfo.Root == targetRoot
+            and Runtime.CurrentTool == tool
+            and tool.Parent == Runtime.Character
+            and remote.Parent == tool
+            and Runtime.IsGunAimAllowed()
+    end
+
+    -- Keep the weapon worker free to enter the combat combo even if this
+    -- game-specific remote yields indefinitely. Only one request may be pending.
+    task.spawn(function()
+        local success, result = pcall(function()
+            if not stillValid() or os.clock() >= deadline then
+                return false
+            end
+
+            local args = {
+                [1] = targetRoot.Position,
+                [2] = targetRoot,
+            }
+            Runtime.AimPosition = args[1]
+            remote:InvokeServer(table.unpack(args))
+            return true
+        end)
+
+        request.Success = success and result == true
+        request.Error = not success and tostring(result) or nil
+        request.Finished = true
+
+        if Runtime.GunShotRequest == request then
+            Runtime.GunShotRequest = nil
+        end
+    end)
+
+    local waitSucceeded, clicked = pcall(function()
+        while not request.Finished and os.clock() < deadline and stillValid() do
+            task.wait()
+        end
+
+        if not request.Finished or not request.Success
+            or os.clock() >= deadline or not stillValid() then
+
+            return false
+        end
+
+        Runtime.AimPosition = targetRoot.Position
+        faceCameraTowardTarget()
+        VirtualUser:CaptureController()
+
+        if not stillValid() then
+            return false
+        end
+
+        Runtime.GunMouseHeld = request
+        VirtualUser:Button1Down(Vector2.new(1280, 672))
+        waitWhileAttackable(0.05, targetEpoch, "GunApproach")
+        return true
+    end)
+
+    request.Expired = true
+    Runtime.ReleaseGunClick(request)
+
+    if Runtime.GunShotOwner == request then
+        Runtime.GunShotOwner = nil
+        Runtime.AimActive = false
+        Runtime.GunAimActive = false
+    end
+
+    if request.Error then
+        warnOnce("gun:shoot:" .. tool.Name, "Gun opener failed: " .. request.Error)
+    elseif not waitSucceeded then
+        warnOnce("gun:click:" .. tool.Name, "Gun opener input failed: " .. tostring(clicked))
+    elseif not request.Finished and os.clock() >= deadline then
+        warnOnce("gun:timeout:" .. tool.Name, "Gun opener response timed out; continuing the combat combo when in range.")
+    end
+
+    return waitSucceeded and clicked == true
+end
+
 local function startWeaponWorker()
     task.spawn(function()
         local weaponOrder = getWeaponOrder()
+        local combatWeaponOrder = {}
+
+        for _, category in ipairs(weaponOrder) do
+            if not GunOpenerEnabled or category ~= "Gun" then
+                table.insert(combatWeaponOrder, category)
+            end
+        end
+
         local comboEntries = nil
         local skillCursor = 1
         local comboTargetEpoch = nil
         local comboCharacterEpoch = nil
+        local gunPassFinished = false
 
         while Runtime.Running do
             local targetEpoch = Runtime.TargetEpoch
 
-            if not canAttack(targetEpoch) then
+            if comboTargetEpoch ~= targetEpoch
+                or comboCharacterEpoch ~= Runtime.CharacterEpoch then
+
+                comboEntries = nil
+                skillCursor = 1
+                gunPassFinished = false
+                comboTargetEpoch = targetEpoch
+                comboCharacterEpoch = Runtime.CharacterEpoch
+            end
+
+            local attackMode = nil
+            local attackable = canAttack(targetEpoch)
+
+            if attackable and GunOpenerEnabled then
+                -- Reaching the combat hitbox ends the opener for this acquisition.
+                -- Leaving it again must not fire another opener.
+                gunPassFinished = true
+            elseif GunOpenerEnabled and not gunPassFinished
+                and canAttack(targetEpoch, "GunApproach") then
+
+                attackMode = "GunApproach"
+                attackable = true
+            end
+
+            if not attackable then
                 -- Keep the next step across a brief hitbox/safe-mode interruption.
                 -- Target/character epoch changes reset the pass when attacks resume.
                 Runtime.AimActive = false
+                Runtime.GunAimActive = false
                 Runtime.CurrentTool = nil
                 releaseAllKeys()
                 task.wait(0.05)
-            else
-                if not comboEntries
-                    or comboTargetEpoch ~= targetEpoch
-                    or comboCharacterEpoch ~= Runtime.CharacterEpoch then
+            elseif attackMode == "GunApproach" then
+                -- One basic gun shot per acquisition, independent of Gun.Skills.
+                -- Latch before equipping/invoking because both may yield.
+                gunPassFinished = true
+                local gunConfig = WeaponConfig.Gun
+                local tool = resolveTool("Gun", gunConfig)
 
-                    comboEntries = CombatActions.GetSkills(weaponOrder)
+                if tool and equipTool(tool, targetEpoch, "GunApproach")
+                    and Runtime.CharacterEpoch == comboCharacterEpoch then
+
+                    CombatActions.GunOpener(tool, targetEpoch, comboCharacterEpoch)
+                end
+
+                Runtime.ReleaseGunClick()
+                Runtime.AimActive = false
+                Runtime.GunAimActive = false
+                task.wait(0.01)
+            else
+                if not comboEntries then
+                    comboEntries = CombatActions.GetSkills(combatWeaponOrder)
                     skillCursor = 1
-                    comboTargetEpoch = targetEpoch
-                    comboCharacterEpoch = Runtime.CharacterEpoch
                 end
 
                 local entry, entryIndex = CombatActions.SelectSkill(comboEntries, skillCursor)
                 local castCompleted = false
+
                 skillCursor = entryIndex + 1
 
                 if entry then
-                    if equipTool(entry.Tool, targetEpoch)
-                        and canAttack(targetEpoch)
+                    if equipTool(entry.Tool, targetEpoch, attackMode)
+                        and canAttack(targetEpoch, attackMode)
                         and Runtime.CharacterEpoch == comboCharacterEpoch
                         and entry.Tool.Parent == Runtime.Character
                         and entry.CategoryConfig.Enabled == true
@@ -3336,13 +3772,13 @@ local function startWeaponWorker()
                             end
 
                             CombatActions.MarkAttempt(entry)
-                            castCompleted = castSkill(entry.Key, entry.Config, targetEpoch)
+                            castCompleted = castSkill(entry.Key, entry.Config, targetEpoch, attackMode)
 
                             if castCompleted then
                                 local delay = getComboNumberSetting("ComboDelay", 0.03)
 
                                 if delay > 0 then
-                                    waitWhileAttackable(delay, targetEpoch)
+                                    waitWhileAttackable(delay, targetEpoch, attackMode)
                                 end
                             end
                         end
@@ -3351,12 +3787,12 @@ local function startWeaponWorker()
                     -- Rebuild only after the entire pass. Retry gates alone never
                     -- qualify as cooldowns for the normal-attack fallback.
                     comboEntries = nil
-                    local latestEntries = CombatActions.GetSkills(weaponOrder)
+                    local latestEntries = CombatActions.GetSkills(combatWeaponOrder)
 
                     if ClickAttackEnabled and CombatActions.AllCooling(latestEntries)
                         and os.clock() >= CombatActions.NextNormalAttackAt then
 
-                        local tool = CombatActions.GetNormalTool(weaponOrder)
+                        local tool = CombatActions.GetNormalTool(combatWeaponOrder)
 
                         if not tool then
                             warnOnce("normal-attack:tool", "NormalAttack needs an available enabled Melee or Sword tool.")
@@ -3366,7 +3802,7 @@ local function startWeaponWorker()
                             and tool.Parent == Runtime.Character then
 
                             -- Equipping may yield: check every skill again before firing.
-                            latestEntries = CombatActions.GetSkills(weaponOrder)
+                            latestEntries = CombatActions.GetSkills(combatWeaponOrder)
 
                             if CombatActions.AllCooling(latestEntries) then
                                 CombatActions.NormalAttack(targetEpoch)
@@ -3376,6 +3812,7 @@ local function startWeaponWorker()
                 end
 
                 Runtime.AimActive = false
+                Runtime.GunAimActive = false
 
                 -- Successful casts already yield during Hold/ComboDelay. Cooling
                 -- skills are skipped together without sleeping for each key.
@@ -3386,6 +3823,7 @@ local function startWeaponWorker()
         end
 
         Runtime.AimActive = false
+        Runtime.GunAimActive = false
         releaseAllKeys()
     end)
 end
@@ -4021,6 +4459,7 @@ local function startMovementWorker()
         elseif Runtime.Mode ~= "CHASE" then
             Runtime.Mode = "CHASE"
             Runtime.AimActive = false
+            Runtime.GunAimActive = false
             releaseAllKeys()
             setStatus("Chasing " .. player.Name)
         end
@@ -4890,6 +5329,7 @@ local function startFriendWorker()
         Runtime.PendingSince[player] = nil
         Runtime.NoProgressCharacters[player] = nil
         Runtime.FollowTimeoutCharacters[player] = nil
+        Runtime.RouteFailures[player] = nil
 
         if Runtime.CurrentTarget == player then
             clearTarget("Target left the server")
@@ -4938,7 +5378,12 @@ local function startTargetWorker()
                 elseif currentInfo then
                     local lockedInfo = Runtime.CurrentTargetInfo
 
-                    if lockedInfo
+                    if (Runtime.Mode == "CHASE" or Runtime.Mode == "ENGAGE")
+                        and currentInfo.Route
+                        and currentInfo.Route.Kind ~= "direct" then
+
+                        clearTarget("Target moved outside MaxTargetDistance; checking other routes")
+                    elseif lockedInfo
                         and (lockedInfo.Character ~= currentInfo.Character
                             or lockedInfo.Humanoid ~= currentInfo.Humanoid
                             or lockedInfo.Root ~= currentInfo.Root) then
@@ -5027,9 +5472,11 @@ function Runtime:Stop(reason)
     self.SafeEpoch = self.SafeEpoch + 1
     self.SafeModeAtAltitude = false
     self.AimActive = false
+    self.GunAimActive = false
     resetTargetTimers()
     table.clear(self.NoProgressCharacters)
     table.clear(self.FollowTimeoutCharacters)
+    table.clear(self.RouteFailures)
 
     if self.CameraBindName then
         pcall(function()
