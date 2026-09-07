@@ -2027,14 +2027,18 @@ local function AutoTween(goalCFrame, deltaTime, insideHitbox)
     local speed = insideHitbox
         and TweenSpeed * INTERNAL.InHitboxSpeedMultiplier
         or TweenSpeed
-    local maxStep = speed * math.max(deltaTime, 0)
-    local alpha = distance <= 0.001 and 1 or math.min(maxStep / distance, 1)
-    local nextCFrame = currentCFrame:Lerp(safeGoalCFrame, math.clamp(alpha, 0, 1))
-    local safeNextCFrame = clampCFrameAboveSea(nextCFrame)
 
-    if safeNextCFrame then
-        root.CFrame = safeNextCFrame
+    if speed <= 0 then
+        return
     end
+
+    root.CFrame = currentCFrame
+
+    game:GetService("TweenService"):Create(
+        root,
+        TweenInfo.new(distance / speed, Enum.EasingStyle.Linear),
+        { CFrame = safeGoalCFrame }
+    ):Play()
 end
 
 local function updateSafeModeMovement(deltaTime)
