@@ -10,7 +10,7 @@
 -- Either qualifies the current target for this check until a different target acquisition.
 -- SkipPreviousTargets defaults to true; set false to allow previous targets through this filter.
 -- OrbitEnabled defaults to true; set false to follow the target directly without circling.
--- ClickAttack defaults to true; set false to disable normal attacks while skills are cooling down.
+-- ClickAttack defaults to true; normal attacks fill gaps when no enabled skill can be attempted.
 -- ClickAttack also pauses while the local player's health is below 20% of MaxHealth.
 -- HitboxOffset defaults to Vector3.new(0, 0, 0), relative to the target's CFrame:
 -- +X right, +Y up, -Z front, +Z behind. Positions stay inside the hitbox and above sea level.
@@ -18,6 +18,8 @@
 -- SafeZoneRadius defaults to 100 studs from each zone part's center (3D distance).
 -- For a zone inside a Model, use the nearest ancestor Model's valid PrimaryPart when available.
 -- SafeModePanicEnabled defaults to true; SafeModePanicRadius defaults to 200 studs.
+-- SafeModeY is the height above the target, refreshed every Heartbeat during recovery.
+-- If the target is lost, hold the last height; without a target, rise above your entry height.
 -- Combo order follows Weapon.Order and each weapon's SkillOrder (default Z, X, C, V, F).
 -- ComboDelay defaults to 0.03 seconds, replacing weapon Delay between casts.
 -- Optional ComboHold overrides every skill Hold; omit it to keep per-skill holds.
@@ -26,6 +28,7 @@
 --     Steps={{Weapon="Godhuman", Key="Z", Hold=0.1}, {Weapon="Cursed Dual Katana", Key="X", Hold=0.3}}}.
 -- RequiredWeapons checks owned Tool names in Character/Backpack; all must be present. Case/spaces/punctuation are ignored.
 -- Steps run in array order, skipping disabled/cooling skills. Missing required Tools select the default combo.
+-- Each custom pass is followed by one default Weapon.Order pass, then the custom sequence is tried again.
 -- When all required Tools are available again, the custom combo resumes from its first step.
 -- Malformed custom steps or an unavailable step Tool outside RequiredWeapons still pause custom attacks.
 -- Each step's optional Hold overrides Settings.ComboHold; omit it to keep the normal hold settings.
@@ -183,7 +186,7 @@ if not isFiniteNumber(TweenSpeed) or TweenSpeed <= 0 then
 end
 
 if not isFiniteNumber(SafeModeY) or SafeModeY <= 0 then
-    warn("[AutoBounty] SafeModeY must be a finite world Y position above 0; using 1000.")
+    warn("[AutoBounty] SafeModeY must be a finite positive height offset above the target; using 1000.")
     SafeModeY = 1000
 end
 
@@ -559,6 +562,7 @@ local Runtime = {
     SafeMode = false,
     SafeModeAtAltitude = false,
     SafeModeMovement = nil,
+    SafeModeReference = nil,
     LocalDead = true,
     Teleporting = false,
     EntranceBusy = false,
@@ -1734,6 +1738,15 @@ local function stopSafeModeMovement()
     local movement = Runtime.SafeModeMovement
     Runtime.SafeModeMovement = nil
 
+    local reference = Runtime.SafeModeReference
+
+    if not Runtime.Running or not Runtime.SafeMode or Runtime.LocalDead
+        or (reference and (reference.SafeEpoch ~= Runtime.SafeEpoch
+            or reference.CharacterEpoch ~= Runtime.CharacterEpoch)) then
+
+        Runtime.SafeModeReference = nil
+    end
+
     if movement and movement.Tween then
         movement.Tween:Cancel()
 
@@ -2581,7 +2594,66 @@ local function updateSeaHeightMovement(goalCFrame, now, targetEpoch, characterEp
     tween:Play()
 end
 
+local function getSafeModeGoalY()
+    local reference = Runtime.SafeModeReference
+
+    if not reference
+        or reference.SafeEpoch ~= Runtime.SafeEpoch
+        or reference.CharacterEpoch ~= Runtime.CharacterEpoch then
+
+        local root = Runtime.Root
+        local baseY = root and root.Parent and isFiniteVector3(root.Position)
+            and root.Position.Y or 0
+        local goalY = baseY + SafeModeY
+        local info = Runtime.CurrentTargetInfo
+        reference = {
+            SafeEpoch = Runtime.SafeEpoch,
+            CharacterEpoch = Runtime.CharacterEpoch,
+            GoalY = math.max(INTERNAL.MinimumTweenY, isFiniteNumber(goalY) and goalY or SafeModeY),
+        }
+
+        -- Keep a height-only reference before clearTarget releases combat state.
+        if Runtime.CurrentTarget and info and info.Player == Runtime.CurrentTarget then
+            reference.TargetInfo = {
+                Player = info.Player,
+                Character = info.Character,
+                Humanoid = info.Humanoid,
+                Root = info.Root,
+            }
+        end
+
+        Runtime.SafeModeReference = reference
+    end
+
+    local info = reference.TargetInfo
+
+    if info then
+        if info.Player.Parent == Players
+            and info.Character and info.Character.Parent
+            and info.Player.Character == info.Character
+            and info.Humanoid and info.Humanoid.Parent == info.Character
+            and info.Humanoid.Health > 0
+            and info.Root and info.Root.Parent and info.Root:IsA("BasePart")
+            and info.Root:IsDescendantOf(info.Character) then
+
+            if isFiniteVector3(info.Root.Position) then
+                local goalY = info.Root.Position.Y + SafeModeY
+
+                if isFiniteNumber(goalY) then
+                    reference.GoalY = math.max(INTERNAL.MinimumTweenY, goalY)
+                end
+            end
+        else
+            -- Do not follow a replacement character or reacquire during recovery.
+            reference.TargetInfo = nil
+        end
+    end
+
+    return reference.GoalY
+end
+
 local function getSafeModeMovementGoal(root)
+    local goalY = getSafeModeGoalY()
     local movement = Runtime.SafeModeMovement
 
     if not movement
@@ -2594,18 +2666,24 @@ local function getSafeModeMovementGoal(root)
             Root = root,
             SafeEpoch = Runtime.SafeEpoch,
             CharacterEpoch = Runtime.CharacterEpoch,
-            Center = Vector3.new(root.Position.X, SafeModeY, root.Position.Z),
+            Center = Vector3.new(root.Position.X, goalY, root.Position.Z),
             Angle = math.random() * math.pi * 2,
         }
         Runtime.SafeModeMovement = movement
     end
 
     if not SafeModePanicEnabled then
-        return CFrame.new(root.Position.X, SafeModeY, root.Position.Z)
+        return CFrame.new(root.Position.X, goalY, root.Position.Z)
             * root.CFrame.Rotation
     end
 
-    -- Keep each destination until reached so rapid updates cannot stall ascent.
+    -- Track height every update while retaining the current X/Z waypoint.
+    movement.Center = Vector3.new(movement.Center.X, goalY, movement.Center.Z)
+
+    if movement.Goal then
+        movement.Goal = Vector3.new(movement.Goal.X, goalY, movement.Goal.Z)
+    end
+
     if not movement.Goal or (root.Position - movement.Goal).Magnitude <= 3 then
         if movement.Goal then
             movement.Angle = movement.Angle + math.pi * (0.5 + math.random())
@@ -2695,26 +2773,30 @@ local function updateSafeModeMovement(deltaTime)
         return false
     end
 
-    local atAltitude = math.abs(root.Position.Y - SafeModeY) <= 0.5
+    local goalY = safeGoal.Position.Y
+    local atAltitude = math.abs(root.Position.Y - goalY) <= 0.5
+    Runtime.SafeModeAtAltitude = atAltitude
 
-    if atAltitude ~= Runtime.SafeModeAtAltitude then
-        Runtime.SafeModeAtAltitude = atAltitude
+    local status
 
-        if atAltitude then
-            setStatus(string.format(
-                SafeModePanicEnabled
-                    and "SafeMode: moving around at Y %.1f until MaxHealth"
-                    or "SafeMode: holding at Y %.1f until MaxHealth",
-                SafeModeY
-            ))
-        else
-            setStatus(string.format(
-                SafeModePanicEnabled
-                    and "SafeMode: panic movement toward Y %.1f"
-                    or "SafeMode: moving to Y %.1f",
-                SafeModeY
-            ))
-        end
+    if atAltitude then
+        status = string.format(
+            SafeModePanicEnabled
+                and "SafeMode: moving around at Y %.1f until MaxHealth"
+                or "SafeMode: holding at Y %.1f until MaxHealth",
+            goalY
+        )
+    else
+        status = string.format(
+            SafeModePanicEnabled
+                and "SafeMode: panic movement toward Y %.1f"
+                or "SafeMode: moving to Y %.1f",
+            goalY
+        )
+    end
+
+    if Runtime.Status ~= status then
+        setStatus(status)
     end
 
     return true
@@ -3462,7 +3544,7 @@ end
 -- true = cooling down, false = ready, nil = unknown; it must not yield.
 -- Default GUI adapter expects Main.Skills[tool.Name][keyName].Cooldown,
 -- with a horizontal cooldown bar that shrinks to zero when ready.
--- This UI convention must match the live game; unknown data never enables M1.
+-- This UI convention must match the live game; unknown skills use retry-limited attempts.
 local CombatActions = {
     NextNormalAttackAt = 0,
     NextRemoteLookupAt = 0,
@@ -3536,6 +3618,13 @@ function CombatActions.ObserveCooldown(tool, keyName, cooling)
 end
 
 function CombatActions.CanAttempt(entry)
+    if entry.CategoryConfig.Enabled ~= true
+        or entry.Config.Enabled ~= true
+        or not CombatActions.IsOwnedTool(entry.Tool) then
+
+        return false
+    end
+
     local cooling = CombatActions.ReadCooldown(entry.Tool, entry.Key)
     local attempt = CombatActions.ObserveCooldown(entry.Tool, entry.Key, cooling)
     entry.Cooling = cooling
@@ -3754,8 +3843,8 @@ function CombatActions.CustomEntryValid(entry)
     return CombatActions.ResolveComboTool(step) == entry.Tool
 end
 
-function CombatActions.GetSkills(weaponOrder)
-    local combo = CombatActions.GetActiveComboConfig()
+function CombatActions.GetSkills(weaponOrder, forceDefault)
+    local combo = not forceDefault and CombatActions.GetActiveComboConfig() or nil
 
     if combo then
         return CombatActions.GetCustomSkills(combo)
@@ -3794,13 +3883,37 @@ function CombatActions.GetSkills(weaponOrder)
     return entries
 end
 
-function CombatActions.AllCooling(entries)
+function CombatActions.GetClickSkills(weaponOrder)
+    local combo = CombatActions.GetActiveComboConfig()
+
+    if not combo then
+        return CombatActions.GetSkills(weaponOrder, true)
+    end
+
+    local customEntries = CombatActions.GetCustomSkills(combo)
+
+    if #customEntries == 0 then
+        -- An invalid/disabled custom pass must not enable the click fallback.
+        return {}
+    end
+
+    local entries = CombatActions.GetSkills(weaponOrder, true)
+
+    for _, entry in ipairs(customEntries) do
+        table.insert(entries, entry)
+    end
+
+    return entries
+end
+
+function CombatActions.NoAttemptableSkills(entries)
     if #entries == 0 then
         return false
     end
 
     for _, entry in ipairs(entries) do
-        if entry.Cooling ~= true then
+        -- Use the same live cooldown and per-key retry check as skill selection.
+        if CombatActions.CanAttempt(entry) then
             return false
         end
     end
@@ -3814,11 +3927,7 @@ function CombatActions.SelectSkill(entries, cursor)
     for index = cursor, #entries do
         local entry = entries[index]
 
-        if entry.CategoryConfig.Enabled == true
-            and entry.Config.Enabled == true
-            and entry.Tool.Parent
-            and CombatActions.CanAttempt(entry) then
-
+        if CombatActions.CanAttempt(entry) then
             return entry, index
         end
     end
@@ -4136,9 +4245,20 @@ local function startWeaponWorker()
         local skillCursor = 1
         local comboTargetEpoch = nil
         local comboCharacterEpoch = nil
+        local followupCombo = nil
         local gunPassFinished = false
         local gunPreparationAttempts = 0
         local nextGunPreparationAt = 0
+
+        local function selectedCombo()
+            local active = CombatActions.GetActiveComboConfig()
+
+            if active and active == followupCombo then
+                return nil
+            end
+
+            return active
+        end
 
         while Runtime.Running do
             local targetEpoch = Runtime.TargetEpoch
@@ -4148,6 +4268,7 @@ local function startWeaponWorker()
 
                 comboEntries = nil
                 skillCursor = 1
+                followupCombo = nil
                 gunPassFinished = false
                 gunPreparationAttempts = 0
                 nextGunPreparationAt = 0
@@ -4240,25 +4361,34 @@ local function startWeaponWorker()
             else
                 local customCombo = CombatActions.GetActiveComboConfig()
 
+                if followupCombo and followupCombo ~= customCombo then
+                    followupCombo = nil
+                    comboEntries = nil
+                    skillCursor = 1
+                end
+
+                local passCombo = selectedCombo()
+
                 if comboEntries and comboEntries[1]
-                    and comboEntries[1].ComboConfig ~= customCombo then
+                    and comboEntries[1].ComboConfig ~= passCombo then
 
                     comboEntries = nil
                 end
 
                 if not comboEntries then
-                    comboEntries = CombatActions.GetSkills(combatWeaponOrder)
+                    comboEntries = CombatActions.GetSkills(combatWeaponOrder, followupCombo ~= nil)
                     skillCursor = 1
                 end
 
-                local customBlocked = customCombo ~= nil and #comboEntries == 0
+                local customBlocked = passCombo ~= nil and #comboEntries == 0
                 local entry, entryIndex = CombatActions.SelectSkill(comboEntries, skillCursor)
                 local castCompleted = false
 
                 skillCursor = entryIndex + 1
 
                 if entry then
-                    if entry.ComboConfig ~= CombatActions.GetActiveComboConfig()
+                    if customCombo ~= CombatActions.GetActiveComboConfig()
+                        or entry.ComboConfig ~= selectedCombo()
                         or (entry.ComboConfig and not CombatActions.CustomEntryValid(entry)) then
 
                         comboEntries = nil
@@ -4272,7 +4402,8 @@ local function startWeaponWorker()
 
                         -- Equipping yields; recheck this exact combo step before
                         -- key-down, without restarting the order at the first skill.
-                        if entry.ComboConfig ~= CombatActions.GetActiveComboConfig()
+                        if customCombo ~= CombatActions.GetActiveComboConfig()
+                            or entry.ComboConfig ~= selectedCombo()
                             or (entry.ComboConfig and not CombatActions.CustomEntryValid(entry)) then
 
                             comboEntries = nil
@@ -4282,7 +4413,7 @@ local function startWeaponWorker()
                                 warnOnce(
                                     "skill:cooldown-unknown:" .. entry.Tool.Name .. ":" .. entry.Key,
                                     "Cooldown unavailable for " .. entry.Tool.Name .. " " .. entry.Key
-                                        .. "; using ordered, retry-limited attempts. NormalAttack requires known cooldowns for every enabled skill."
+                                        .. "; using ordered, retry-limited attempts. NormalAttack can fill gaps when no enabled skill can be attempted."
                                 )
                             end
 
@@ -4299,12 +4430,19 @@ local function startWeaponWorker()
                         end
                     end
                 else
-                    -- Rebuild only after the entire pass. Retry gates alone never
-                    -- qualify as cooldowns for the normal-attack fallback.
-                    comboEntries = nil
-                    local latestEntries = CombatActions.GetSkills(combatWeaponOrder)
+                    local completedCombo = comboEntries[1] and comboEntries[1].ComboConfig
 
-                    if ClickAttackEnabled and CombatActions.AllCooling(latestEntries)
+                    if completedCombo and completedCombo == CombatActions.GetActiveComboConfig() then
+                        followupCombo = completedCombo
+                    elseif followupCombo then
+                        followupCombo = nil
+                    end
+
+                    -- Alternate complete passes; do not restart a default pass after each key.
+                    comboEntries = nil
+                    local latestEntries = CombatActions.GetClickSkills(combatWeaponOrder)
+
+                    if ClickAttackEnabled and CombatActions.NoAttemptableSkills(latestEntries)
                         and os.clock() >= CombatActions.NextNormalAttackAt then
 
                         local tool = CombatActions.GetNormalTool(combatWeaponOrder)
@@ -4316,10 +4454,10 @@ local function startWeaponWorker()
                             and Runtime.CharacterEpoch == comboCharacterEpoch
                             and tool.Parent == Runtime.Character then
 
-                            -- Equipping may yield: check every skill again before firing.
-                            latestEntries = CombatActions.GetSkills(combatWeaponOrder)
+                            -- Equipping may yield: check custom and default skills again before firing.
+                            latestEntries = CombatActions.GetClickSkills(combatWeaponOrder)
 
-                            if CombatActions.AllCooling(latestEntries) then
+                            if CombatActions.NoAttemptableSkills(latestEntries) then
                                 CombatActions.NormalAttack(targetEpoch)
                             end
                         end
@@ -4492,6 +4630,7 @@ enterSafeMode = function()
     Runtime.SafeMode = true
     Runtime.SafeEpoch = Runtime.SafeEpoch + 1
     Runtime.SafeModeAtAltitude = false
+    local goalY = getSafeModeGoalY()
 
     if cancelFollowTimeoutHop then
         cancelFollowTimeoutHop("SafeMode reset PlayerFollowTime")
@@ -4504,7 +4643,7 @@ enterSafeMode = function()
         SafeModePanicEnabled
             and "SafeMode: panic movement toward Y %.1f"
             or "SafeMode: moving to Y %.1f",
-        SafeModeY
+        goalY
     ))
 end
 
