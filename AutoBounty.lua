@@ -2,16 +2,25 @@
 -- External options are intentionally limited to Team, Weapon, Attack, FastTP,
 -- AutoHop, ESP, NoClip, TweenSpeed, SafeModeY, health thresholds, hitbox settings,
 -- PlayerFollowTime, NoDamageTimeout, SkipPreviousTargets, OrbitEnabled, RaceV3, RaceV4,
--- ClickAttack, HitboxOffset, SafeZoneRadius, and optional ReadSkillCooldown.
+-- ClickAttack, HitboxOffset, SafeZoneRadius, combo timings, panic movement,
+-- SeaHeightStallTimeout, and optional ReadSkillCooldown.
 -- Race flags belong in Config.Settings and require an explicit true.
 -- NoDamageTimeout is the seconds allowed for the first health drop after entering the hitbox.
 -- SkipPreviousTargets defaults to true; set false to allow previous targets through this filter.
 -- OrbitEnabled defaults to true; set false to follow the target directly without circling.
 -- ClickAttack defaults to true; set false to disable normal attacks while skills are cooling down.
+-- ClickAttack also pauses while the local player's health is below 20% of MaxHealth.
 -- HitboxOffset defaults to Vector3.new(0, 0, 0), relative to the target's CFrame:
 -- +X right, +Y up, -Z front, +Z behind. Positions stay inside the hitbox and above sea level.
+-- Empty targets during combat: request the nearest entrance once per wait/character, then wait to hop.
 -- SafeZoneRadius defaults to 100 studs from each zone part's center (3D distance).
 -- For a zone inside a Model, use the nearest ancestor Model's valid PrimaryPart when available.
+-- SafeModePanicEnabled defaults to true; SafeModePanicRadius defaults to 200 studs.
+-- Combo order follows Weapon.Order and each weapon's SkillOrder (default Z, X, C, V, F).
+-- ComboDelay defaults to 0.03 seconds, replacing weapon Delay between casts.
+-- Optional ComboHold overrides every skill Hold; omit it to keep per-skill holds.
+-- ComboRetryDelay defaults to 1 second when cooldown activation cannot be confirmed.
+-- SeaHeightStallTimeout defaults to 3 seconds without vertical progress: retry once, then switch.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -64,6 +73,9 @@ local RawTweenSpeed = Settings.TweenSpeed
 local TweenSpeed = RawTweenSpeed == nil and 180 or tonumber(RawTweenSpeed)
 local RawSafeModeY = Settings.SafeModeY
 local SafeModeY = RawSafeModeY == nil and 1000 or tonumber(RawSafeModeY)
+local SafeModePanicEnabled = Settings.SafeModePanicEnabled ~= false
+local SafeModePanicRadius = Settings.SafeModePanicRadius == nil
+    and 200 or tonumber(Settings.SafeModePanicRadius)
 local LowHealth = tonumber(Settings.LowHealth) or 8000
 local RecoveryHealth = tonumber(Settings.MaxHealth) or 10000
 local RawPlayerFollowTime = Settings.PlayerFollowTime
@@ -108,6 +120,11 @@ end
 if not isFiniteNumber(SafeModeY) or SafeModeY <= 0 then
     warn("[AutoBounty] SafeModeY must be a finite world Y position above 0; using 1000.")
     SafeModeY = 1000
+end
+
+if not isFiniteNumber(SafeModePanicRadius) or SafeModePanicRadius <= 0 then
+    warn("[AutoBounty] SafeModePanicRadius must be a finite number above 0; using 200 studs.")
+    SafeModePanicRadius = 200
 end
 
 if not isFiniteNumber(PlayerFollowTime) or PlayerFollowTime <= 0 then
@@ -186,7 +203,6 @@ local INTERNAL = {
     SeaHeightTweenSpeed = 50,
     SeaHeightMoveDuration = 0.5,
     SeaHeightPauseDuration = 0.1,
-    SafeZoneRetreatInset = 0.5,
     FastTPArrivalTimeout = 3,
     FastTPCooldown = 2,
     ServerRetryDelay = 3,
@@ -456,6 +472,7 @@ local Runtime = {
     InsideHitbox = false,
     ChaseMoveCycle = nil,
     SeaHeightMove = nil,
+    ActiveTween = nil,
     FollowNoCombatSince = nil,
     FollowTimerEpoch = nil,
     FollowTimerCharacterEpoch = nil,
@@ -468,11 +485,13 @@ local Runtime = {
     AimActive = false,
     SafeMode = false,
     SafeModeAtAltitude = false,
+    SafeModeMovement = nil,
     LocalDead = true,
     Teleporting = false,
     EntranceBusy = false,
     LastEntranceAt = 0,
     HopPending = false,
+    EmptyCombatEntranceAttempt = nil,
     HopReason = nil,
     FollowTimeoutHopDetail = nil,
     HopWorkerRunning = false,
@@ -511,8 +530,6 @@ local Runtime = {
     SafeZonesFolder = nil,
     SafeZonesReady = false,
     SafeZoneConnections = {},
-    Retreating = false,
-    RetreatSafeZonePart = nil,
     CameraBindName = "AutoBountyCamera_" .. tostring(LocalPlayer.UserId),
     CameraBound = false,
     GUI = nil,
@@ -962,143 +979,6 @@ local function isInsideSafeZone(worldPosition)
     return false
 end
 
-local function safeZoneAxisLimit(halfExtent)
-    local inset = math.min(INTERNAL.SafeZoneRetreatInset, halfExtent * 0.1)
-    return math.max(halfExtent - inset, 0)
-end
-
-local function nearestSafeZoneRetreatPosition(worldPosition)
-    local folder = Runtime.SafeZonesFolder
-
-    if not folder or not folder.Parent or not Runtime.SafeZonesReady then
-        return nil
-    end
-
-    local bestPart
-    local bestPosition
-    local bestDistance
-    local bestName
-
-    for part in pairs(Runtime.SafeZoneParts) do
-        if part.Parent
-            and part:IsA("BasePart")
-            and part:IsDescendantOf(folder) then
-
-            local halfSize = part.Size * 0.5
-            local limitX = safeZoneAxisLimit(halfSize.X)
-            local limitY = safeZoneAxisLimit(halfSize.Y)
-            local limitZ = safeZoneAxisLimit(halfSize.Z)
-            local localPosition = part.CFrame:PointToObjectSpace(worldPosition)
-            local nearestLocal = Vector3.new(
-                math.clamp(localPosition.X, -limitX, limitX),
-                math.clamp(localPosition.Y, -limitY, limitY),
-                math.clamp(localPosition.Z, -limitZ, limitZ)
-            )
-            local candidate = part.CFrame:PointToWorldSpace(nearestLocal)
-
-            if candidate.Y < INTERNAL.MinimumTweenY then
-                local xAxis = part.CFrame:VectorToWorldSpace(Vector3.new(1, 0, 0))
-                local yAxis = part.CFrame:VectorToWorldSpace(Vector3.new(0, 1, 0))
-                local zAxis = part.CFrame:VectorToWorldSpace(Vector3.new(0, 0, 1))
-                local floorNormal = Vector3.new(xAxis.Y, yAxis.Y, zAxis.Y)
-                local componentEpsilon = 0.000001
-                local function highestCoordinate(coordinate, component, limit)
-                    if component > componentEpsilon then
-                        return limit
-                    elseif component < -componentEpsilon then
-                        return -limit
-                    end
-
-                    return math.clamp(coordinate, -limit, limit)
-                end
-                local highestLocal = Vector3.new(
-                    highestCoordinate(localPosition.X, floorNormal.X, limitX),
-                    highestCoordinate(localPosition.Y, floorNormal.Y, limitY),
-                    highestCoordinate(localPosition.Z, floorNormal.Z, limitZ)
-                )
-                local highestPosition = part.CFrame:PointToWorldSpace(highestLocal)
-
-                if highestPosition.Y >= INTERNAL.MinimumTweenY then
-                    local function requiredLambda(coordinate, component, limit)
-                        if math.abs(component) <= componentEpsilon then
-                            return 0
-                        end
-
-                        local boundary = component > 0 and limit or -limit
-                        return math.max((boundary - coordinate) / component, 0)
-                    end
-                    local upperLambda = math.max(
-                        1,
-                        requiredLambda(localPosition.X, floorNormal.X, limitX),
-                        requiredLambda(localPosition.Y, floorNormal.Y, limitY),
-                        requiredLambda(localPosition.Z, floorNormal.Z, limitZ)
-                    )
-                    local function projectedLocal(lambda)
-                        return Vector3.new(
-                            math.clamp(localPosition.X + lambda * floorNormal.X, -limitX, limitX),
-                            math.clamp(localPosition.Y + lambda * floorNormal.Y, -limitY, limitY),
-                            math.clamp(localPosition.Z + lambda * floorNormal.Z, -limitZ, limitZ)
-                        )
-                    end
-                    local lowerLambda = 0
-
-                    for _ = 1, 48 do
-                        local middleLambda = (lowerLambda + upperLambda) * 0.5
-                        local middlePosition = part.CFrame:PointToWorldSpace(
-                            projectedLocal(middleLambda)
-                        )
-
-                        if middlePosition.Y < INTERNAL.MinimumTweenY then
-                            lowerLambda = middleLambda
-                        else
-                            upperLambda = middleLambda
-                        end
-                    end
-
-                    candidate = part.CFrame:PointToWorldSpace(
-                        projectedLocal(upperLambda)
-                    )
-
-                    if candidate.Y < INTERNAL.MinimumTweenY then
-                        local adjusted = Vector3.new(
-                            candidate.X,
-                            INTERNAL.MinimumTweenY,
-                            candidate.Z
-                        )
-
-                        candidate = pointInsidePart(part, adjusted, 0.05)
-                            and adjusted
-                            or nil
-                    end
-                else
-                    candidate = nil
-                end
-            end
-
-            if candidate
-                and isFiniteVector3(candidate)
-                and candidate.Y >= INTERNAL.MinimumTweenY
-                and pointInsidePart(part, candidate, 0.05) then
-
-                local distance = (candidate - worldPosition).Magnitude
-                local partName = part:GetFullName()
-
-                if not bestDistance
-                    or distance < bestDistance - 0.001
-                    or (math.abs(distance - bestDistance) <= 0.001 and partName < bestName) then
-
-                    bestPart = part
-                    bestPosition = candidate
-                    bestDistance = distance
-                    bestName = partName
-                end
-            end
-        end
-    end
-
-    return bestPosition, bestPart
-end
-
 local function releaseAllKeys()
     for keyName, keyCode in pairs(Runtime.PressedKeys) do
         pcall(function()
@@ -1307,24 +1187,6 @@ local function applyLocalNoClip()
     else
         bodyClip.MaxForce = Vector3.new(100000, 100000, 100000)
         bodyClip.Velocity = Vector3.new(0, 0, 0)
-    end
-end
-
-local function stopSafeZoneRetreat()
-    if not Runtime.Retreating then
-        return
-    end
-
-    Runtime.Retreating = false
-    Runtime.RetreatSafeZonePart = nil
-    restoreLocalCollision()
-
-    if Runtime.Running
-        and Runtime.HopPending
-        and not Runtime.SafeMode
-        and not Runtime.LocalDead then
-
-        Runtime.Mode = "HOP_WAIT"
     end
 end
 
@@ -1681,7 +1543,25 @@ local function stopSeaHeightMovement()
     end
 end
 
+local function stopSafeModeMovement()
+    local movement = Runtime.SafeModeMovement
+    Runtime.SafeModeMovement = nil
+
+    if movement and movement.Tween then
+        movement.Tween:Cancel()
+
+        if Runtime.ActiveTween == movement.Tween then
+            Runtime.ActiveTween = nil
+        end
+    end
+end
+
 local function resetTargetTimers()
+    -- Hop requests may clear targets while recovery continues; keep its center.
+    if not Runtime.Running or not Runtime.SafeMode then
+        stopSafeModeMovement()
+    end
+
     stopSeaHeightMovement()
     Runtime.ChaseMoveCycle = nil
     Runtime.FollowNoCombatSince = nil
@@ -1709,7 +1589,6 @@ local function clearTarget(reason)
     disconnectConnections(Runtime.TargetConnections)
     releaseAllKeys()
     restoreTargetHitbox()
-    stopSafeZoneRetreat()
     restoreLocalCollision()
     Runtime.CurrentTarget = nil
     Runtime.CurrentTargetInfo = nil
@@ -2174,11 +2053,12 @@ local function AutoTween(goalCFrame, deltaTime, insideHitbox)
 
     root.CFrame = currentCFrame
 
-    game:GetService("TweenService"):Create(
+    Runtime.ActiveTween = game:GetService("TweenService"):Create(
         root,
         TweenInfo.new(distance / speed, Enum.EasingStyle.Linear),
         { CFrame = safeGoalCFrame }
-    ):Play()
+    )
+    Runtime.ActiveTween:Play()
 end
 
 local function updateSeaHeightMovement(goalCFrame, now, targetEpoch, characterEpoch, localRoot)
@@ -2211,18 +2091,24 @@ local function updateSeaHeightMovement(goalCFrame, now, targetEpoch, characterEp
     end
 
     if not movement then
+        local stallTimeout = tonumber(Settings.SeaHeightStallTimeout)
+
+        if not stallTimeout or stallTimeout ~= stallTimeout or stallTimeout <= 0 or stallTimeout == math.huge then
+            stallTimeout = 3
+        end
+
         movement = {
             TargetEpoch = targetEpoch,
             CharacterEpoch = characterEpoch,
             Root = localRoot,
             ResumeAt = now,
+            StallTimeout = stallTimeout,
+            LastProgressAt = now,
+            ProgressDistance = nil,
+            RetryCount = 0,
         }
         Runtime.SeaHeightMove = movement
         Runtime.ChaseMoveCycle = nil
-    end
-
-    if movement.Tween or now < movement.ResumeAt then
-        return
     end
 
     local currentCFrame = clampCFrameAboveSea(localRoot.CFrame)
@@ -2239,6 +2125,38 @@ local function updateSeaHeightMovement(goalCFrame, now, targetEpoch, characterEp
 
     if distance <= 0.001 then
         stopSeaHeightMovement()
+        return
+    end
+
+    -- Check actual vertical progress even while a segment still owns a tween.
+    -- Small oscillations cannot continually restart the timeout.
+    if not movement.ProgressDistance or distance <= movement.ProgressDistance - 0.5 then
+        movement.ProgressDistance = distance
+        movement.LastProgressAt = now
+    elseif now - movement.LastProgressAt >= movement.StallTimeout then
+        if movement.Connection then
+            movement.Connection:Disconnect()
+            movement.Connection = nil
+        end
+
+        if movement.Tween then
+            movement.Tween:Cancel()
+            movement.Tween = nil
+        end
+
+        if movement.RetryCount >= 1 then
+            clearTarget("Sea-height movement stalled after retry; finding another target")
+            return
+        end
+
+        movement.RetryCount = movement.RetryCount + 1
+        movement.ProgressDistance = distance
+        movement.LastProgressAt = now
+        movement.ResumeAt = now
+        setStatus("Sea-height movement stalled; retrying")
+    end
+
+    if movement.Tween or now < movement.ResumeAt then
         return
     end
 
@@ -2264,24 +2182,67 @@ local function updateSeaHeightMovement(goalCFrame, now, targetEpoch, characterEp
         movement.Connection = nil
         movement.Tween = nil
 
-        if playbackState ~= Enum.PlaybackState.Completed
-            or not Runtime.Running
+        if not Runtime.Running
             or Runtime.SafeMode
             or Runtime.LocalDead
             or Runtime.HopPending
             or Runtime.TargetEpoch ~= targetEpoch
             or Runtime.CharacterEpoch ~= characterEpoch
+            or not Runtime.CurrentTarget
             or Runtime.Root ~= localRoot
             or not localRoot.Parent
+            or not isFiniteVector3(localRoot.Position)
             or localRoot.Position.Y <= INTERNAL.MinimumTweenY + 0.001 then
 
             stopSeaHeightMovement()
             return
         end
 
+        -- Cancellation must not erase the accumulated stall time or retry count.
         movement.ResumeAt = os.clock() + INTERNAL.SeaHeightPauseDuration
     end)
     tween:Play()
+end
+
+local function getSafeModeMovementGoal(root)
+    local movement = Runtime.SafeModeMovement
+
+    if not movement
+        or movement.Root ~= root
+        or movement.SafeEpoch ~= Runtime.SafeEpoch
+        or movement.CharacterEpoch ~= Runtime.CharacterEpoch then
+
+        stopSafeModeMovement()
+        movement = {
+            Root = root,
+            SafeEpoch = Runtime.SafeEpoch,
+            CharacterEpoch = Runtime.CharacterEpoch,
+            Center = Vector3.new(root.Position.X, SafeModeY, root.Position.Z),
+            Angle = math.random() * math.pi * 2,
+        }
+        Runtime.SafeModeMovement = movement
+    end
+
+    if not SafeModePanicEnabled then
+        return CFrame.new(root.Position.X, SafeModeY, root.Position.Z)
+            * root.CFrame.Rotation
+    end
+
+    -- Keep each destination until reached so rapid updates cannot stall ascent.
+    if not movement.Goal or (root.Position - movement.Goal).Magnitude <= 3 then
+        if movement.Goal then
+            movement.Angle = movement.Angle + math.pi * (0.5 + math.random())
+        end
+
+        local radius = SafeModePanicRadius * (0.5 + math.random() * 0.5)
+        movement.Goal = movement.Center + Vector3.new(
+            math.cos(movement.Angle) * radius,
+            0,
+            math.sin(movement.Angle) * radius
+        )
+    end
+
+    return CFrame.new(movement.Goal) * root.CFrame.Rotation
 end
 
 local function updateSafeModeMovement(deltaTime)
@@ -2299,6 +2260,7 @@ local function updateSafeModeMovement(deltaTime)
         or humanoid.Parent ~= character
         or humanoid.Health <= 0 then
 
+        stopSafeModeMovement()
         restoreLocalCollision()
         return false
     end
@@ -2308,6 +2270,7 @@ local function updateSafeModeMovement(deltaTime)
         or not root:IsA("BasePart")
         or not root:IsDescendantOf(character) then
 
+        stopSafeModeMovement()
         restoreLocalCollision()
 
         local replacementRoot = character:FindFirstChild("HumanoidRootPart")
@@ -2327,6 +2290,7 @@ local function updateSafeModeMovement(deltaTime)
     end
 
     if not isFiniteVector3(root.Position) then
+        stopSafeModeMovement()
         restoreLocalCollision()
         Runtime.SafeModeAtAltitude = false
         return false
@@ -2334,11 +2298,10 @@ local function updateSafeModeMovement(deltaTime)
 
     applyLocalNoClip()
 
-    local position = root.Position
-    local safeGoal = CFrame.new(position.X, SafeModeY, position.Z)
-        * root.CFrame.Rotation
+    local safeGoal = getSafeModeMovementGoal(root)
 
     AutoTween(safeGoal, deltaTime, false)
+    Runtime.SafeModeMovement.Tween = Runtime.ActiveTween
 
     if not Runtime.Running
         or not Runtime.SafeMode
@@ -2350,6 +2313,7 @@ local function updateSafeModeMovement(deltaTime)
         or not root.Parent
         or not root:IsDescendantOf(character) then
 
+        stopSafeModeMovement()
         restoreLocalCollision()
         return false
     end
@@ -2361,11 +2325,18 @@ local function updateSafeModeMovement(deltaTime)
 
         if atAltitude then
             setStatus(string.format(
-                "SafeMode: holding at Y %.1f until MaxHealth",
+                SafeModePanicEnabled
+                    and "SafeMode: moving around at Y %.1f until MaxHealth"
+                    or "SafeMode: holding at Y %.1f until MaxHealth",
                 SafeModeY
             ))
         else
-            setStatus(string.format("SafeMode: moving to Y %.1f", SafeModeY))
+            setStatus(string.format(
+                SafeModePanicEnabled
+                    and "SafeMode: panic movement toward Y %.1f"
+                    or "SafeMode: moving to Y %.1f",
+                SafeModeY
+            ))
         end
     end
 
@@ -2453,7 +2424,8 @@ local function getPlayerChaseGoal(localRoot, targetRoot)
         return targetCFrame
     end
 
-    if localPosition.Y > INTERNAL.MinimumTweenY + 0.001 then
+    -- Finish an active descent precisely, but do not restart it for tiny physics drift.
+    if finishingSeaHeight or localPosition.Y > INTERNAL.MinimumTweenY + 0.5 then
         return CFrame.new(
             localPosition.X,
             INTERNAL.MinimumTweenY,
@@ -2540,18 +2512,21 @@ local function faceRootTowardTarget(localRoot, targetRoot)
     end
 end
 
-local function updateSafeZoneRetreat(deltaTime)
+local function updateEmptyCombatEntrance()
     local character = Runtime.Character
     local characterEpoch = Runtime.CharacterEpoch
     local root = Runtime.Root
     local humanoid = Runtime.Humanoid
     local inCombat, inCombatKnown = readLocalInCombat()
-    local emptyRetreatReady = isEmptyListHopReady()
 
-    if not Runtime.HopPending
-        or not emptyRetreatReady
+    if not Runtime.Running
+        or not Runtime.HopPending
+        or Runtime.SafeMode
+        or Runtime.LocalDead
+        or not isEmptyListHopReady()
         or not inCombatKnown
         or inCombat ~= true
+        or Runtime.CurrentTarget ~= nil
         or not character
         or character ~= LocalPlayer.Character
         or not root
@@ -2559,82 +2534,84 @@ local function updateSafeZoneRetreat(deltaTime)
         or not root:IsDescendantOf(character)
         or not isFiniteVector3(root.Position)
         or not humanoid
-        or not humanoid.Parent
+        or humanoid.Parent ~= character
         or humanoid.Health <= 0 then
 
-        stopSafeZoneRetreat()
         return false
     end
 
-    local retreatPosition, safeZonePart = nearestSafeZoneRetreatPosition(root.Position)
+    local previousAttempt = Runtime.EmptyCombatEntranceAttempt
 
-    if not retreatPosition or not safeZonePart then
-        stopSafeZoneRetreat()
-        Runtime.Mode = "HOP_WAIT"
-
-        if Runtime.Status ~= "InCombat; waiting for a usable SafeZone before hopping" then
-            setStatus("InCombat; waiting for a usable SafeZone before hopping")
-        end
-
-        return false
-    end
-
-    if pointInsidePart(safeZonePart, root.Position, 0.05) then
-        restoreLocalCollision()
-        Runtime.Retreating = true
-        Runtime.RetreatSafeZonePart = safeZonePart
-        Runtime.Mode = "RETREAT"
-
-        if Runtime.Status ~= "Inside SafeZone; waiting for InCombat to turn off" then
-            setStatus("Inside SafeZone; waiting for InCombat to turn off")
-        end
+    if previousAttempt
+        and previousAttempt.EmptySince == Runtime.EmptySince
+        and previousAttempt.CharacterEpoch == characterEpoch then
 
         return true
     end
 
-    local retreatChanged = not Runtime.Retreating
-        or Runtime.RetreatSafeZonePart ~= safeZonePart
-    Runtime.Retreating = true
-    Runtime.RetreatSafeZonePart = safeZonePart
-    Runtime.Mode = "RETREAT"
+    -- Latch before spawning: Heartbeat must not issue duplicate requests.
+    local attempt = {
+        EmptySince = Runtime.EmptySince,
+        CharacterEpoch = characterEpoch,
+    }
+    Runtime.EmptyCombatEntranceAttempt = attempt
+    Runtime.Mode = "HOP_WAIT"
 
-    if retreatChanged
-        or Runtime.Status ~= "InCombat; retreating to nearest SafeZone before hopping" then
+    -- An old chase tween must not pull us back after requestEntrance.
+    stopSeaHeightMovement()
 
-        setStatus("InCombat; retreating to nearest SafeZone before hopping")
+    if Runtime.ActiveTween then
+        Runtime.ActiveTween:Cancel()
+        Runtime.ActiveTween = nil
     end
 
-    applyLocalNoClip()
+    restoreLocalCollision()
+    local entrance = nearestEntrance(root.Position)
 
-    local finalInCombat, finalInCombatKnown = readLocalInCombat()
-
-    if not Runtime.Running
-        or not Runtime.HopPending
-        or not isEmptyListHopReady()
-        or Runtime.SafeMode
-        or Runtime.LocalDead
-        or Runtime.CharacterEpoch ~= characterEpoch
-        or Runtime.Character ~= character
-        or LocalPlayer.Character ~= character
-        or Runtime.Root ~= root
-        or not root.Parent
-        or not root:IsDescendantOf(character)
-        or not finalInCombatKnown
-        or finalInCombat ~= true
-        or Runtime.SafeZoneParts[safeZonePart] ~= true
-        or not safeZonePart.Parent
-        or not Runtime.SafeZonesFolder
-        or not safeZonePart:IsDescendantOf(Runtime.SafeZonesFolder) then
-
-        stopSafeZoneRetreat()
+    if not entrance then
+        setStatus("No entrance available; waiting for InCombat to turn off before hopping")
         return false
     end
 
-    AutoTween(
-        CFrame.new(retreatPosition) * root.CFrame.Rotation,
-        deltaTime,
-        false
-    )
+    local function stillValid()
+        local currentInCombat, currentInCombatKnown = readLocalInCombat()
+
+        return Runtime.Running
+            and Runtime.HopPending
+            and not Runtime.SafeMode
+            and not Runtime.LocalDead
+            and Runtime.EmptyCombatEntranceAttempt == attempt
+            and Runtime.EmptySince == attempt.EmptySince
+            and Runtime.CharacterEpoch == characterEpoch
+            and Runtime.Character == character
+            and LocalPlayer.Character == character
+            and Runtime.Humanoid == humanoid
+            and humanoid.Parent == character
+            and humanoid.Health > 0
+            and Runtime.Root == root
+            and root.Parent ~= nil
+            and root:IsDescendantOf(character)
+            and isFiniteVector3(root.Position)
+            and Runtime.CurrentTarget == nil
+            and isEmptyListHopReady()
+            and currentInCombatKnown
+            and currentInCombat == true
+    end
+
+    setStatus("InCombat with no eligible targets; requesting nearest entrance")
+
+    task.spawn(function()
+        local success = invokeEntrance(entrance, "EmptyCombat", nil, stillValid)
+
+        if not stillValid() then
+            return
+        end
+
+        setStatus(success
+            and "Entrance requested; waiting for InCombat to turn off before hopping"
+            or "Entrance request failed; waiting for InCombat to turn off before hopping")
+    end)
+
     return true
 end
 
@@ -2790,6 +2767,44 @@ local function getWeaponOrder()
     return result
 end
 
+local function getSkillOrder(categoryConfig)
+    local result = {}
+    local included = {}
+    local allowed = {}
+
+    for _, keyName in ipairs(SKILL_ORDER) do
+        allowed[keyName] = true
+    end
+
+    if type(categoryConfig.SkillOrder) == "table" then
+        for _, keyName in ipairs(categoryConfig.SkillOrder) do
+            if allowed[keyName] and not included[keyName] then
+                included[keyName] = true
+                table.insert(result, keyName)
+            end
+        end
+    end
+
+    -- An order override reorders keys; Enabled remains the switch for each skill.
+    for _, keyName in ipairs(SKILL_ORDER) do
+        if not included[keyName] then
+            table.insert(result, keyName)
+        end
+    end
+
+    return result
+end
+
+local function getComboNumberSetting(name, fallback)
+    local value = tonumber(Settings[name])
+
+    if isFiniteNumber(value) and value >= 0 then
+        return value
+    end
+
+    return fallback
+end
+
 local function collectTools()
     local tools = {}
     local character = Runtime.Character
@@ -2914,7 +2929,12 @@ local function castSkill(keyName, skillConfig, targetEpoch)
         return false
     end
 
-    local holdTime = math.max(tonumber(skillConfig.Hold) or 0, 0)
+    local holdTime = getComboNumberSetting("ComboHold", nil)
+
+    if holdTime == nil then
+        local configuredHold = tonumber(skillConfig.Hold)
+        holdTime = isFiniteNumber(configuredHold) and math.max(configuredHold, 0) or 0
+    end
     Runtime.AimActive = true
 
     if not pressKeyDown(keyName) then
@@ -2942,6 +2962,7 @@ end
 local CombatActions = {
     NextNormalAttackAt = 0,
     NextRemoteLookupAt = 0,
+    SkillAttempts = setmetatable({}, {__mode = "k"}),
 }
 
 function CombatActions.ReadCooldown(tool, keyName)
@@ -2982,6 +3003,47 @@ function CombatActions.ReadCooldown(tool, keyName)
     return cooldown.AbsoluteSize.X > 0
 end
 
+function CombatActions.ObserveCooldown(tool, keyName, cooling)
+    local skills = CombatActions.SkillAttempts[tool]
+
+    if not skills then
+        skills = {}
+        CombatActions.SkillAttempts[tool] = skills
+    end
+
+    local attempt = skills[keyName]
+
+    if not attempt then
+        attempt = {NextAttemptAt = 0}
+        skills[keyName] = attempt
+    end
+
+    -- A confirmed cooldown finishing can resume immediately. Repeated false/nil
+    -- readings still honor the retry interval when an activation was not observed.
+    if attempt.LastKnownCooling == true and cooling == false then
+        attempt.NextAttemptAt = 0
+    end
+
+    if cooling ~= nil then
+        attempt.LastKnownCooling = cooling
+    end
+
+    return attempt
+end
+
+function CombatActions.CanAttempt(entry)
+    local cooling = CombatActions.ReadCooldown(entry.Tool, entry.Key)
+    local attempt = CombatActions.ObserveCooldown(entry.Tool, entry.Key, cooling)
+    entry.Cooling = cooling
+
+    return cooling ~= true and os.clock() >= attempt.NextAttemptAt
+end
+
+function CombatActions.MarkAttempt(entry)
+    local attempt = CombatActions.ObserveCooldown(entry.Tool, entry.Key, entry.Cooling)
+    attempt.NextAttemptAt = os.clock() + getComboNumberSetting("ComboRetryDelay", 1)
+end
+
 function CombatActions.GetSkills(weaponOrder)
     local entries = {}
 
@@ -2993,17 +3055,19 @@ function CombatActions.GetSkills(weaponOrder)
             local skills = type(categoryConfig.Skills) == "table" and categoryConfig.Skills or {}
 
             if tool then
-                for _, keyName in ipairs(SKILL_ORDER) do
+                for _, keyName in ipairs(getSkillOrder(categoryConfig)) do
                     local skillConfig = skills[keyName]
 
                     if type(skillConfig) == "table" and skillConfig.Enabled == true then
+                        local cooling = CombatActions.ReadCooldown(tool, keyName)
+                        CombatActions.ObserveCooldown(tool, keyName, cooling)
                         table.insert(entries, {
                             Tool = tool,
                             Category = category,
                             CategoryConfig = categoryConfig,
                             Key = keyName,
                             Config = skillConfig,
-                            Cooling = CombatActions.ReadCooldown(tool, keyName),
+                            Cooling = cooling,
                         })
                     end
                 end
@@ -3029,21 +3093,21 @@ function CombatActions.AllCooling(entries)
 end
 
 function CombatActions.SelectSkill(entries, cursor)
-    -- Prefer known-ready skills; otherwise retain attempts for unknown skills.
-    for pass = 1, 2 do
-        for offset = 0, #entries - 1 do
-            local index = ((cursor - 1 + offset) % #entries) + 1
-            local entry = entries[index]
+    -- A pass advances only forward. Ready and unknown skills share the same
+    -- order, so one ready skill cannot repeatedly jump ahead of later skills.
+    for index = cursor, #entries do
+        local entry = entries[index]
 
-            if (pass == 1 and entry.Cooling == false)
-                or (pass == 2 and entry.Cooling == nil) then
+        if entry.CategoryConfig.Enabled == true
+            and entry.Config.Enabled == true
+            and entry.Tool.Parent
+            and CombatActions.CanAttempt(entry) then
 
-                return entry, index
-            end
+            return entry, index
         end
     end
 
-    return nil
+    return nil, #entries
 end
 
 function CombatActions.GetNormalTool(weaponOrder)
@@ -3108,6 +3172,14 @@ function CombatActions.NormalAttack(targetEpoch)
         return false
     end
 
+    local humanoid = Runtime.Humanoid
+
+    if not humanoid or humanoid.MaxHealth <= 0
+        or humanoid.Health < humanoid.MaxHealth * 0.20 then
+
+        return false
+    end
+
     local now = os.clock()
 
     if now < CombatActions.NextNormalAttackAt then
@@ -3156,65 +3228,102 @@ end
 local function startWeaponWorker()
     task.spawn(function()
         local weaponOrder = getWeaponOrder()
+        local comboEntries = nil
         local skillCursor = 1
+        local comboTargetEpoch = nil
+        local comboCharacterEpoch = nil
 
         while Runtime.Running do
             local targetEpoch = Runtime.TargetEpoch
 
             if not canAttack(targetEpoch) then
+                -- Keep the next step across a brief hitbox/safe-mode interruption.
+                -- Target/character epoch changes reset the pass when attacks resume.
                 Runtime.AimActive = false
                 Runtime.CurrentTool = nil
                 releaseAllKeys()
                 task.wait(0.05)
             else
-                local entries = CombatActions.GetSkills(weaponOrder)
-                local entry, entryIndex = CombatActions.SelectSkill(entries, skillCursor)
+                if not comboEntries
+                    or comboTargetEpoch ~= targetEpoch
+                    or comboCharacterEpoch ~= Runtime.CharacterEpoch then
+
+                    comboEntries = CombatActions.GetSkills(weaponOrder)
+                    skillCursor = 1
+                    comboTargetEpoch = targetEpoch
+                    comboCharacterEpoch = Runtime.CharacterEpoch
+                end
+
+                local entry, entryIndex = CombatActions.SelectSkill(comboEntries, skillCursor)
+                local castCompleted = false
+                skillCursor = entryIndex + 1
 
                 if entry then
-                    skillCursor = (entryIndex % #entries) + 1
-
                     if equipTool(entry.Tool, targetEpoch)
                         and canAttack(targetEpoch)
-                        and entry.Tool.Parent == Runtime.Character then
+                        and Runtime.CharacterEpoch == comboCharacterEpoch
+                        and entry.Tool.Parent == Runtime.Character
+                        and entry.CategoryConfig.Enabled == true
+                        and entry.Config.Enabled == true then
 
-                        local cooling = CombatActions.ReadCooldown(entry.Tool, entry.Key)
-
-                        if cooling ~= true then
-                            if cooling == nil then
+                        -- Equipping yields; recheck this exact combo step before
+                        -- key-down, without restarting the order at the first skill.
+                        if CombatActions.CanAttempt(entry) then
+                            if entry.Cooling == nil then
                                 warnOnce(
                                     "skill:cooldown-unknown:" .. entry.Tool.Name .. ":" .. entry.Key,
                                     "Cooldown unavailable for " .. entry.Tool.Name .. " " .. entry.Key
-                                        .. "; continuing skill attempts. NormalAttack requires known cooldowns for every enabled skill."
+                                        .. "; using ordered, retry-limited attempts. NormalAttack requires known cooldowns for every enabled skill."
                                 )
                             end
 
-                            if castSkill(entry.Key, entry.Config, targetEpoch) then
-                                waitWhileAttackable(entry.CategoryConfig.Delay or 0.1, targetEpoch)
+                            CombatActions.MarkAttempt(entry)
+                            castCompleted = castSkill(entry.Key, entry.Config, targetEpoch)
+
+                            if castCompleted then
+                                local delay = getComboNumberSetting("ComboDelay", 0.03)
+
+                                if delay > 0 then
+                                    waitWhileAttackable(delay, targetEpoch)
+                                end
                             end
                         end
                     end
-                elseif ClickAttackEnabled and CombatActions.AllCooling(entries)
-                    and os.clock() >= CombatActions.NextNormalAttackAt then
+                else
+                    -- Rebuild only after the entire pass. Retry gates alone never
+                    -- qualify as cooldowns for the normal-attack fallback.
+                    comboEntries = nil
+                    local latestEntries = CombatActions.GetSkills(weaponOrder)
 
-                    local tool = CombatActions.GetNormalTool(weaponOrder)
+                    if ClickAttackEnabled and CombatActions.AllCooling(latestEntries)
+                        and os.clock() >= CombatActions.NextNormalAttackAt then
 
-                    if not tool then
-                        warnOnce("normal-attack:tool", "NormalAttack needs an available enabled Melee or Sword tool.")
-                    elseif equipTool(tool, targetEpoch)
-                        and canAttack(targetEpoch)
-                        and tool.Parent == Runtime.Character then
+                        local tool = CombatActions.GetNormalTool(weaponOrder)
 
-                        -- Equipping may yield: check every skill again before firing.
-                        local latestEntries = CombatActions.GetSkills(weaponOrder)
+                        if not tool then
+                            warnOnce("normal-attack:tool", "NormalAttack needs an available enabled Melee or Sword tool.")
+                        elseif equipTool(tool, targetEpoch)
+                            and canAttack(targetEpoch)
+                            and Runtime.CharacterEpoch == comboCharacterEpoch
+                            and tool.Parent == Runtime.Character then
 
-                        if CombatActions.AllCooling(latestEntries) then
-                            CombatActions.NormalAttack(targetEpoch)
+                            -- Equipping may yield: check every skill again before firing.
+                            latestEntries = CombatActions.GetSkills(weaponOrder)
+
+                            if CombatActions.AllCooling(latestEntries) then
+                                CombatActions.NormalAttack(targetEpoch)
+                            end
                         end
                     end
                 end
 
                 Runtime.AimActive = false
-                task.wait(0.01)
+
+                -- Successful casts already yield during Hold/ComboDelay. Cooling
+                -- skills are skipped together without sleeping for each key.
+                if not castCompleted then
+                    task.wait(0.01)
+                end
             end
         end
 
@@ -3378,7 +3487,12 @@ enterSafeMode = function()
     clearTarget()
     applyLocalNoClip()
     Runtime.Mode = "SAFE_MODE"
-    setStatus(string.format("SafeMode: moving to Y %.1f", SafeModeY))
+    setStatus(string.format(
+        SafeModePanicEnabled
+            and "SafeMode: panic movement toward Y %.1f"
+            or "SafeMode: moving to Y %.1f",
+        SafeModeY
+    ))
 end
 
 exitSafeMode = function()
@@ -3389,6 +3503,7 @@ exitSafeMode = function()
     Runtime.SafeMode = false
     Runtime.SafeEpoch = Runtime.SafeEpoch + 1
     Runtime.SafeModeAtAltitude = false
+    stopSafeModeMovement()
     restoreLocalCollision()
     Runtime.Mode = Runtime.HopPending and "HOP_WAIT" or "SCAN"
 
@@ -3634,11 +3749,9 @@ local function startMovementWorker()
         end
 
         if Runtime.HopPending then
-            updateSafeZoneRetreat(deltaTime)
+            updateEmptyCombatEntrance()
             return
         end
-
-        stopSafeZoneRetreat()
 
         if not Runtime.FriendAuditComplete then
             if Runtime.CurrentTarget then
@@ -4101,10 +4214,10 @@ local function stopHopPending(message)
     Runtime.HopAttemptEpoch = Runtime.HopAttemptEpoch + 1
     Runtime.Teleporting = false
     Runtime.HopPending = false
+    Runtime.EmptyCombatEntranceAttempt = nil
     Runtime.HopReason = nil
     Runtime.HopDetail = nil
     Runtime.FollowTimeoutHopDetail = nil
-    stopSafeZoneRetreat()
 
     if Runtime.Running and not Runtime.SafeMode and not Runtime.LocalDead then
         Runtime.Mode = "SCAN"
@@ -4441,7 +4554,6 @@ local function runHopWorker()
                 end
 
                 if inCombatKnown and inCombat == false then
-                    stopSafeZoneRetreat()
                     break
                 end
 
@@ -4655,6 +4767,10 @@ requestHop = function(reason, detail)
         Runtime.FollowTimeoutHopDetail = detail or "PlayerFollowTime expired"
     end
 
+    if not Runtime.HopPending then
+        Runtime.EmptyCombatEntranceAttempt = nil
+    end
+
     Runtime.HopPending = true
     Runtime.HopReason = reason
     Runtime.HopDetail = detail
@@ -4824,6 +4940,13 @@ function Runtime:Stop(reason)
     end
 
     self.HopPending = false
+    self.EmptyCombatEntranceAttempt = nil
+
+    if self.ActiveTween then
+        self.ActiveTween:Cancel()
+        self.ActiveTween = nil
+    end
+
     self.FollowTimeoutHopDetail = nil
     self.HopAttemptEpoch = self.HopAttemptEpoch + 1
     self.Teleporting = false
@@ -4849,7 +4972,6 @@ function Runtime:Stop(reason)
 
     releaseAllKeys()
     restoreTargetHitbox()
-    stopSafeZoneRetreat()
     restoreLocalCollision()
     destroyAllESP()
     disconnectConnections(self.TargetConnections)
