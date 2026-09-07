@@ -440,6 +440,7 @@ local Runtime = {
     PendingCandidateCount = 0,
     NoProgressCharacters = {},
     FollowTimeoutCharacters = {},
+    PreviouslyTargeted = {},
     TargetConnections = {},
     Connections = {},
     CharacterConnections = {},
@@ -1387,6 +1388,10 @@ local function evaluateTarget(player)
         return false, "self-or-left"
     end
 
+    if Runtime.PreviouslyTargeted[player.UserId] then
+        return false, "previously-targeted"
+    end
+
     requestFriendCheck(player)
 
     if Runtime.FriendCache[player.UserId] == nil then
@@ -1572,6 +1577,10 @@ local function resetTargetTimers()
 end
 
 local function clearTarget(reason)
+    if Runtime.CurrentTarget then
+        Runtime.PreviouslyTargeted[Runtime.CurrentTarget.UserId] = true
+    end
+
     Runtime.TargetEpoch = Runtime.TargetEpoch + 1
     Runtime.AimActive = false
     Runtime.AimPosition = nil
