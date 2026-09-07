@@ -4,14 +4,20 @@
 -- PlayerFollowTime, NoDamageTimeout, SkipPreviousTargets, OrbitEnabled, RaceV3, RaceV4,
 -- ClickAttack, HitboxOffset, TweenHitbox, SafeZoneRadius, combo timings, panic movement,
 -- SeaHeightFirst, SeaHeightStallTimeout, GunOpenerEnabled, GunEngageDistance, MaxTargetDistance,
--- Aimbot, optional Config.Combo, and optional ReadSkillCooldown.
+-- Aimbot, TargetWeaponFilter, optional Config.Combo, and optional ReadSkillCooldown.
 -- Race flags belong in Config.Settings and require an explicit true.
 -- Race V3/V4 activation does not require InCombat or being inside a target hitbox.
 -- NoDamageTimeout allows time for a target health drop or confirmed local InCombat after hitbox entry.
 -- Either qualifies the current target for this check until a different target acquisition.
--- Keep the selected player through recovery and temporary eligibility changes.
--- Only NoDamageTimeout abandons a target; PlayerFollowTime no longer switches targets.
+-- Keep the selected player through recovery and temporary eligibility changes except the abandonment rules below.
+-- Abandon for NoDamageTimeout, target PvP disabled, or target in a safe zone with confirmed local InCombat=false.
+-- PlayerFollowTime no longer switches targets. The PvP/safe-zone abandonment checks require confirmed data.
 -- SkipPreviousTargets records only abandoned targets. A player leaving is released without a history mark.
+-- Settings.TargetWeaponFilter = {Enabled=true, Ignore={"Portal-Portal"}}; these are the defaults.
+-- false or Enabled=false disables the filter; Ignore={} excludes no weapons.
+-- Match visible Tool names or WeaponName on EquippedWeapon/UnequippedWeapon models.
+-- Exact matches ignore case/spaces/punctuation; a detected exclusion lasts until character replacement.
+-- An excluded current target is released without a previous-target or no-damage history mark.
 -- OrbitEnabled defaults to true; set false to follow the target directly without circling.
 -- ClickAttack defaults to true; normal attacks fill gaps when no enabled skill can be attempted.
 -- ClickAttack also pauses while the local player's health is below 20% of MaxHealth.
@@ -37,7 +43,7 @@
 -- Each step's optional Hold overrides Settings.ComboHold; omit it to keep the normal hold settings.
 -- Each step.Weapon uses the Tool display name (e.g. "Ice-Ice"); optional step.Tool overrides that lookup name.
 -- Weapon category/skill Enabled flags still apply. Explicit Gun steps run in the hitbox, independent of the basic opener.
--- SeaHeightStallTimeout defaults to 3 seconds without vertical progress: retry once, then switch.
+-- SeaHeightStallTimeout defaults to 3 seconds without vertical progress: retry once, then pause.
 -- SeaHeightFirst defaults to false for direct chasing; set true to restore the sea-level stage.
 -- TweenHitbox defaults: Enabled=true, Size=Vector3.new(100,100,100), TimeMultiplier=0.2.
 -- This separate target-relative box multiplies chase/orbit tween duration, including the existing hitbox slowdown.
@@ -595,6 +601,7 @@ local Runtime = {
     NoProgressCharacters = {},
     FollowTimeoutCharacters = {},
     PreviouslyTargeted = {},
+    IgnoredTargetWeapons = {},
     RouteFailures = {},
     TargetConnections = {},
     Connections = {},
@@ -1537,9 +1544,112 @@ local function getTargetRoute(player, info, preferEntrance)
     return nil, hasFailedRoute and "entrance-route-failed" or "target-out-of-range"
 end
 
+local TargetWeaponFilter = {Enabled = false, Names = {}}
+
+function TargetWeaponFilter.NormalizeName(value)
+    if type(value) ~= "string" then
+        return nil
+    end
+
+    local name = string.lower(value):gsub("[%s%p]", "")
+    return name ~= "" and name or nil
+end
+
+do
+    local config = type(Settings.TargetWeaponFilter) == "table" and Settings.TargetWeaponFilter or {}
+    TargetWeaponFilter.Enabled = Settings.TargetWeaponFilter ~= false and config.Enabled ~= false
+    local names = config.Ignore
+
+    if names == nil then
+        names = {"Portal-Portal"}
+    elseif type(names) ~= "table" then
+        warnOnce("target-weapon-filter:ignore", "TargetWeaponFilter.Ignore must be a list of weapon names; using Portal-Portal.")
+        names = {"Portal-Portal"}
+    end
+
+    for _, name in ipairs(names) do
+        local normalized = TargetWeaponFilter.NormalizeName(name)
+
+        if normalized then
+            TargetWeaponFilter.Names[normalized] = name
+        end
+    end
+end
+
+function TargetWeaponFilter.MatchInstance(instance, allowModel)
+    local name
+
+    -- Direct method calls also make this safe inside the aim hook's validation.
+    if instance.IsA(instance, "Tool") then
+        name = instance.Name
+    elseif allowModel
+        and (instance.Name == "EquippedWeapon" or instance.Name == "UnequippedWeapon")
+        and (instance.IsA(instance, "Model") or instance.IsA(instance, "BasePart")) then
+
+        name = instance.GetAttribute(instance, "WeaponName")
+    end
+
+    local normalized = TargetWeaponFilter.NormalizeName(name)
+    return normalized and TargetWeaponFilter.Names[normalized] or nil
+end
+
+function TargetWeaponFilter.FindIgnored(player)
+    if not TargetWeaponFilter.Enabled or next(TargetWeaponFilter.Names) == nil
+        or not player or player == LocalPlayer or player.Parent ~= Players then
+
+        return nil
+    end
+
+    local character = player.Character
+    local cached = Runtime.IgnoredTargetWeapons[player]
+
+    if cached and cached.Character ~= character then
+        Runtime.IgnoredTargetWeapons[player] = nil
+        cached = nil
+    end
+
+    if not character or not character.Parent then
+        return nil
+    end
+
+    if cached then
+        return cached.Weapon
+    end
+
+    for _, child in ipairs(character.GetChildren(character)) do
+        local matched = TargetWeaponFilter.MatchInstance(child, true)
+
+        if matched then
+            Runtime.IgnoredTargetWeapons[player] = {Character = character, Weapon = matched}
+            return matched
+        end
+    end
+
+    -- A remote player's full inventory may not be visible. Inspect only Tools
+    -- actually available to this client, without waiting for missing containers.
+    local backpack = player.FindFirstChildOfClass(player, "Backpack")
+
+    if backpack then
+        for _, child in ipairs(backpack.GetChildren(backpack)) do
+            local matched = TargetWeaponFilter.MatchInstance(child, false)
+
+            if matched then
+                Runtime.IgnoredTargetWeapons[player] = {Character = character, Weapon = matched}
+                return matched
+            end
+        end
+    end
+
+    return nil
+end
+
 local function evaluateTarget(player)
     if not player or player == LocalPlayer or player.Parent ~= Players then
         return false, "self-or-left"
+    end
+
+    if TargetWeaponFilter.FindIgnored(player) then
+        return false, "ignored-weapon"
     end
 
     if SkipPreviousTargets and Runtime.PreviouslyTargeted[player.UserId] then
@@ -1866,8 +1976,16 @@ local function pauseTarget(reason)
 end
 
 local function clearTarget(reason, abandon)
-    if abandon and SkipPreviousTargets and Runtime.CurrentTarget then
-        Runtime.PreviouslyTargeted[Runtime.CurrentTarget.UserId] = true
+    if abandon and Runtime.CurrentTarget then
+        if SkipPreviousTargets then
+            Runtime.PreviouslyTargeted[Runtime.CurrentTarget.UserId] = true
+        end
+
+        local reference = Runtime.SafeModeReference
+
+        if reference and reference.TargetInfo and reference.TargetInfo.Player == Runtime.CurrentTarget then
+            reference.TargetInfo = nil
+        end
     end
 
     pauseTarget()
@@ -1899,6 +2017,52 @@ local function clearTarget(reason, abandon)
     end
 
     updateTargetGUI()
+end
+
+local function releaseIgnoredTarget(weapon)
+    local player = Runtime.CurrentTarget
+
+    if not player then
+        return
+    end
+
+    local reference = Runtime.SafeModeReference
+
+    if reference and reference.TargetInfo and reference.TargetInfo.Player == player then
+        reference.TargetInfo = nil
+    end
+
+    clearTarget("Ignoring " .. player.Name .. ": weapon " .. tostring(weapon))
+end
+
+local function getTargetAbandonReason(player)
+    if not Runtime.Running or not player or player ~= Runtime.CurrentTarget
+        or player.Parent ~= Players then
+
+        return nil
+    end
+
+    local pvpDisabled, pvpKnown = readBooleanAttribute(player, "PvpDisabled", false)
+
+    if pvpKnown and pvpDisabled == true then
+        return "Target PvP is disabled; abandoning selected target"
+    end
+
+    local _, _, root = getAliveCharacter(player)
+
+    if not root or not isFiniteVector3(root.Position)
+        or isInsideSafeZone(root.Position) ~= true then
+
+        return nil
+    end
+
+    local inCombat, combatKnown = readLocalInCombat()
+
+    if combatKnown and inCombat == false then
+        return "Target is in a safe zone and local combat ended; abandoning selected target"
+    end
+
+    return nil
 end
 
 local function ensureCombatAttributes()
@@ -2082,6 +2246,7 @@ local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer, entr
             and Runtime.TargetEpoch == targetEpoch
             and Runtime.CharacterEpoch == characterEpoch
             and Runtime.CurrentTarget == targetPlayer
+            and not TargetWeaponFilter.FindIgnored(targetPlayer)
             and Runtime.Root == localRoot
             and localRoot ~= nil
             and localRoot.Parent ~= nil
@@ -2435,6 +2600,10 @@ local function canAttack(targetEpoch, attackMode, readOnly)
         or Runtime.HopPending
         or not Runtime.FriendAuditComplete then
 
+        return false
+    end
+
+    if TargetWeaponFilter.FindIgnored(Runtime.CurrentTarget) then
         return false
     end
 
@@ -5008,6 +5177,20 @@ local function startMovementWorker()
             return
         end
 
+        local ignoredWeapon = TargetWeaponFilter.FindIgnored(Runtime.CurrentTarget)
+
+        if ignoredWeapon then
+            releaseIgnoredTarget(ignoredWeapon)
+        else
+            -- Check even while pursuit is paused, so a later combat-state change
+            -- can release a target that is still waiting inside a safe zone.
+            local abandonReason = getTargetAbandonReason(Runtime.CurrentTarget)
+
+            if abandonReason then
+                clearTarget(abandonReason, true)
+            end
+        end
+
         enforceLocalYFloor()
 
         if Runtime.LocalDead then
@@ -5085,7 +5268,7 @@ local function startMovementWorker()
         local targetPvpDisabled = readBooleanAttribute(player, "PvpDisabled", false)
 
         if targetPvpDisabled == true then
-            pauseTarget("Target PvP is disabled")
+            clearTarget("Target PvP is disabled; abandoning selected target", true)
             return
         end
 
@@ -6082,6 +6265,7 @@ local function startFriendWorker()
 
     connect(Players.PlayerRemoving, function(player)
         destroyESP(player)
+        Runtime.IgnoredTargetWeapons[player] = nil
         Runtime.FriendCache[player.UserId] = nil
         Runtime.FriendCheckedAt[player.UserId] = nil
 
@@ -6136,9 +6320,15 @@ local function startTargetWorker()
             if Runtime.CurrentTarget then
                 local player = Runtime.CurrentTarget
                 local currentInfo = Runtime.CandidateInfo[player]
+                local ignoredWeapon = TargetWeaponFilter.FindIgnored(player)
+                local abandonReason = not ignoredWeapon and getTargetAbandonReason(player)
 
                 if player.Parent ~= Players then
                     clearTarget("Target left the server")
+                elseif ignoredWeapon then
+                    releaseIgnoredTarget(ignoredWeapon)
+                elseif abandonReason then
+                    clearTarget(abandonReason, true)
                 elseif not Runtime.SafeMode and not Runtime.LocalDead and not Runtime.HopPending then
                     if not Runtime.FriendAuditComplete then
                         pauseTarget("Waiting for friend checks; keeping selected target")
@@ -6251,6 +6441,7 @@ function Runtime:Stop(reason)
     table.clear(self.NoProgressCharacters)
     table.clear(self.FollowTimeoutCharacters)
     table.clear(self.RouteFailures)
+    table.clear(self.IgnoredTargetWeapons)
 
     if self.CameraBindName then
         pcall(function()
