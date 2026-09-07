@@ -24,10 +24,12 @@
 -- ComboRetryDelay defaults to 1 second when cooldown activation cannot be confirmed.
 -- SeaHeightStallTimeout defaults to 3 seconds without vertical progress: retry once, then switch.
 -- SeaHeightFirst defaults to false for direct chasing; set true to restore the sea-level stage.
--- TweenHitbox defaults: Enabled=true, Size=Vector3.new(100,100,100), TimeMultiplier=2.
+-- TweenHitbox defaults: Enabled=true, Size=Vector3.new(100,100,100), TimeMultiplier=0.2.
 -- This separate target-relative box multiplies chase/orbit tween duration, including the existing hitbox slowdown.
+-- Any finite multiplier above 0 is accepted: 0.2 gives one-fifth duration (5x speed).
 -- GunOpenerEnabled defaults to true; fire one RemoteFunctionShoot opener within GunEngageDistance (100 studs).
 -- Other weapons start inside the combat hitbox. The opener requires Weapon.Gun.Enabled, not Gun skill flags.
+-- Gun lookup/equip can retry up to 3 times, 0.25s apart; an invoked shot is never repeated for that acquisition.
 -- MaxTargetDistance defaults to 10000 studs (3D): direct targets first, then entrance routes.
 
 local Players = game:GetService("Players")
@@ -81,7 +83,7 @@ local MaxTargetDistance = Settings.MaxTargetDistance == nil
 local TweenHitboxEnabled = TweenHitboxConfig.Enabled ~= false
 local TweenHitboxSize = TweenHitboxConfig.Size or Vector3.new(100, 100, 100)
 local TweenHitboxTimeMultiplier = TweenHitboxConfig.TimeMultiplier == nil
-    and 2 or tonumber(TweenHitboxConfig.TimeMultiplier)
+    and 0.2 or tonumber(TweenHitboxConfig.TimeMultiplier)
 local RawAutoHop = Settings.AutoHop
 local AutoHopEnabled = RawAutoHop == nil and true or RawAutoHop
 local RawAttack = Settings.Attack
@@ -127,9 +129,9 @@ if typeof(TweenHitboxSize) ~= "Vector3"
     TweenHitboxSize = Vector3.new(100, 100, 100)
 end
 
-if not isFiniteNumber(TweenHitboxTimeMultiplier) or TweenHitboxTimeMultiplier < 1 then
-    warn("[AutoBounty] Settings.TweenHitbox.TimeMultiplier must be finite and at least 1; using 2.")
-    TweenHitboxTimeMultiplier = 2
+if not isFiniteNumber(TweenHitboxTimeMultiplier) or TweenHitboxTimeMultiplier <= 0 then
+    warn("[AutoBounty] Settings.TweenHitbox.TimeMultiplier must be finite and above 0; using 0.2.")
+    TweenHitboxTimeMultiplier = 0.2
 end
 
 if HitboxOffset == nil then
@@ -3270,6 +3272,14 @@ local function castSkill(keyName, skillConfig, targetEpoch, attackMode)
         return false
     end
 
+    print(string.format(
+        "[AutoBounty][Combo] KeyDown | Weapon=%s | Key=%s | Hold=%.2fs | Target=%s",
+        tostring(Runtime.CurrentTool and Runtime.CurrentTool.Name or "Unknown"),
+        tostring(keyName),
+        holdTime,
+        tostring(Runtime.CurrentTarget and Runtime.CurrentTarget.Name or "None")
+    ))
+
     local waitOk, completed = pcall(waitWhileAttackable, holdTime, targetEpoch, attackMode)
     releaseKey(keyName)
     Runtime.AimActive = false
@@ -3549,31 +3559,39 @@ function CombatActions.NormalAttack(targetEpoch)
 
     if not success then
         warnOnce("normal-attack:fire", "NormalAttack failed: " .. tostring(result))
+    else
+        print(string.format(
+            "[AutoBounty][ClickAttack] Blade attack sent | Weapon=%s | Target=%s",
+            tostring(tool.Name),
+            tostring(info.Player.Name)
+        ))
     end
 
     return success
 end
 
 function CombatActions.GunOpener(tool, targetEpoch, characterEpoch)
-    if Runtime.GunShotRequest
-        or Runtime.CharacterEpoch ~= characterEpoch
+    if Runtime.GunShotRequest then
+        return false, false, "A previous gun request is still pending"
+    end
+
+    if Runtime.CharacterEpoch ~= characterEpoch
         or not canAttack(targetEpoch, "GunApproach")
         or not tool or tool.Parent ~= Runtime.Character
         or Runtime.CurrentTool ~= tool then
 
-        return false
+        return false, false, "Gun, character, or approach state changed"
     end
 
     local remote = tool:FindFirstChild("RemoteFunctionShoot")
 
     if not remote or not remote:IsA("RemoteFunction") then
-        warnOnce("gun:remote:" .. tool.Name, "Gun " .. tool.Name .. " has no RemoteFunctionShoot; skipping its opener.")
-        return false
+        return false, false, "Gun " .. tool.Name .. " has no RemoteFunctionShoot RemoteFunction"
     end
 
     local targetInfo = Runtime.CurrentTargetInfo
     local targetRoot = targetInfo.Root
-    local request = {Finished = false, Success = false, Expired = false}
+    local request = {Started = false, Finished = false, Success = false, Expired = false}
     local deadline = os.clock() + 1
 
     Runtime.GunShotRequest = request
@@ -3614,6 +3632,12 @@ function CombatActions.GunOpener(tool, targetEpoch, characterEpoch)
                 [2] = targetRoot,
             }
             Runtime.AimPosition = args[1]
+            print(string.format(
+                "[AutoBounty][Gun] Requesting RemoteFunctionShoot | Weapon=%s | Target=%s",
+                tostring(tool.Name),
+                tostring(targetInfo.Player.Name)
+            ))
+            request.Started = true
             remote:InvokeServer(table.unpack(args))
             return true
         end)
@@ -3648,6 +3672,11 @@ function CombatActions.GunOpener(tool, targetEpoch, characterEpoch)
 
         Runtime.GunMouseHeld = request
         VirtualUser:Button1Down(Vector2.new(1280, 672))
+        print(string.format(
+            "[AutoBounty][GunClick] Button1Down sent | Weapon=%s | Target=%s",
+            tostring(tool.Name),
+            tostring(targetInfo.Player.Name)
+        ))
         waitWhileAttackable(0.05, targetEpoch, "GunApproach")
         return true
     end)
@@ -3669,7 +3698,10 @@ function CombatActions.GunOpener(tool, targetEpoch, characterEpoch)
         warnOnce("gun:timeout:" .. tool.Name, "Gun opener response timed out; continuing the combat combo when in range.")
     end
 
-    return waitSucceeded and clicked == true
+    return waitSucceeded and clicked == true, request.Started,
+        request.Error or (not waitSucceeded and tostring(clicked))
+            or (not request.Started and "Approach changed or timed out before sending the gun request")
+            or nil
 end
 
 local function startWeaponWorker()
@@ -3688,6 +3720,9 @@ local function startWeaponWorker()
         local comboTargetEpoch = nil
         local comboCharacterEpoch = nil
         local gunPassFinished = false
+        local gunPreparationAttempts = 0
+        local nextGunPreparationAt = 0
+        local gunPendingReported = false
 
         while Runtime.Running do
             local targetEpoch = Runtime.TargetEpoch
@@ -3698,6 +3733,9 @@ local function startWeaponWorker()
                 comboEntries = nil
                 skillCursor = 1
                 gunPassFinished = false
+                gunPreparationAttempts = 0
+                nextGunPreparationAt = 0
+                gunPendingReported = false
                 comboTargetEpoch = targetEpoch
                 comboCharacterEpoch = Runtime.CharacterEpoch
             end
@@ -3725,22 +3763,71 @@ local function startWeaponWorker()
                 releaseAllKeys()
                 task.wait(0.05)
             elseif attackMode == "GunApproach" then
-                -- One basic gun shot per acquisition, independent of Gun.Skills.
-                -- Latch before equipping/invoking because both may yield.
-                gunPassFinished = true
-                local gunConfig = WeaponConfig.Gun
-                local tool = resolveTool("Gun", gunConfig)
+                if Runtime.GunShotRequest then
+                    if not gunPendingReported then
+                        print("[AutoBounty][Gun] Waiting for the previous gun request; preparation attempts are paused")
+                        gunPendingReported = true
+                    end
 
-                if tool and equipTool(tool, targetEpoch, "GunApproach")
-                    and Runtime.CharacterEpoch == comboCharacterEpoch then
+                    task.wait(0.03)
+                elseif os.clock() < nextGunPreparationAt then
+                    task.wait(0.03)
+                else
+                    -- A failed lookup/equip does not consume the shot. Retry
+                    -- preparation briefly, but never repeat a request once sent.
+                    gunPendingReported = false
+                    gunPreparationAttempts = gunPreparationAttempts + 1
+                    local gunConfig = WeaponConfig.Gun
+                    local tool = resolveTool("Gun", gunConfig)
+                    local targetName = tostring(Runtime.CurrentTarget and Runtime.CurrentTarget.Name or "None")
+                    local requestStarted = false
+                    local failureReason
 
-                    CombatActions.GunOpener(tool, targetEpoch, comboCharacterEpoch)
+                    if not tool then
+                        failureReason = "No matching gun for Name=" .. tostring(gunConfig.Name or "Auto")
+                            .. "; Auto requires a Tool with ToolTip=Gun"
+                    else
+                        print(string.format(
+                            "[AutoBounty][Gun] Equipping | Weapon=%s | Target=%s | Attempt=%d/3",
+                            tostring(tool.Name), targetName, gunPreparationAttempts
+                        ))
+
+                        if not equipTool(tool, targetEpoch, "GunApproach") then
+                            failureReason = "Equip failed or the target left the gun approach phase"
+                        elseif Runtime.CharacterEpoch ~= comboCharacterEpoch then
+                            failureReason = "Local character changed during equip"
+                        else
+                            print(string.format(
+                                "[AutoBounty][Gun] Equipped | Weapon=%s | Target=%s",
+                                tostring(tool.Name), targetName
+                            ))
+                            local clicked
+                            clicked, requestStarted, failureReason = CombatActions.GunOpener(
+                                tool, targetEpoch, comboCharacterEpoch
+                            )
+                        end
+                    end
+
+                    if Runtime.TargetEpoch == targetEpoch
+                        and Runtime.CharacterEpoch == comboCharacterEpoch then
+
+                        gunPassFinished = requestStarted or gunPreparationAttempts >= 3
+                        nextGunPreparationAt = os.clock() + 0.25
+
+                        if not requestStarted then
+                            print(string.format(
+                                "[AutoBounty][Gun] %s | Target=%s | Attempt=%d/3 | Reason=%s",
+                                gunPassFinished and "Preparation stopped" or "Preparation will retry if still in approach range",
+                                targetName, gunPreparationAttempts, tostring(failureReason or "Request was not sent")
+                            ))
+                        end
+                    end
+
+                    Runtime.ReleaseGunClick()
+                    Runtime.AimActive = false
+                    Runtime.GunAimActive = false
+                    task.wait(0.01)
                 end
-
-                Runtime.ReleaseGunClick()
-                Runtime.AimActive = false
-                Runtime.GunAimActive = false
-                task.wait(0.01)
             else
                 if not comboEntries then
                     comboEntries = CombatActions.GetSkills(combatWeaponOrder)
@@ -4483,7 +4570,7 @@ local function startMovementWorker()
     local offset = localRoot.Position - center
     local angle = math.atan2(offset.Z, offset.X)
 
-    -- Maximum rotation: 180 degrees/second, limited by your tween speed.
+    -- Base rotation before the duration multiplier: at most 180 degrees/second, limited by tween speed.
     local angularSpeed = math.min(
         math.rad(180),
         TweenSpeed * INTERNAL.InHitboxSpeedMultiplier * 0.8 / radius
