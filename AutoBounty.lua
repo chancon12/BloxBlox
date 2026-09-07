@@ -22,12 +22,12 @@
 -- ComboDelay defaults to 0.03 seconds, replacing weapon Delay between casts.
 -- Optional ComboHold overrides every skill Hold; omit it to keep per-skill holds.
 -- ComboRetryDelay defaults to 1 second when cooldown activation cannot be confirmed.
--- Config.Combo = {Enabled=true, RequiredWeapons={"godhuman", "curseddualkatana"},
+-- Config.Combo = {Enabled=true, RequiredWeapons={"Godhuman", "Cursed Dual Katana"},
 --     Steps={{Weapon="Godhuman", Key="Z", Hold=0.1}, {Weapon="Cursed Dual Katana", Key="X", Hold=0.3}}}.
--- RequiredWeapons checks actual WeaponName attributes; all must be present. Case/spaces/punctuation are ignored.
+-- RequiredWeapons checks owned Tool names in Character/Backpack; all must be present. Case/spaces/punctuation are ignored.
 -- Steps run in array order, skipping disabled/cooling skills. Missing requirements/tools pause custom attacks.
 -- Each step's optional Hold overrides Settings.ComboHold; omit it to keep the normal hold settings.
--- Optional step.Tool is an explicit Tool-name alias, e.g. Weapon="icesword", Tool="Ice-Ice".
+-- Each step.Weapon uses the Tool display name (e.g. "Ice-Ice"); optional step.Tool overrides that lookup name.
 -- Weapon category/skill Enabled flags still apply. Explicit Gun steps run in the hitbox, independent of the basic opener.
 -- SeaHeightStallTimeout defaults to 3 seconds without vertical progress: retry once, then switch.
 -- SeaHeightFirst defaults to false for direct chasing; set true to restore the sea-level stage.
@@ -3551,7 +3551,7 @@ function CombatActions.GetComboConfig()
     return type(combo) == "table" and combo.Enabled == true and combo or nil
 end
 
-function CombatActions.NormalizeWeaponName(value)
+function CombatActions.NormalizeToolName(value)
     if type(value) ~= "string" then
         return nil
     end
@@ -3569,70 +3569,28 @@ function CombatActions.IsOwnedTool(tool)
     return tool.Parent == Runtime.Character or (backpack ~= nil and tool.Parent == backpack)
 end
 
-function CombatActions.GetOwnedWeaponModel(tool)
-    if not CombatActions.IsOwnedTool(tool) then
-        return nil
-    end
-
-    local pointer = tool:FindFirstChild("LocalEquippedWeaponPointer")
-    local model = pointer and pointer:IsA("ObjectValue") and pointer.Value
-
-    -- The owned Tool's explicit pointer also supports locally rendered models outside Character.
-    if model and model.Parent then
-        return model
-    end
-
-    return nil
-end
-
 function CombatActions.ComboRequirementsMet(combo)
     if type(combo.RequiredWeapons) ~= "table" or #combo.RequiredWeapons == 0 then
-        return false, "RequiredWeapons must contain at least one WeaponName"
+        return false, "RequiredWeapons must contain at least one Tool name"
     end
 
     local found = {}
-    local function readAttribute(object)
-        local name = CombatActions.NormalizeWeaponName(object:GetAttribute("WeaponName"))
+
+    for _, tool in ipairs(collectTools()) do
+        local name = CombatActions.NormalizeToolName(tool.Name)
 
         if name then
             found[name] = true
         end
     end
 
-    local function readContainer(container)
-        if not container then
-            return
-        end
-
-        readAttribute(container)
-
-        for _, object in ipairs(container:GetDescendants()) do
-            readAttribute(object)
-        end
-    end
-
-    readContainer(Runtime.Character)
-
-    for _, tool in ipairs(collectTools()) do
-        -- Equipped tools are already covered by the character scan.
-        if tool.Parent ~= Runtime.Character then
-            readContainer(tool)
-        end
-
-        local model = CombatActions.GetOwnedWeaponModel(tool)
-
-        if model then
-            readAttribute(model)
-        end
-    end
-
     local missing = {}
 
     for _, value in ipairs(combo.RequiredWeapons) do
-        local name = CombatActions.NormalizeWeaponName(value)
+        local name = CombatActions.NormalizeToolName(value)
 
         if not name then
-            return false, "RequiredWeapons entries must be nonempty strings"
+            return false, "RequiredWeapons entries must be nonempty Tool-name strings"
         end
 
         if not found[name] then
@@ -3641,44 +3599,26 @@ function CombatActions.ComboRequirementsMet(combo)
     end
 
     if #missing > 0 then
-        return false, "Missing WeaponName: " .. table.concat(missing, ", ")
+        return false, "Missing owned Tool: " .. table.concat(missing, ", ")
     end
 
     return true
 end
 
 function CombatActions.ResolveComboTool(step)
-    local requested = CombatActions.NormalizeWeaponName(step.Tool or step.Weapon)
+    local requested = CombatActions.NormalizeToolName(step.Tool or step.Weapon)
 
     if not requested then
         return nil
     end
 
-    local nameMatch
-
     for _, tool in ipairs(collectTools()) do
-        local named = CombatActions.NormalizeWeaponName(tool.Name) == requested
-
-        if step.Tool ~= nil then
-            if named then
-                return tool
-            end
-        else
-            local model = CombatActions.GetOwnedWeaponModel(tool)
-            local toolName = CombatActions.NormalizeWeaponName(tool:GetAttribute("WeaponName"))
-            local modelName = model and CombatActions.NormalizeWeaponName(model:GetAttribute("WeaponName"))
-
-            if toolName == requested or modelName == requested then
-                return tool
-            end
-
-            if named and not nameMatch then
-                nameMatch = tool
-            end
+        if CombatActions.NormalizeToolName(tool.Name) == requested then
+            return tool
         end
     end
 
-    return nameMatch
+    return nil
 end
 
 function CombatActions.ComboBlocked(reason)
@@ -3709,7 +3649,7 @@ function CombatActions.GetCustomSkills(combo)
         end
 
         if step.Enabled ~= false then
-            if not CombatActions.NormalizeWeaponName(step.Weapon) then
+            if not CombatActions.NormalizeToolName(step.Weapon) then
                 return CombatActions.ComboBlocked("Step " .. tostring(index) .. " needs a Weapon name")
             end
 
