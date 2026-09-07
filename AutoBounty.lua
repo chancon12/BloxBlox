@@ -1080,7 +1080,6 @@ local function applyTargetHitbox(root)
         pcall(function()
             root.Size = ConfiguredHitboxSize
             root.CanCollide = false
-            root.Massless = true
             root.Transparency = ConfiguredHitboxTransparency
         end)
         return
@@ -1098,7 +1097,6 @@ local function applyTargetHitbox(root)
     pcall(function()
         root.Size = ConfiguredHitboxSize
         root.CanCollide = false
-        root.Massless = true
         root.Transparency = ConfiguredHitboxTransparency
     end)
 end
