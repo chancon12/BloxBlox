@@ -120,11 +120,13 @@ local INTERNAL = {
     PvPMaxAttempts = 5,
     InHitboxSpeedMultiplier = 2 / 7,
     MinimumTweenY = 0,
+    VerticalChaseDistance = 1000,
     SafeZoneRetreatInset = 0.5,
     FastTPArrivalTimeout = 3,
     FastTPCooldown = 2,
     ServerRetryDelay = 3,
     ServerPageDelay = 0.03,
+    ServerPageMaxAttempts = 3,
     ServerInvokeTimeout = 5,
     TeleportStartTimeout = 8,
     TeleportTransferTimeout = 30,
@@ -425,6 +427,7 @@ local Runtime = {
     PendingSince = {},
     PendingCandidateCount = 0,
     NoProgressCharacters = {},
+    FollowTimeoutCharacters = {},
     TargetConnections = {},
     Connections = {},
     CharacterConnections = {},
@@ -1398,6 +1401,16 @@ local function evaluateTarget(player)
         return false, "below-sea-level"
     end
 
+    local followTimeoutCharacter = Runtime.FollowTimeoutCharacters[player]
+
+    if followTimeoutCharacter then
+        if followTimeoutCharacter == character then
+            return false, "follow-timeout-target"
+        end
+
+        Runtime.FollowTimeoutCharacters[player] = nil
+    end
+
     local noProgressCharacter = Runtime.NoProgressCharacters[player]
 
     if noProgressCharacter then
@@ -1479,6 +1492,32 @@ local function rebuildCandidates()
             Runtime.PendingSince[player] = nil
         end
     end
+
+    local localRoot = Runtime.Root
+
+    table.sort(candidates, function(firstPlayer, secondPlayer)
+        local firstInfo = candidateInfo[firstPlayer]
+        local secondInfo = candidateInfo[secondPlayer]
+        local firstRoot = firstInfo and firstInfo.Root
+        local secondRoot = secondInfo and secondInfo.Root
+
+        if localRoot
+            and localRoot.Parent
+            and firstRoot
+            and firstRoot.Parent
+            and secondRoot
+            and secondRoot.Parent then
+
+            local firstDistance = (firstRoot.Position - localRoot.Position).Magnitude
+            local secondDistance = (secondRoot.Position - localRoot.Position).Magnitude
+
+            if firstDistance ~= secondDistance then
+                return firstDistance < secondDistance
+            end
+        end
+
+        return firstPlayer.UserId < secondPlayer.UserId
+    end)
 
     Runtime.Candidates = candidates
     Runtime.CandidateInfo = candidateInfo
@@ -1960,6 +1999,47 @@ local function AutoTween(goalCFrame, deltaTime, insideHitbox)
     if safeNextCFrame then
         root.CFrame = safeNextCFrame
     end
+end
+
+local function getPlayerChaseGoal(localRoot, targetRoot)
+    if not localRoot
+        or not localRoot.Parent
+        or not targetRoot
+        or not targetRoot.Parent
+        or not isFiniteVector3(localRoot.Position)
+        or not isFiniteVector3(targetRoot.Position) then
+
+        return nil
+    end
+
+    local targetCFrame = targetRoot.CFrame
+    local targetPosition = targetCFrame.Position
+    local horizontalOffset = Vector3.new(
+        targetPosition.X - localRoot.Position.X,
+        0,
+        targetPosition.Z - localRoot.Position.Z
+    )
+
+    if horizontalOffset.Magnitude <= INTERNAL.VerticalChaseDistance then
+        return targetCFrame
+    end
+
+    local localCFrame = localRoot.CFrame
+    local localPosition = localCFrame.Position
+
+    if localPosition.Y > INTERNAL.MinimumTweenY + 0.001 then
+        return CFrame.new(
+            localPosition.X,
+            INTERNAL.MinimumTweenY,
+            localPosition.Z
+        ) * localCFrame.Rotation
+    end
+
+    return CFrame.new(
+        targetPosition.X,
+        INTERNAL.MinimumTweenY,
+        targetPosition.Z
+    ) * targetCFrame.Rotation
 end
 
 local function enforceLocalYFloor()
@@ -2823,7 +2903,20 @@ local function startMovementWorker()
                     and finalInCombatKnown
                     and finalInCombat == false then
 
-                    requestHop("follow-timeout", player.Name)
+                    Runtime.FollowTimeoutCharacters[player] = character
+                    clearTarget("PlayerFollowTime expired; switching to nearest target")
+
+                    local remainingCandidates = rebuildCandidates()
+
+                    if #remainingCandidates > 0 then
+                        local nearestPlayer = remainingCandidates[1]
+                        setTarget(nearestPlayer, Runtime.CandidateInfo[nearestPlayer])
+                    elseif Runtime.PendingCandidateCount > 0 then
+                        setStatus("PlayerFollowTime expired; waiting for player data or respawn")
+                    else
+                        setStatus("PlayerFollowTime expired; no remaining eligible target")
+                    end
+
                     return
                 end
 
@@ -2911,7 +3004,11 @@ local function startMovementWorker()
             setStatus("Chasing " .. player.Name)
         end
 
-        AutoTween(targetRoot.CFrame, deltaTime, insideHitbox)
+        local chaseGoal = getPlayerChaseGoal(localRoot, targetRoot)
+
+        if chaseGoal then
+            AutoTween(chaseGoal, deltaTime, insideHitbox)
+        end
 
         if insideHitbox then
             faceRootTowardTarget(localRoot, targetRoot)
@@ -3172,7 +3269,7 @@ local function getCurrentJob(browser)
     local success, jobId = invokeServerBrowser(
         browser,
         INTERNAL.ServerInvokeTimeout,
-        "read",
+        "read:getjob",
         nil,
         "getjob"
     )
@@ -3221,58 +3318,76 @@ local function scanServers()
         if not Runtime.Running
             or not Runtime.HopPending
             or Runtime.SafeMode
-            or Runtime.LocalDead then
+            or Runtime.LocalDead
+            or determineHopReason() == nil then
 
             scanStatus = "cancelled"
             break
         end
 
-        local success, servers, invokeFinished = invokeServerBrowser(
-            browser,
-            INTERNAL.ServerInvokeTimeout,
-            "read",
-            nil,
-            page
-        )
+        local servers
+        local pageResolved = false
+        local pageFailure
+        local pageSlotKey = "read:page:" .. tostring(page)
 
-        if not invokeFinished then
-            scanStatus = Runtime.Running
-                and Runtime.HopPending
-                and not Runtime.SafeMode
-                and not Runtime.LocalDead
-                and "failed"
-                or "cancelled"
-
-            if scanStatus == "failed" then
-                warnOnce(
-                    "server-browser:page-timeout",
-                    "A server-browser page request timed out."
-                )
+        for attempt = 1, INTERNAL.ServerPageMaxAttempts do
+            if determineHopReason() == nil then
+                scanStatus = "cancelled"
+                break
             end
 
-            break
-        elseif not success then
-            scanStatus = "failed"
-            warnOnce(
-                "server-browser:page",
-                "A server-browser page request failed: " .. tostring(servers)
+            local success, result, invokeFinished, invokePending = invokeServerBrowser(
+                browser,
+                INTERNAL.ServerInvokeTimeout,
+                pageSlotKey,
+                nil,
+                page
             )
-            break
-        elseif type(servers) ~= "table" then
-            scanStatus = "failed"
-            warnOnce(
-                "server-browser:schema",
-                "The server browser returned an unexpected page format."
-            )
+
+            if not Runtime.Running
+                or not Runtime.HopPending
+                or Runtime.SafeMode
+                or Runtime.LocalDead
+                or determineHopReason() == nil then
+
+                scanStatus = "cancelled"
+                break
+            end
+
+            if invokeFinished and success and type(result) == "table" then
+                servers = result
+                pageResolved = true
+                break
+            end
+
+            pageFailure = result
+
+            if invokePending then
+                break
+            end
+
+            if attempt < INTERNAL.ServerPageMaxAttempts then
+                task.wait(0.5)
+            end
+        end
+
+        if scanStatus == "cancelled" then
             break
         end
 
-        local pageHadEntries = false
+        if not pageResolved then
+            scanStatus = "failed"
+            warnOnce(
+                "server-browser:page",
+                "One or more server-browser pages failed after retries: " .. tostring(pageFailure)
+            )
+
+            task.wait(INTERNAL.ServerPageDelay)
+            continue
+        end
 
         for key, info in pairs(servers) do
             if type(info) == "table" then
-                pageHadEntries = true
-
                 local jobId = info.JobId or info.Id
 
                 if (type(jobId) ~= "string" or jobId == "") and type(key) == "string" then
@@ -3281,7 +3396,10 @@ local function scanServers()
 
                 local count = tonumber(info.Count or info.Playing or info.Players)
                 local maxPlayers = tonumber(info.MaxPlayers or info.Capacity)
-                    or INTERNAL.MaxServerPlayers
+
+                if not isFiniteNumber(maxPlayers) or maxPlayers <= 0 then
+                    maxPlayers = tonumber(Players.MaxPlayers) or INTERNAL.MaxServerPlayers
+                end
 
                 if type(jobId) == "string"
                     and jobId ~= ""
@@ -3303,10 +3421,6 @@ local function scanServers()
                     })
                 end
             end
-        end
-
-        if not pageHadEntries then
-            break
         end
 
         task.wait(INTERNAL.ServerPageDelay)
@@ -3811,6 +3925,7 @@ local function startFriendWorker()
 
         Runtime.PendingSince[player] = nil
         Runtime.NoProgressCharacters[player] = nil
+        Runtime.FollowTimeoutCharacters[player] = nil
 
         if Runtime.CurrentTarget == player then
             clearTarget("Target left the server")
@@ -3933,6 +4048,7 @@ function Runtime:Stop(reason)
     self.AimActive = false
     resetTargetTimers()
     table.clear(self.NoProgressCharacters)
+    table.clear(self.FollowTimeoutCharacters)
 
     if self.CameraBindName then
         pcall(function()
