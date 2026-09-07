@@ -1779,6 +1779,8 @@ local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer)
         return false
     end
 
+    task.wait(1)
+    
     if (localRoot.Position - targetRoot.Position).Magnitude <= 300 then
         return false
     end
