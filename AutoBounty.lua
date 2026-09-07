@@ -2,11 +2,12 @@
 -- External options are intentionally limited to Team, Weapon, Attack, FastTP,
 -- AutoHop, ESP, NoClip, TweenSpeed, SafeModeY, health thresholds, hitbox settings,
 -- PlayerFollowTime, NoDamageTimeout, SkipPreviousTargets, OrbitEnabled, RaceV3, RaceV4,
--- and optional ReadSkillCooldown.
+-- ClickAttack, and optional ReadSkillCooldown.
 -- Race flags belong in Config.Settings and require an explicit true.
 -- NoDamageTimeout is the seconds allowed for the first health drop after entering the hitbox.
 -- SkipPreviousTargets defaults to true; set false to allow previous targets through this filter.
 -- OrbitEnabled defaults to true; set false to follow the target directly without circling.
+-- ClickAttack defaults to true; set false to disable normal attacks while skills are cooling down.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -48,6 +49,7 @@ local FastTPEnabled = Settings.FastTP ~= false
 local ESPEnabled = Settings.ESPPlayer ~= false
 local SkipPreviousTargets = Settings.SkipPreviousTargets ~= false
 local OrbitEnabled = Settings.OrbitEnabled ~= false
+local ClickAttackEnabled = Settings.ClickAttack ~= false
 local RawAutoHop = Settings.AutoHop
 local AutoHopEnabled = RawAutoHop == nil and true or RawAutoHop
 local RawAttack = Settings.Attack
@@ -2861,7 +2863,7 @@ function CombatActions.GetAttackRemotes()
 end
 
 function CombatActions.NormalAttack(targetEpoch)
-    if not canAttack(targetEpoch) or Runtime.AimActive then
+    if not ClickAttackEnabled or not canAttack(targetEpoch) or Runtime.AimActive then
         return false
     end
 
@@ -2950,7 +2952,7 @@ local function startWeaponWorker()
                             end
                         end
                     end
-                elseif CombatActions.AllCooling(entries)
+                elseif ClickAttackEnabled and CombatActions.AllCooling(entries)
                     and os.clock() >= CombatActions.NextNormalAttackAt then
 
                     local tool = CombatActions.GetNormalTool(weaponOrder)
