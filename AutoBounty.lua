@@ -1,7 +1,8 @@
 -- GitHub-side Auto Bounty module.
 -- External options are intentionally limited to Team, Weapon, Attack, FastTP,
 -- AutoHop, ESP, NoClip, TweenSpeed, SafeModeY, health thresholds, hitbox settings,
--- and PlayerFollowTime.
+-- PlayerFollowTime, RaceV3, RaceV4, and optional ReadSkillCooldown.
+-- Race flags belong in Config.Settings and require an explicit true.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -2677,64 +2678,287 @@ local function castSkill(keyName, skillConfig, targetEpoch)
     return completed
 end
 
+-- Optional Settings.ReadSkillCooldown(tool, keyName) must return:
+-- true = cooling down, false = ready, nil = unknown; it must not yield.
+-- Default GUI adapter expects Main.Skills[tool.Name][keyName].Cooldown,
+-- with a horizontal cooldown bar that shrinks to zero when ready.
+-- This UI convention must match the live game; unknown data never enables M1.
+local CombatActions = {
+    NextNormalAttackAt = 0,
+    NextRemoteLookupAt = 0,
+}
+
+function CombatActions.ReadCooldown(tool, keyName)
+    if not tool or not tool.Parent then
+        return nil
+    end
+
+    if type(Settings.ReadSkillCooldown) == "function" then
+        local success, result = pcall(Settings.ReadSkillCooldown, tool, keyName)
+
+        if success and type(result) == "boolean" then
+            return result
+        end
+
+        if not success then
+            warnOnce("skill:cooldown-reader", "ReadSkillCooldown failed: " .. tostring(result))
+        end
+
+        return nil
+    end
+
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local main = playerGui and playerGui:FindFirstChild("Main")
+    local skills = main and main:FindFirstChild("Skills")
+    local panel = skills and skills:FindFirstChild(tool.Name)
+    local skill = panel and panel:FindFirstChild(keyName)
+    local cooldown = skill and skill:FindFirstChild("Cooldown")
+
+    if not skill
+        or not skill:IsA("GuiObject")
+        or skill.AbsoluteSize.X <= 0
+        or not cooldown
+        or not cooldown:IsA("GuiObject") then
+
+        return nil
+    end
+
+    return cooldown.AbsoluteSize.X > 0
+end
+
+function CombatActions.GetSkills(weaponOrder)
+    local entries = {}
+
+    for _, category in ipairs(weaponOrder) do
+        local categoryConfig = WeaponConfig[category]
+
+        if type(categoryConfig) == "table" and categoryConfig.Enabled == true then
+            local tool = resolveTool(category, categoryConfig)
+            local skills = type(categoryConfig.Skills) == "table" and categoryConfig.Skills or {}
+
+            if tool then
+                for _, keyName in ipairs(SKILL_ORDER) do
+                    local skillConfig = skills[keyName]
+
+                    if type(skillConfig) == "table" and skillConfig.Enabled == true then
+                        table.insert(entries, {
+                            Tool = tool,
+                            Category = category,
+                            CategoryConfig = categoryConfig,
+                            Key = keyName,
+                            Config = skillConfig,
+                            Cooling = CombatActions.ReadCooldown(tool, keyName),
+                        })
+                    end
+                end
+            end
+        end
+    end
+
+    return entries
+end
+
+function CombatActions.AllCooling(entries)
+    if #entries == 0 then
+        return false
+    end
+
+    for _, entry in ipairs(entries) do
+        if entry.Cooling ~= true then
+            return false
+        end
+    end
+
+    return true
+end
+
+function CombatActions.SelectSkill(entries, cursor)
+    -- Prefer known-ready skills; otherwise retain attempts for unknown skills.
+    for pass = 1, 2 do
+        for offset = 0, #entries - 1 do
+            local index = ((cursor - 1 + offset) % #entries) + 1
+            local entry = entries[index]
+
+            if (pass == 1 and entry.Cooling == false)
+                or (pass == 2 and entry.Cooling == nil) then
+
+                return entry, index
+            end
+        end
+    end
+
+    return nil
+end
+
+function CombatActions.GetNormalTool(weaponOrder)
+    local firstTool
+
+    for _, category in ipairs(weaponOrder) do
+        local categoryConfig = WeaponConfig[category]
+
+        if (category == "Melee" or category == "Sword")
+            and type(categoryConfig) == "table"
+            and categoryConfig.Enabled == true then
+
+            local tool = resolveTool(category, categoryConfig)
+
+            if tool then
+                if tool == Runtime.CurrentTool then
+                    return tool
+                end
+
+                firstTool = firstTool or tool
+            end
+        end
+    end
+
+    return firstTool
+end
+
+function CombatActions.GetAttackRemotes()
+    local attack = CombatActions.RegisterAttack
+    local hit = CombatActions.RegisterHit
+
+    if attack and hit
+        and attack.Parent
+        and attack.Parent == hit.Parent
+        and attack:IsDescendantOf(ReplicatedStorage) then
+
+        return attack, hit
+    end
+
+    if os.clock() < CombatActions.NextRemoteLookupAt then
+        return nil
+    end
+
+    CombatActions.NextRemoteLookupAt = os.clock() + 1
+    attack = ReplicatedStorage:FindFirstChild("RE/RegisterAttack", true)
+    hit = attack and attack.Parent and attack.Parent:FindFirstChild("RE/RegisterHit")
+
+    if not attack or not attack:IsA("RemoteEvent")
+        or not hit or not hit:IsA("RemoteEvent") then
+
+        warnOnce("normal-attack:remotes", "NormalAttack is waiting for RE/RegisterAttack and RE/RegisterHit under the same parent.")
+        return nil
+    end
+
+    CombatActions.RegisterAttack = attack
+    CombatActions.RegisterHit = hit
+    return attack, hit
+end
+
+function CombatActions.NormalAttack(targetEpoch)
+    if not canAttack(targetEpoch) or Runtime.AimActive then
+        return false
+    end
+
+    local now = os.clock()
+
+    if now < CombatActions.NextNormalAttackAt then
+        return false
+    end
+
+    local info = Runtime.CurrentTargetInfo
+    local targetRoot = info and info.Root
+    local localRoot = Runtime.Root
+    local tool = Runtime.CurrentTool
+
+    if not info or info.Player ~= Runtime.CurrentTarget
+        or not targetRoot or not targetRoot.Parent
+        or not localRoot or not localRoot.Parent
+        or not tool or tool.Parent ~= Runtime.Character
+        or not isFiniteVector3(targetRoot.Position)
+        or not isFiniteVector3(localRoot.Position)
+        or (localRoot.Position - targetRoot.Position).Magnitude >= 60 then
+
+        return false
+    end
+
+    local attack, hit = CombatActions.GetAttackRemotes()
+
+    if not attack or not hit then
+        return false
+    end
+
+    CombatActions.NextNormalAttackAt = now + 0.25
+
+    local success, result = pcall(function()
+        attack:FireServer(0)
+        attack:FireServer(1)
+        attack:FireServer(2)
+        attack:FireServer(3)
+        hit:FireServer(targetRoot, {})
+    end)
+
+    if not success then
+        warnOnce("normal-attack:fire", "NormalAttack failed: " .. tostring(result))
+    end
+
+    return success
+end
+
 local function startWeaponWorker()
     task.spawn(function()
         local weaponOrder = getWeaponOrder()
+        local skillCursor = 1
 
         while Runtime.Running do
-            if not AttackEnabled then
-                Runtime.AimActive = false
-                Runtime.CurrentTool = nil
-                releaseAllKeys()
-                task.wait(0.05)
-            elseif not Runtime.CurrentTarget or not Runtime.InsideHitbox then
+            local targetEpoch = Runtime.TargetEpoch
+
+            if not canAttack(targetEpoch) then
                 Runtime.AimActive = false
                 Runtime.CurrentTool = nil
                 releaseAllKeys()
                 task.wait(0.05)
             else
-                local targetEpoch = Runtime.TargetEpoch
+                local entries = CombatActions.GetSkills(weaponOrder)
+                local entry, entryIndex = CombatActions.SelectSkill(entries, skillCursor)
 
-                if not canAttack(targetEpoch) then
-                    Runtime.AimActive = false
-                    releaseAllKeys()
-                    task.wait(0.05)
-                else
-                    for _, category in ipairs(weaponOrder) do
-                        if not canAttack(targetEpoch) then
-                            break
-                        end
+                if entry then
+                    skillCursor = (entryIndex % #entries) + 1
 
-                        local categoryConfig = WeaponConfig[category]
+                    if equipTool(entry.Tool, targetEpoch)
+                        and canAttack(targetEpoch)
+                        and entry.Tool.Parent == Runtime.Character then
 
-                        if type(categoryConfig) == "table" and categoryConfig.Enabled == true then
-                            local tool = resolveTool(category, categoryConfig)
+                        local cooling = CombatActions.ReadCooldown(entry.Tool, entry.Key)
 
-                            if tool and equipTool(tool, targetEpoch) then
-                                Runtime.CurrentTool = tool
+                        if cooling ~= true then
+                            if cooling == nil then
+                                warnOnce(
+                                    "skill:cooldown-unknown:" .. entry.Tool.Name .. ":" .. entry.Key,
+                                    "Cooldown unavailable for " .. entry.Tool.Name .. " " .. entry.Key
+                                        .. "; continuing skill attempts. NormalAttack requires known cooldowns for every enabled skill."
+                                )
+                            end
 
-                                local skills = type(categoryConfig.Skills) == "table" and categoryConfig.Skills or {}
-
-                                for _, keyName in ipairs(SKILL_ORDER) do
-                                    local skillConfig = skills[keyName]
-
-                                    if type(skillConfig) == "table" and skillConfig.Enabled == true then
-                                        if not castSkill(keyName, skillConfig, targetEpoch) then
-                                            break
-                                        end
-
-                                        if not waitWhileAttackable(categoryConfig.Delay or 0.1, targetEpoch) then
-                                            break
-                                        end
-                                    end
-                                end
+                            if castSkill(entry.Key, entry.Config, targetEpoch) then
+                                waitWhileAttackable(entry.CategoryConfig.Delay or 0.1, targetEpoch)
                             end
                         end
                     end
+                elseif CombatActions.AllCooling(entries)
+                    and os.clock() >= CombatActions.NextNormalAttackAt then
 
-                    Runtime.AimActive = false
-                    task.wait(0.03)
+                    local tool = CombatActions.GetNormalTool(weaponOrder)
+
+                    if not tool then
+                        warnOnce("normal-attack:tool", "NormalAttack needs an available enabled Melee or Sword tool.")
+                    elseif equipTool(tool, targetEpoch)
+                        and canAttack(targetEpoch)
+                        and tool.Parent == Runtime.Character then
+
+                        -- Equipping may yield: check every skill again before firing.
+                        local latestEntries = CombatActions.GetSkills(weaponOrder)
+
+                        if CombatActions.AllCooling(latestEntries) then
+                            CombatActions.NormalAttack(targetEpoch)
+                        end
+                    end
                 end
+
+                Runtime.AimActive = false
+                task.wait(0.01)
             end
         end
 
@@ -2742,6 +2966,138 @@ local function startWeaponWorker()
         releaseAllKeys()
     end)
 end
+
+
+local function startRaceWorker()
+    local nextCheckAt = 0
+    local heldRaceKey = nil
+
+    -- Race transformation owns Y separately from the weapon skill keys.
+    -- Runtime:Stop() must call this before disconnecting Runtime.Connections.
+    local function releaseRaceKey()
+        if not heldRaceKey then
+            return
+        end
+
+        local success, result = pcall(function()
+            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Y, false, game)
+        end)
+
+        if success then
+            heldRaceKey = nil
+        else
+            warnOnce("race:v4:key-up", "Could not release race transformation key: " .. tostring(result))
+        end
+    end
+
+    Runtime.ReleaseRaceKey = releaseRaceKey
+
+    local function getCombatCharacter()
+        local character = Runtime.Character
+        local humanoid = Runtime.Humanoid
+
+        if not Runtime.Running
+            or Environment.__AutoBountyRuntime ~= Runtime
+            or Runtime.SafeMode
+            or Runtime.LocalDead
+            or Runtime.HopPending
+            or Runtime.Teleporting
+            or not character
+            or character ~= LocalPlayer.Character
+            or not character.Parent
+            or not humanoid
+            or humanoid.Parent ~= character
+            or humanoid.Health <= 0 then
+
+            return nil
+        end
+
+        local inCombat, inCombatKnown = readLocalInCombat()
+
+        if not inCombatKnown or inCombat ~= true then
+            return nil
+        end
+
+        return character
+    end
+
+    connect(RunService.Heartbeat, function()
+        local now = os.clock()
+
+        -- Key-up has its own deadline; no sleeping or blocking of V3 checks.
+        if heldRaceKey then
+            local character = getCombatCharacter()
+
+            if now >= heldRaceKey.ReleaseAt
+                or Settings.RaceV4 ~= true
+                or character ~= heldRaceKey.Character
+                or Runtime.CharacterEpoch ~= heldRaceKey.CharacterEpoch then
+
+                releaseRaceKey()
+            end
+        end
+
+        if not Runtime.Running or now < nextCheckAt then
+            return
+        end
+
+        nextCheckAt = now + 0.2
+
+        if Settings.RaceV3 ~= true and Settings.RaceV4 ~= true then
+            return
+        end
+
+        local character = getCombatCharacter()
+
+        if not character then
+            return
+        end
+
+        if Settings.RaceV3 == true then
+            local commE = Remotes:FindFirstChild("CommE")
+
+            if commE and commE:IsA("RemoteEvent") then
+                local success, result = pcall(function()
+                    commE:FireServer("ActivateAbility")
+                end)
+
+                if not success then
+                    warnOnce("race:v3:activate", "Could not activate Race V3: " .. tostring(result))
+                end
+            end
+        end
+
+        if Settings.RaceV4 == true and not heldRaceKey then
+            local raceEnergy = character:FindFirstChild("RaceEnergy")
+            local raceTransformed = character:FindFirstChild("RaceTransformed")
+
+            if raceEnergy
+                and (raceEnergy:IsA("NumberValue")
+                    or raceEnergy:IsA("IntValue")
+                    or raceEnergy:IsA("StringValue"))
+                and tonumber(raceEnergy.Value) == 1
+                and raceTransformed
+                and raceTransformed:IsA("BoolValue")
+                and raceTransformed.Value == false then
+
+                local success, result = pcall(function()
+                    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Y, false, game)
+                end)
+
+                if success then
+                    heldRaceKey = {
+                        Character = character,
+                        CharacterEpoch = Runtime.CharacterEpoch,
+                        ReleaseAt = os.clock() + 0.1,
+                    }
+                else
+                    warnOnce("race:v4:key-down", "Could not activate Race V4: " .. tostring(result))
+                end
+            end
+        end
+    end)
+end
+
 
 enterSafeMode = function()
     local humanoid = Runtime.Humanoid
@@ -4201,6 +4557,10 @@ function Runtime:Stop(reason)
         self.CameraBound = false
     end
 
+    if self.ReleaseRaceKey then
+        self.ReleaseRaceKey()
+    end
+
     releaseAllKeys()
     restoreTargetHitbox()
     stopSafeZoneRetreat()
@@ -4241,6 +4601,7 @@ installAimHook()
 startFriendWorker()
 startMovementWorker()
 startWeaponWorker()
+startRaceWorker()
 startESPWorker()
 startTargetWorker()
 
