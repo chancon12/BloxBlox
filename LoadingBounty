@@ -99,6 +99,28 @@ Combo = {
                 {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.3},
             },
         },
+
+        {
+            Name = "Soul Guitar + Dough + Shark Anchor + Godhuman",
+            Enabled = true,
+            RequiredWeapons = {
+                "Soul Guitar",
+                "Dough-Dough",
+                "Shark Anchor",
+                "Godhuman",
+            },
+            Steps = {
+                {Weapon = "Soul Guitar", Key = "X", Hold = 0.1},
+                {Weapon = "Dough-Dough", Key = "V", Hold = 0.1},
+                {Weapon = "Dough-Dough", Key = "X", Hold = 0.1},
+                {Weapon = "Shark Anchor", Key = "Z", Hold = 0.1},
+                {Weapon = "Shark Anchor", Key = "X", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.3},
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+                {Weapon = "Dough-Dough", Key = "C", Hold = 0.1},
+            },
+        },
     },
 },
 
