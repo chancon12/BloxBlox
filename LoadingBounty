@@ -43,7 +43,11 @@ Combo = {
         {
             Name = "Godhuman + Blizzard + Cursed Dual Katana",
             Enabled = true,
-            RequiredWeapons = {"Blizzard-Blizzard", "Cursed Dual Katana", "Godhuman"},
+            RequiredWeapons = {
+                "Blizzard-Blizzard",
+                "Cursed Dual Katana",
+                "Godhuman",
+            },
             Steps = {
                 {Weapon = "Blizzard-Blizzard", Key = "V", Hold = 0.1},
                 {Weapon = "Blizzard-Blizzard", Key = "C", Hold = 0.1},
@@ -73,6 +77,26 @@ Combo = {
                 {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
                 {Weapon = "Godhuman", Key = "C", Hold = 0.1},
                 {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+            },
+        },
+
+        {
+            Name = "Ice + Soul Guitar + Godhuman + Cursed Dual Katana",
+            Enabled = true,
+            RequiredWeapons = {
+                "Ice-Ice",
+                "Soul Guitar",
+                "Godhuman",
+                "Cursed Dual Katana",
+            },
+            Steps = {
+                {Weapon = "Ice-Ice", Key = "V", Hold = 0.1},
+                {Weapon = "Ice-Ice", Key = "C", Hold = 0.1},
+                {Weapon = "Soul Guitar", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.3},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.3},
             },
         },
     },
