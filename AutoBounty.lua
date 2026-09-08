@@ -41,6 +41,7 @@
 -- Profiles takes priority over single-combo fields; array order sets priority (first matching wins).
 -- Profiles may have Name and Enabled; Enabled=false skips one. No matching profile uses default skills.
 -- Only weapon ownership selects profiles; cooldowns do not select a lower-priority profile.
+-- The status panel shows the current combo Name, default skill pass, or paused/idle state.
 -- RequiredWeapons checks owned Tool names in Character/Backpack; all must be present. Case/spaces/punctuation are ignored.
 -- Steps run in array order, skipping disabled/cooling skills. Missing required Tools select the default combo.
 -- Each custom pass is followed by one default Weapon.Order pass, then the custom sequence is tried again.
@@ -930,7 +931,7 @@ local function createGUI()
     frame.Parent = screenGui
     frame.AnchorPoint = Vector2.new(1, 0)
     frame.Position = UDim2.new(1, -18, 0, 18)
-    frame.Size = UDim2.fromOffset(310, 150)
+    frame.Size = UDim2.fromOffset(310, 194)
     frame.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
     frame.BackgroundTransparency = 0.12
     frame.BorderSizePixel = 0
@@ -957,7 +958,11 @@ local function createGUI()
     Runtime.Labels.Team = createTextLabel(frame, "Team", UDim2.fromOffset(12, 58), UDim2.new(1, -24, 0, 20), "Team: " .. Config.Team, 14)
     Runtime.Labels.Target = createTextLabel(frame, "Target", UDim2.fromOffset(12, 80), UDim2.new(1, -24, 0, 20), "Target: None", 14)
     Runtime.Labels.Candidates = createTextLabel(frame, "Candidates", UDim2.fromOffset(12, 102), UDim2.new(1, -24, 0, 20), "Eligible players: 0", 14)
-    Runtime.Labels.Status = createTextLabel(frame, "Status", UDim2.fromOffset(12, 124), UDim2.new(1, -24, 0, 20), "Status: Initializing", 13)
+    Runtime.Labels.Combo = createTextLabel(frame, "Combo", UDim2.fromOffset(12, 124), UDim2.new(1, -24, 0, 40), "Combo: Initializing", 13)
+    Runtime.Labels.Combo.TextWrapped = true
+    Runtime.Labels.Combo.TextTruncate = Enum.TextTruncate.AtEnd
+    Runtime.Labels.Combo.TextYAlignment = Enum.TextYAlignment.Top
+    Runtime.Labels.Status = createTextLabel(frame, "Status", UDim2.fromOffset(12, 168), UDim2.new(1, -24, 0, 20), "Status: Initializing", 13)
     Runtime.Labels.Status.TextColor3 = Color3.fromRGB(130, 200, 255)
 
     Runtime.GUI = screenGui
@@ -4218,6 +4223,47 @@ function CombatActions.GetComboConfig()
     return type(combo) == "table" and combo.Enabled == true and combo or nil
 end
 
+function CombatActions.UpdateComboGUI(combo, state)
+    local label = Runtime.Labels and Runtime.Labels.Combo
+
+    if not label or not label.Parent then
+        return
+    end
+
+    local name = "Default skills"
+
+    if combo then
+        if type(combo.Name) == "string" and combo.Name:match("%S") then
+            name = combo.Name
+        else
+            name = "Custom combo"
+            local config = CombatActions.GetComboConfig()
+            local profiles = config and config.Profiles
+
+            if type(profiles) == "table" then
+                for index, profile in ipairs(profiles) do
+                    if profile == combo then
+                        name = "Custom combo #" .. tostring(index)
+                        break
+                    end
+                end
+            end
+        end
+
+        if state == "Blocked" then
+            name = name .. " (blocked)"
+        end
+    elseif state then
+        name = state
+    end
+
+    local text = "Combo: " .. name
+
+    if label.Text ~= text then
+        label.Text = text
+    end
+end
+
 function CombatActions.NormalizeToolName(value)
     if type(value) ~= "string" then
         return nil
@@ -4901,6 +4947,8 @@ local function startWeaponWorker()
             if not attackable then
                 -- Keep the next step across a brief hitbox/safe-mode interruption.
                 -- Target/character epoch changes reset the pass when attacks resume.
+                CombatActions.UpdateComboGUI(nil, not Runtime.AttackEnabled and "Disabled"
+                    or (Runtime.CurrentTarget and "Paused" or "Idle"))
                 Runtime.AttackBusy = false
                 Runtime.AimActive = false
                 Runtime.GunAimActive = false
@@ -4908,6 +4956,7 @@ local function startWeaponWorker()
                 releaseAllKeys()
                 task.wait(0.05)
             elseif attackMode == "GunApproach" then
+                CombatActions.UpdateComboGUI(nil, "Gun opener")
                 if os.clock() < nextGunPreparationAt then
                     task.wait(0.03)
                 else
@@ -4989,6 +5038,8 @@ local function startWeaponWorker()
                 end
 
                 local customBlocked = passCombo ~= nil and #comboEntries == 0
+                CombatActions.UpdateComboGUI(passCombo, customBlocked and "Blocked"
+                    or (followupCombo and "Default skills (follow-up)" or nil))
                 local entry, entryIndex = CombatActions.SelectSkill(comboEntries, skillCursor)
                 local castCompleted = false
 
@@ -5025,6 +5076,8 @@ local function startWeaponWorker()
                                 )
                             end
 
+                            CombatActions.UpdateComboGUI(entry.ComboConfig,
+                                followupCombo and "Default skills (follow-up)" or nil)
                             CombatActions.MarkAttempt(entry)
                             castCompleted = castSkill(entry.Key, entry.Config, targetEpoch, attackMode, entry.HoldOverride)
 
@@ -5042,8 +5095,10 @@ local function startWeaponWorker()
 
                     if completedCombo and completedCombo == CombatActions.GetActiveComboConfig() then
                         followupCombo = completedCombo
+                        CombatActions.UpdateComboGUI(nil, "Default skills (follow-up)")
                     elseif followupCombo then
                         followupCombo = nil
+                        CombatActions.UpdateComboGUI(customCombo)
                     end
 
                     -- Alternate complete passes; do not restart a default pass after each key.
