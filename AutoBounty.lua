@@ -68,9 +68,13 @@
 -- Optional shortcuts are checked once per acquisition; failed shortcuts fall back to direct chasing.
 -- Empty-target hops attempt an entrance first (5s timeout), then wait for known InCombat=false.
 -- AutoHop uses current-PlaceId public servers, fullest first, excluding full/current/attempted JobIds.
+-- Joining uses ReplicatedStorage.__ServerBrowser:InvokeServer("teleport", JobId).
 -- There is no minimum player count. Retry another unused JobId every 5 seconds while still here.
 -- Attempted JobIds and transport locks survive same-server reloads; no external hop script is loaded.
 -- Pending HTTP/teleport calls must return before another call of the same type can start.
+-- Startup order: confirm team, apply FPS boost once, wait 1 second, then continue readiness/workers.
+-- After 300 seconds in this script's server session, queue a hop when local InCombat is known false.
+-- This timeout respects AutoHop/recovery gates and survives same-server reloads.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -305,6 +309,8 @@ local INTERNAL = {
     ServerRetryDelay = 5,
     PublicServerPageDelay = 1,
     PublicServerRequestTimeout = 15,
+    FPSBoostWait = 1,
+    ServerTimeout = 300,
 }
 
 local function isFiniteVector3(value)
@@ -439,7 +445,68 @@ assert(
     "[AutoBounty] The requested team was not confirmed within 15 seconds"
 )
 
-print("[AutoBounty] Team confirmed; waiting for DataLoaded marker and Data.Level")
+-- Finish the one-time visual pass before any normal runtime workers start.
+do
+    print("[AutoBounty][FPSBoost] Team confirmed; applying FPS boost")
+    local qualityOK, qualityError = pcall(function()
+        settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+    end)
+    if not qualityOK then
+        warn("[AutoBounty][FPSBoost] Could not set rendering quality: " .. tostring(qualityError))
+    end
+
+    local decalsyeeted = true
+    local changed, skipped = 0, 0
+    for index, instance in ipairs(game:GetDescendants()) do
+        if not bootstrapStillCurrent() then
+            return
+        end
+
+        local ok, applied = pcall(function()
+            if instance:IsA("BasePart") and not instance:IsA("Terrain") then
+                instance.Material = Enum.Material.Plastic
+                instance.Reflectance = 0
+            elseif (instance:IsA("Decal") or instance:IsA("Texture")) and decalsyeeted then
+                instance.Transparency = 1
+            elseif instance:IsA("ParticleEmitter") then
+                instance.Lifetime = NumberRange.new(0)
+            elseif instance:IsA("Trail") then
+                instance.Lifetime = 0
+            elseif instance:IsA("Explosion") then
+                instance.BlastPressure = 1
+                instance.BlastRadius = 1
+            elseif instance:IsA("Fire") or instance:IsA("SpotLight") or instance:IsA("Smoke") then
+                instance.Enabled = false
+            else
+                return false
+            end
+            return true
+        end)
+
+        if not ok then
+            skipped = skipped + 1
+        elseif applied then
+            changed = changed + 1
+        end
+
+        if index % 250 == 0 then
+            task.wait()
+        end
+    end
+
+    if not bootstrapStillCurrent() then
+        return
+    end
+    print(string.format("[AutoBounty][FPSBoost] Applied to %d objects; skipped %d; waiting %.1fs",
+        changed, skipped, INTERNAL.FPSBoostWait))
+    task.wait(INTERNAL.FPSBoostWait)
+    if not bootstrapStillCurrent() then
+        return
+    end
+    print("[AutoBounty][FPSBoost] Complete; continuing startup")
+end
+
+print("[AutoBounty] Waiting for DataLoaded marker and Data.Level")
 
 local DataLoadedDeadline = os.clock() + 60
 local DataLoaded
@@ -6211,6 +6278,56 @@ local function startESPWorker()
     end)
 end
 
+local ServerTimeout = {Pending = false}
+
+function ServerTimeout.Initialize()
+    local state = Environment.__AutoBountyServerTimeoutState
+    if type(state) ~= "table"
+        or state.PlaceId ~= game.PlaceId
+        or state.SourceJobId ~= game.JobId
+        or not isFiniteNumber(state.StartedAt)
+        or state.StartedAt > os.clock() then
+
+        state = {PlaceId = game.PlaceId, SourceJobId = game.JobId, StartedAt = os.clock()}
+        Environment.__AutoBountyServerTimeoutState = state
+    end
+    ServerTimeout.State = state
+    ServerTimeout.Deadline = state.StartedAt + INTERNAL.ServerTimeout
+end
+
+function ServerTimeout.IsDue()
+    local state = ServerTimeout.State
+    return state ~= nil
+        and state.PlaceId == game.PlaceId
+        and state.SourceJobId == game.JobId
+        and os.clock() >= ServerTimeout.Deadline
+end
+
+function ServerTimeout.StartWorker()
+    task.spawn(function()
+        while Runtime.Running and bootstrapStillCurrent()
+            and Environment.__AutoBountyRuntime == Runtime do
+
+            if AutoHopEnabled and ServerTimeout.IsDue()
+                and not Runtime.HopPending
+                and not Runtime.SafeMode
+                and not Runtime.LocalDead
+                and not Runtime.WinEntranceAttempt then
+
+                local inCombat, inCombatKnown = readLocalInCombat()
+                if inCombatKnown and inCombat == false then
+                    ServerTimeout.Pending = true
+                    print("[AutoBounty][ServerHop] 5-minute server timeout; InCombat=false")
+                    if not requestHop("server-timeout", "5-minute server timeout") then
+                        ServerTimeout.Pending = false
+                    end
+                end
+            end
+            task.wait(0.25)
+        end
+    end)
+end
+
 determineHopReason = function()
     if not AutoHopEnabled then
         return nil
@@ -6227,6 +6344,10 @@ determineHopReason = function()
         return "saved-account", savedAccount.Name .. " (" .. tostring(savedAccount.UserId) .. ")"
     end
 
+    if ServerTimeout.Pending and ServerTimeout.IsDue() then
+        return "server-timeout", "5-minute server timeout"
+    end
+
     if Runtime.FollowTimeoutHopDetail then
         return "follow-timeout", Runtime.FollowTimeoutHopDetail
     end
@@ -6241,6 +6362,7 @@ end
 local HOP_PRIORITY = {
     empty = 1,
     ["follow-timeout"] = 1,
+    ["server-timeout"] = 1,
     ["saved-account"] = 2,
     friend = 3,
 }
@@ -6255,6 +6377,7 @@ local PublicHop = {
 }
 
 local function stopHopPending(message)
+    ServerTimeout.Pending = false
     PublicHop.CancelSearch()
     if Runtime.HopAttempt then
         Runtime.HopAttempt.Cancelled = true
@@ -6574,10 +6697,25 @@ function PublicHop.AcceptPage(search)
     return true
 end
 
+function PublicHop.GetBrowser()
+    local browser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
+    if browser and browser:IsA("RemoteFunction") then
+        return browser
+    end
+
+    PublicHop.State.NextAttemptAt = os.clock() + INTERNAL.ServerRetryDelay
+    setStatus("Waiting for __ServerBrowser; checking again in 5 seconds")
+    warnOnce("server-hop:browser-missing", "[AutoBounty][ServerHop] __ServerBrowser RemoteFunction is unavailable; waiting to retry.")
+    return nil
+end
+
 function PublicHop.Dispatch(server, context)
     local state = PublicHop.State
     if state.TeleportCall or state.UsedJobs[server.JobId]
         or os.clock() < state.NextAttemptAt or not PublicHop.Validate(context) then
+        return false
+    end
+    if not PublicHop.GetBrowser() then
         return false
     end
 
@@ -6597,19 +6735,31 @@ function PublicHop.Dispatch(server, context)
             return
         end
 
+        -- Resolve again after task scheduling so a replaced remote is not retained.
+        local browser = PublicHop.GetBrowser()
+        if not browser then
+            attempt.Cancelled = true
+            attempt.Returned = true
+            if state.TeleportCall == attempt then
+                state.TeleportCall = nil
+            end
+            table.insert(PublicHop.Servers, 1, server)
+            return
+        end
+
         -- Consume the JobId only when the request is actually dispatched.
         attempt.StartedAt = os.clock()
         state.UsedJobs[attempt.JobId] = true
         state.NextAttemptAt = attempt.StartedAt + INTERNAL.ServerRetryDelay
         Runtime.Teleporting = true
         Runtime.Mode = "HOPPING"
-        print(string.format("[AutoBounty][ServerHop] Trying | PlaceId=%s | JobId=%s | Players=%d/%d",
+        print(string.format("[AutoBounty][ServerHop] Trying via __ServerBrowser | PlaceId=%s | JobId=%s | Players=%d/%d",
             tostring(PublicHop.PlaceId), attempt.JobId, server.Playing, server.MaxPlayers))
         setStatus(string.format("Joining server (%d/%d); retry in 5 seconds if still here",
             server.Playing, server.MaxPlayers))
 
         local ok, err = pcall(function()
-            TeleportService:TeleportToPlaceInstance(PublicHop.PlaceId, attempt.JobId, LocalPlayer)
+            return browser:InvokeServer("teleport", attempt.JobId)
         end)
         attempt.Returned = true
         if state.TeleportCall == attempt then
@@ -6678,7 +6828,9 @@ function PublicHop.Tick(context)
     while #PublicHop.Servers > 0 do
         local server = table.remove(PublicHop.Servers, 1)
         if not state.UsedJobs[server.JobId] then
-            PublicHop.Dispatch(server, context)
+            if not PublicHop.Dispatch(server, context) and PublicHop.ContextMatches(context) then
+                table.insert(PublicHop.Servers, 1, server)
+            end
             return
         end
     end
@@ -6979,6 +7131,7 @@ function Runtime:Stop(reason)
 
     self.Running = false
 
+    ServerTimeout.Pending = false
     PublicHop.CancelSearch()
     if self.HopAttempt then
         self.HopAttempt.Cancelled = true
@@ -7063,6 +7216,7 @@ end
 
 createGUI()
 PublicHop.Initialize()
+ServerTimeout.Initialize()
 SavedBounty.StartWorker()
 startBountyValueBinder()
 WinEntrance.StartWorker()
@@ -7100,5 +7254,7 @@ end)
 if LocalPlayer.Character then
     bindCharacter(LocalPlayer.Character)
 end
+
+ServerTimeout.StartWorker()
 
 return Runtime
