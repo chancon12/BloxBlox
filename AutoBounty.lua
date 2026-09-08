@@ -37,6 +37,10 @@
 -- ComboRetryDelay defaults to 1 second when cooldown activation cannot be confirmed.
 -- Config.Combo = {Enabled=true, RequiredWeapons={"Godhuman", "Cursed Dual Katana"},
 --     Steps={{Weapon="Godhuman", Key="Z", Hold=0.1}, {Weapon="Cursed Dual Katana", Key="X", Hold=0.3}}}.
+-- Multiple combos: Config.Combo = {Enabled=true, Profiles={comboOne, comboTwo, ...}}.
+-- Profiles takes priority over single-combo fields; array order sets priority (first matching wins).
+-- Profiles may have Name and Enabled; Enabled=false skips one. No matching profile uses default skills.
+-- Only weapon ownership selects profiles; cooldowns do not select a lower-priority profile.
 -- RequiredWeapons checks owned Tool names in Character/Backpack; all must be present. Case/spaces/punctuation are ignored.
 -- Steps run in array order, skipping disabled/cooling skills. Missing required Tools select the default combo.
 -- Each custom pass is followed by one default Weapon.Order pass, then the custom sequence is tried again.
@@ -4271,12 +4275,44 @@ end
 function CombatActions.GetActiveComboConfig()
     local combo = CombatActions.GetComboConfig()
 
-    if combo then
-        local ready, _, reason = CombatActions.ComboRequirementsMet(combo)
+    if not combo then
+        return nil
+    end
 
-        if not ready and reason == "missing-tools" then
+    -- Profiles are ordered: the first enabled profile with all required Tools wins.
+    -- Return its original table so the worker can detect a change during equip.
+    if combo.Profiles ~= nil then
+        if type(combo.Profiles) ~= "table" then
+            warnOnce("combo:profiles:type", "Combo.Profiles must be an ordered list of combo tables")
             return nil
         end
+
+        for index, profile in ipairs(combo.Profiles) do
+            if type(profile) ~= "table" then
+                warnOnce("combo:profile:type:" .. tostring(index),
+                    "Combo profile " .. tostring(index) .. " must be a table; skipping")
+            elseif profile.Enabled ~= false then
+                local ready, reason, requirementState = CombatActions.ComboRequirementsMet(profile)
+
+                if ready then
+                    return profile
+                end
+
+                if requirementState ~= "missing-tools" then
+                    warnOnce("combo:profile:requirements:" .. tostring(index) .. ":" .. tostring(reason),
+                        "Combo profile " .. tostring(profile.Name or index) .. " skipped: " .. tostring(reason))
+                end
+            end
+        end
+
+        return nil
+    end
+
+    -- Keep the existing single-combo configuration and validation behavior.
+    local ready, _, reason = CombatActions.ComboRequirementsMet(combo)
+
+    if not ready and reason == "missing-tools" then
+        return nil
     end
 
     return combo
@@ -4384,7 +4420,7 @@ function CombatActions.GetCustomSkills(combo)
 end
 
 function CombatActions.CustomEntryValid(entry)
-    local combo = CombatActions.GetComboConfig()
+    local combo = CombatActions.GetActiveComboConfig()
     local step = entry.ComboStep
 
     if not combo or combo ~= entry.ComboConfig
