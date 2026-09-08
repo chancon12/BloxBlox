@@ -55,6 +55,26 @@ Combo = {
             },
         },
 
+        {
+            Name = "Soul Guitar + Magma + Cursed Dual Katana + Godhuman",
+            Enabled = true,
+            RequiredWeapons = {
+                "Soul Guitar",
+                "Magma-Magma",
+                "Cursed Dual Katana",
+                "Godhuman",
+            },
+            Steps = {
+                {Weapon = "Soul Guitar", Key = "X", Hold = 0.1},
+                {Weapon = "Magma-Magma", Key = "V", Hold = 0.1},
+                {Weapon = "Magma-Magma", Key = "C", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.3},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+            },
+        },
     },
 },
 
