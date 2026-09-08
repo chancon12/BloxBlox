@@ -9,9 +9,12 @@
 -- Filters visible Tool names and equipped/unequipped weapon model WeaponName attributes.
 -- Low-health recovery keeps the selected target and freezes its no-damage countdown.
 -- Selected targets entering safe zones are released only when local InCombat is known false.
--- SavedAccountHop defaults to true: save this account as AutoBountyAccounts/<UserId>.txt.
--- At startup, hop if another current player has a saved ID file in the same runner workspace.
--- Requires host isfolder/makefolder/isfile/writefile functions; AutoHop still controls hopping.
+-- AutoBountyAccounts/<UserId>.txt stores UserId and cumulative positive Bounty/Honor gains.
+-- ID-only files migrate with Gained=0; existing totals survive reloads and server hops.
+-- Initial/rebound stats and losses add nothing. GUI Total gained uses saved total plus pending gains.
+-- Saved gains need host isfolder/makefolder/isfile/writefile/readfile functions.
+-- SavedAccountHop defaults to true: at startup, hop if another player has a saved ID file.
+-- SavedAccountHop=false disables that scan; gain tracking continues. AutoHop still controls hopping.
 -- WinEntrance defaults to true: a positive Bounty/Honor change queues the nearest local entrance.
 -- Initial/rebound stats establish a baseline; gains during one pending exit are combined.
 -- Attacks/chasing/hop execution resume after arrival or a bounded 5-second entrance attempt.
@@ -654,13 +657,213 @@ local SavedAccountCheck = {
     Ready = false,
 }
 
+local SavedBounty = {Record = nil}
+
+function SavedBounty.Decode(contents, ownId)
+    if type(contents) ~= "string" then
+        return nil, "Account file did not contain text"
+    end
+
+    local trimmed = contents:match("^%s*(.-)%s*$")
+
+    -- Older versions stored only the ID. It is not a bounty gain amount.
+    if trimmed == ownId then
+        return 0, true
+    end
+
+    local storedId, amount = trimmed:match("^UserId=(%d+)\r?\nGained=([^\r\n]+)$")
+    local total = tonumber(amount)
+
+    if storedId ~= ownId or not isFiniteNumber(total) or total < 0 then
+        return nil, "Account file has invalid UserId/Gained data; existing contents were preserved"
+    end
+
+    return total, false
+end
+
+function SavedBounty.Encode(ownId, total)
+    return "UserId=" .. ownId .. "\nGained=" .. string.format("%.17g", total) .. "\n"
+end
+
+function SavedBounty.Attach(ownId, folderExists, createFolder, fileExists, saveFile, readFile)
+    local folder = SavedAccountCheck.Folder
+    local path = folder .. "/" .. ownId .. ".txt"
+    local records = Environment.__AutoBountyGainRecords
+
+    if type(records) ~= "table" then
+        records = {}
+        Environment.__AutoBountyGainRecords = records
+    end
+
+    local record = records[path]
+    if type(record) ~= "table" or record.Format ~= 1 then
+        record = {Format = 1, OwnId = ownId, Path = path, Ready = false,
+            Busy = false, SavedTotal = 0, Pending = 0, NextRetryAt = 0}
+        records[path] = record
+    end
+
+    -- Shared across reloads: a yielding old write must finish before a new write.
+    -- Pending gains also survive a reload in the same runner environment.
+    SavedBounty.Record = record
+    SavedBounty.RetryAttach = nil
+    record.WriteFile = saveFile
+
+    if record.Ready then
+        SavedBounty.UpdateGUI()
+        return
+    end
+
+    local deadline = os.clock() + 5
+    while record.Busy and SavedAccountCheck.StillCurrent() and os.clock() < deadline do
+        task.wait(0.05)
+    end
+
+    if not SavedAccountCheck.StillCurrent() then
+        return
+    end
+    if record.Busy then
+        SavedBounty.RetryAttach = function()
+            SavedBounty.Attach(ownId, folderExists, createFolder, fileExists, saveFile, readFile)
+        end
+        warnOnce("saved-gain:busy", "Saved gain file is still busy; its active write was left intact.")
+        return
+    end
+    if record.Ready then
+        SavedBounty.UpdateGUI()
+        return
+    end
+
+    record.Busy = true
+    local initialized, initializeError = pcall(function()
+        local exists = folderExists(folder)
+        if not SavedAccountCheck.StillCurrent() then return end
+
+        if exists ~= true then
+            local created, createError = pcall(createFolder, folder)
+            if not SavedAccountCheck.StillCurrent() then return end
+            local nowExists = folderExists(folder)
+            if not SavedAccountCheck.StillCurrent() then return end
+            if nowExists ~= true then
+                error(created and "Account folder was not created" or tostring(createError))
+            end
+        end
+
+        local existsFile = fileExists(path)
+        if not SavedAccountCheck.StillCurrent() then return end
+        if existsFile ~= true then
+            local written = saveFile(path, SavedBounty.Encode(ownId, 0))
+            if written == false then error("Account file write failed") end
+            if not SavedAccountCheck.StillCurrent() then return end
+            local nowExists = fileExists(path)
+            if not SavedAccountCheck.StillCurrent() then return end
+            if nowExists ~= true then error("Local account file was not created") end
+        end
+        record.Registered = true
+
+        if type(readFile) ~= "function" then
+            error("Saved gain tracking needs readfile; existing account contents were preserved")
+        end
+
+        local contents = readFile(path)
+        if not SavedAccountCheck.StillCurrent() then return end
+        local total, legacy = SavedBounty.Decode(contents, ownId)
+        if total == nil then error(legacy) end
+
+        if legacy then
+            local written = saveFile(path, SavedBounty.Encode(ownId, total))
+            if written == false then error("Account file migration failed") end
+        end
+
+        record.SavedTotal = total
+        record.Ready = true
+        record.Error = nil
+    end)
+    record.Busy = false
+
+    if not initialized then
+        record.Error = tostring(initializeError)
+        warnOnce("saved-gain:load", "Could not load saved bounty/honor gains: " .. record.Error)
+    end
+    SavedBounty.UpdateGUI()
+end
+
+function SavedBounty.Flush()
+    local record = SavedBounty.Record
+    if not SavedAccountCheck.StillCurrent() or not record or not record.Ready
+        or record.Busy or record.Pending <= 0 or os.clock() < record.NextRetryAt then
+
+        return
+    end
+
+    record.Busy = true
+    while SavedAccountCheck.StillCurrent() and record.Pending > 0 do
+        local amount = record.Pending
+        local total = record.SavedTotal + amount
+        local saved, saveError = pcall(record.WriteFile, record.Path, SavedBounty.Encode(record.OwnId, total))
+
+        if not saved or saveError == false then
+            record.Error = saved and "Account file write returned false" or tostring(saveError)
+            record.NextRetryAt = os.clock() + 1
+            warnOnce("saved-gain:write", "Could not save bounty/honor gains; pending gains will retry: " .. record.Error)
+            break
+        end
+
+        -- Finish bookkeeping even if a reload occurred during writefile. The new
+        -- runtime shares this record and must not add the same pending gain twice.
+        record.SavedTotal = total
+        record.Pending = math.max(0, record.Pending - amount)
+        record.Error = nil
+        record.NextRetryAt = 0
+    end
+    record.Busy = false
+    SavedBounty.UpdateGUI()
+end
+
+function SavedBounty.AddGain(amount)
+    local record = SavedBounty.Record
+    if not SavedAccountCheck.StillCurrent() or not record
+        or not isFiniteNumber(amount) or amount <= 0 then
+
+        return
+    end
+
+    if not isFiniteNumber(record.SavedTotal + record.Pending + amount) then
+        warnOnce("saved-gain:overflow", "Bounty/honor gain total was too large to save")
+        return
+    end
+
+    -- Keep observed gains even while the saved baseline is unavailable. A later
+    -- successful attach can add them once without guessing the existing total.
+    record.Pending = record.Pending + amount
+    SavedBounty.UpdateGUI()
+    if not record.Busy and os.clock() >= record.NextRetryAt then
+        task.spawn(SavedBounty.Flush)
+    end
+end
+
+function SavedBounty.StartWorker()
+    task.spawn(function()
+        while SavedAccountCheck.StillCurrent() do
+            local record = SavedBounty.Record
+            if SavedBounty.RetryAttach and record and not record.Busy then
+                local retry = SavedBounty.RetryAttach
+                SavedBounty.RetryAttach = nil
+                retry()
+            end
+            SavedBounty.Flush()
+            SavedBounty.UpdateGUI()
+            task.wait(1)
+        end
+    end)
+end
+
 function SavedAccountCheck.StillCurrent()
     return Runtime.Running and bootstrapStillCurrent()
         and Environment.__AutoBountyRuntime == Runtime
 end
 
 function SavedAccountCheck.Initialize()
-    if not SavedAccountCheck.Enabled or not SavedAccountCheck.StillCurrent() then
+    if not SavedAccountCheck.StillCurrent() then
         return
     end
 
@@ -668,11 +871,12 @@ function SavedAccountCheck.Initialize()
     local createFolder = type(makefolder) == "function" and makefolder or Environment.makefolder
     local fileExists = type(isfile) == "function" and isfile or Environment.isfile
     local saveFile = type(writefile) == "function" and writefile or Environment.writefile
+    local readFile = type(readfile) == "function" and readfile or Environment.readfile
 
     if type(folderExists) ~= "function" or type(createFolder) ~= "function"
         or type(fileExists) ~= "function" or type(saveFile) ~= "function" then
 
-        warnOnce("saved-account:filesystem", "SavedAccountHop needs isfolder, makefolder, isfile and writefile; startup account check skipped.")
+        warnOnce("saved-account:filesystem", "Account files need isfolder, makefolder, isfile and writefile; saved gains and startup account check skipped.")
         return
     end
 
@@ -692,46 +896,15 @@ function SavedAccountCheck.Initialize()
 
     local folder = SavedAccountCheck.Folder
     local ownPath = folder .. "/" .. ownId .. ".txt"
-    local saved, saveError = pcall(function()
-        local exists = folderExists(folder)
-        if not SavedAccountCheck.StillCurrent() then
-            return
-        end
+    SavedBounty.Attach(ownId, folderExists, createFolder, fileExists, saveFile, readFile)
 
-        if exists ~= true then
-            -- Another account may create this shared folder at the same time.
-            local created, createError = pcall(createFolder, folder)
-            if not SavedAccountCheck.StillCurrent() then
-                return
-            end
-            local nowExists = folderExists(folder)
-            if not SavedAccountCheck.StillCurrent() then
-                return
-            end
-            if nowExists ~= true then
-                error(created and "Account folder was not created" or tostring(createError))
-            end
-        end
-
-        -- The filename is the lookup key; contents are plain text, never executed.
-        saveFile(ownPath, ownId .. "\n")
-        if not SavedAccountCheck.StillCurrent() then
-            return
-        end
-        if fileExists(ownPath) ~= true then
-            error("Local account file was not created")
-        end
-    end)
-
-    if not SavedAccountCheck.StillCurrent() then
-        return
-    end
-    if not saved then
-        warnOnce("saved-account:save", "Could not save local account ID: " .. tostring(saveError) .. "; startup account check skipped.")
+    if not SavedAccountCheck.StillCurrent() or not SavedAccountCheck.Enabled then
         return
     end
 
-    print("[AutoBounty][SavedAccounts] Saved local UserId=" .. ownId .. " | File=" .. ownPath)
+    if SavedBounty.Record and SavedBounty.Record.Registered then
+        print("[AutoBounty][SavedAccounts] Local UserId=" .. ownId .. " | File=" .. ownPath)
+    end
     local matchedIds = {}
     local matchCount = 0
 
@@ -896,6 +1069,33 @@ local function formatNumber(value)
     return formatted
 end
 
+function SavedBounty.UpdateGUI()
+    local label = Runtime.Labels and Runtime.Labels.Gained
+    if not SavedAccountCheck.StillCurrent() or not label or not label.Parent then
+        return
+    end
+
+    local record = SavedBounty.Record
+    local text = "Total gained: Unavailable"
+    if record and record.Ready then
+        text = "Total gained: " .. formatNumber(record.SavedTotal + record.Pending)
+        if record.Pending > 0 then
+            text = text .. (record.Error and " (save pending)" or " (saving)")
+        end
+    elseif record then
+        if record.Busy or SavedBounty.RetryAttach then
+            text = "Total gained: Loading..."
+        end
+        if record.Pending > 0 then
+            text = text .. "\nPending gain: " .. formatNumber(record.Pending)
+        end
+    end
+
+    if label.Text ~= text then
+        label.Text = text
+    end
+end
+
 local function createTextLabel(parent, name, position, size, text, textSize)
     local label = Instance.new("TextLabel")
     label.Name = name
@@ -931,7 +1131,7 @@ local function createGUI()
     frame.Parent = screenGui
     frame.AnchorPoint = Vector2.new(1, 0)
     frame.Position = UDim2.new(1, -18, 0, 18)
-    frame.Size = UDim2.fromOffset(310, 194)
+    frame.Size = UDim2.fromOffset(310, 238)
     frame.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
     frame.BackgroundTransparency = 0.12
     frame.BorderSizePixel = 0
@@ -955,17 +1155,22 @@ local function createGUI()
         16
     )
     Runtime.Labels.Bounty = createTextLabel(frame, "Bounty", UDim2.fromOffset(12, 36), UDim2.new(1, -24, 0, 20), "Bounty/Honor: Loading...", 14)
-    Runtime.Labels.Team = createTextLabel(frame, "Team", UDim2.fromOffset(12, 58), UDim2.new(1, -24, 0, 20), "Team: " .. Config.Team, 14)
-    Runtime.Labels.Target = createTextLabel(frame, "Target", UDim2.fromOffset(12, 80), UDim2.new(1, -24, 0, 20), "Target: None", 14)
-    Runtime.Labels.Candidates = createTextLabel(frame, "Candidates", UDim2.fromOffset(12, 102), UDim2.new(1, -24, 0, 20), "Eligible players: 0", 14)
-    Runtime.Labels.Combo = createTextLabel(frame, "Combo", UDim2.fromOffset(12, 124), UDim2.new(1, -24, 0, 40), "Combo: Initializing", 13)
+    Runtime.Labels.Gained = createTextLabel(frame, "Gained", UDim2.fromOffset(12, 58), UDim2.new(1, -24, 0, 40), "Total gained: Loading...", 14)
+    Runtime.Labels.Gained.TextWrapped = true
+    Runtime.Labels.Gained.TextTruncate = Enum.TextTruncate.AtEnd
+    Runtime.Labels.Gained.TextYAlignment = Enum.TextYAlignment.Top
+    Runtime.Labels.Team = createTextLabel(frame, "Team", UDim2.fromOffset(12, 102), UDim2.new(1, -24, 0, 20), "Team: " .. Config.Team, 14)
+    Runtime.Labels.Target = createTextLabel(frame, "Target", UDim2.fromOffset(12, 124), UDim2.new(1, -24, 0, 20), "Target: None", 14)
+    Runtime.Labels.Candidates = createTextLabel(frame, "Candidates", UDim2.fromOffset(12, 146), UDim2.new(1, -24, 0, 20), "Eligible players: 0", 14)
+    Runtime.Labels.Combo = createTextLabel(frame, "Combo", UDim2.fromOffset(12, 168), UDim2.new(1, -24, 0, 40), "Combo: Initializing", 13)
     Runtime.Labels.Combo.TextWrapped = true
     Runtime.Labels.Combo.TextTruncate = Enum.TextTruncate.AtEnd
     Runtime.Labels.Combo.TextYAlignment = Enum.TextYAlignment.Top
-    Runtime.Labels.Status = createTextLabel(frame, "Status", UDim2.fromOffset(12, 168), UDim2.new(1, -24, 0, 20), "Status: Initializing", 13)
+    Runtime.Labels.Status = createTextLabel(frame, "Status", UDim2.fromOffset(12, 212), UDim2.new(1, -24, 0, 20), "Status: Initializing", 13)
     Runtime.Labels.Status.TextColor3 = Color3.fromRGB(130, 200, 255)
 
     Runtime.GUI = screenGui
+    SavedBounty.UpdateGUI()
 end
 
 local function setStatus(status)
@@ -1042,6 +1247,7 @@ local function startBountyValueBinder()
                         local before = previousValue
                         previousValue = value
                         if before and value > before then
+                            SavedBounty.AddGain(value - before)
                             WinEntrance.OnIncrease(before, value)
                         end
                     end
@@ -6907,6 +7113,7 @@ if not SavedAccountCheck.StillCurrent() then
 end
 
 createGUI()
+SavedBounty.StartWorker()
 startBountyValueBinder()
 WinEntrance.StartWorker()
 startSafeZoneBinder()
