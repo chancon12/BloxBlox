@@ -111,7 +111,7 @@ Combo = {
             },
             Steps = {
                 {Weapon = "Soul Guitar", Key = "X", Hold = 0.1},
-                {Weapon = "Dough-Dough", Key = "V", Hold = 0.1},
+                {Weapon = "Dough-Dough", Key = "V", Hold = 2},
                 {Weapon = "Dough-Dough", Key = "X", Hold = 0.1},
                 {Weapon = "Shark Anchor", Key = "Z", Hold = 0.1},
                 {Weapon = "Shark Anchor", Key = "X", Hold = 0.1},
