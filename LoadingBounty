@@ -41,7 +41,7 @@ Combo = {
     Enabled = true,
     Profiles = {
         {
-            Name = "Blizzard + Cursed Dual Katana",
+            Name = "Godhuman + Blizzard + Cursed Dual Katana",
             Enabled = true,
             RequiredWeapons = {"Blizzard-Blizzard", "Cursed Dual Katana", "Godhuman"},
             Steps = {
@@ -54,20 +54,7 @@ Combo = {
                 {Weapon = "Godhuman", Key = "X", Hold = 0.1},
             },
         },
-        {
-            Name = "Blizzard + Shark Anchor",
-            Enabled = true,
-            RequiredWeapons = {"Blizzard-Blizzard", "Shark Anchor", "Godhuman"},
-            Steps = {
-                {Weapon = "Blizzard-Blizzard", Key = "V", Hold = 0.1},
-                {Weapon = "Blizzard-Blizzard", Key = "C", Hold = 0.1},
-                {Weapon = "Shark Anchor", Key = "X", Hold = 0.1},
-                {Weapon = "Shark Anchor", Key = "Z", Hold = 0.5},
-                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
-                {Weapon = "Godhuman", Key = "C", Hold = 0.1},
-                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
-            },
-        },
+
     },
 },
 
