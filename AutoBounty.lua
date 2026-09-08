@@ -72,7 +72,8 @@
 -- There is no minimum player count. Retry another unused JobId every 5 seconds while still here.
 -- Attempted JobIds and transport locks survive same-server reloads; no external hop script is loaded.
 -- Pending HTTP/teleport calls must return before another call of the same type can start.
--- Startup order: confirm team, apply FPS boost once, wait 1 second, then continue readiness/workers.
+-- Startup order: confirm team, start FPS boost, then continue setup 5 seconds after the boost starts.
+-- A longer FPS pass continues in the background without extending the startup delay.
 -- After 300 seconds in this script's server session, queue a hop when local InCombat is known false.
 -- This timeout respects AutoHop/recovery gates and survives same-server reloads.
 
@@ -309,7 +310,7 @@ local INTERNAL = {
     ServerRetryDelay = 5,
     PublicServerPageDelay = 1,
     PublicServerRequestTimeout = 15,
-    FPSBoostWait = 1,
+    FPSBoostWait = 5,
     ServerTimeout = 300,
 }
 
@@ -445,65 +446,76 @@ assert(
     "[AutoBounty] The requested team was not confirmed within 15 seconds"
 )
 
--- Finish the one-time visual pass before any normal runtime workers start.
+-- The startup delay is measured from the start of the FPS boost, not its completion.
+local StartupFPSBoost = {Cancelled = false}
 do
+    local resumeAt = os.clock() + INTERNAL.FPSBoostWait
     print("[AutoBounty][FPSBoost] Team confirmed; applying FPS boost")
-    local qualityOK, qualityError = pcall(function()
-        settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
-    end)
-    if not qualityOK then
-        warn("[AutoBounty][FPSBoost] Could not set rendering quality: " .. tostring(qualityError))
-    end
-
-    local decalsyeeted = true
-    local changed, skipped = 0, 0
-    for index, instance in ipairs(game:GetDescendants()) do
-        if not bootstrapStillCurrent() then
+    task.spawn(function()
+        if StartupFPSBoost.Cancelled or not bootstrapStillCurrent() then
             return
         end
-
-        local ok, applied = pcall(function()
-            if instance:IsA("BasePart") and not instance:IsA("Terrain") then
-                instance.Material = Enum.Material.Plastic
-                instance.Reflectance = 0
-            elseif (instance:IsA("Decal") or instance:IsA("Texture")) and decalsyeeted then
-                instance.Transparency = 1
-            elseif instance:IsA("ParticleEmitter") then
-                instance.Lifetime = NumberRange.new(0)
-            elseif instance:IsA("Trail") then
-                instance.Lifetime = 0
-            elseif instance:IsA("Explosion") then
-                instance.BlastPressure = 1
-                instance.BlastRadius = 1
-            elseif instance:IsA("Fire") or instance:IsA("SpotLight") or instance:IsA("Smoke") then
-                instance.Enabled = false
-            else
-                return false
-            end
-            return true
+        local qualityOK, qualityError = pcall(function()
+            settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
         end)
-
-        if not ok then
-            skipped = skipped + 1
-        elseif applied then
-            changed = changed + 1
+        if not qualityOK then
+            warn("[AutoBounty][FPSBoost] Could not set rendering quality: " .. tostring(qualityError))
         end
 
-        if index % 250 == 0 then
-            task.wait()
+        local decalsyeeted = true
+        local changed, skipped = 0, 0
+        for index, instance in ipairs(game:GetDescendants()) do
+            if StartupFPSBoost.Cancelled or not bootstrapStillCurrent() then
+                return
+            end
+
+            local ok, applied = pcall(function()
+                if instance:IsA("BasePart") and not instance:IsA("Terrain") then
+                    instance.Material = Enum.Material.Plastic
+                    instance.Reflectance = 0
+                elseif (instance:IsA("Decal") or instance:IsA("Texture")) and decalsyeeted then
+                    instance.Transparency = 1
+                elseif instance:IsA("ParticleEmitter") then
+                    instance.Lifetime = NumberRange.new(0)
+                elseif instance:IsA("Trail") then
+                    instance.Lifetime = 0
+                elseif instance:IsA("Explosion") then
+                    instance.BlastPressure = 1
+                    instance.BlastRadius = 1
+                elseif instance:IsA("Fire") or instance:IsA("SpotLight") or instance:IsA("Smoke") then
+                    instance.Enabled = false
+                else
+                    return false
+                end
+                return true
+            end)
+
+            if not ok then
+                skipped = skipped + 1
+            elseif applied then
+                changed = changed + 1
+            end
+
+            if index % 250 == 0 then
+                task.wait()
+            end
         end
+
+        if StartupFPSBoost.Cancelled or not bootstrapStillCurrent() then
+            return
+        end
+        print(string.format("[AutoBounty][FPSBoost] Complete; applied to %d objects; skipped %d",
+            changed, skipped))
+    end)
+
+    local remaining = resumeAt - os.clock()
+    if remaining > 0 then
+        task.wait(remaining)
     end
-
     if not bootstrapStillCurrent() then
         return
     end
-    print(string.format("[AutoBounty][FPSBoost] Applied to %d objects; skipped %d; waiting %.1fs",
-        changed, skipped, INTERNAL.FPSBoostWait))
-    task.wait(INTERNAL.FPSBoostWait)
-    if not bootstrapStillCurrent() then
-        return
-    end
-    print("[AutoBounty][FPSBoost] Complete; continuing startup")
+    print("[AutoBounty][FPSBoost] Startup delay finished; continuing startup")
 end
 
 print("[AutoBounty] Waiting for DataLoaded marker and Data.Level")
@@ -7131,6 +7143,7 @@ function Runtime:Stop(reason)
 
     self.Running = false
 
+    StartupFPSBoost.Cancelled = true
     ServerTimeout.Pending = false
     PublicHop.CancelSearch()
     if self.HopAttempt then
