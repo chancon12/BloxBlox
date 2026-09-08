@@ -39,21 +39,35 @@ Environment.AutoBountyConfig = {
 
 Combo = {
     Enabled = true,
-
-    RequiredWeapons = {
-        "Ice-Ice",
-        "Cursed Dual Katana",
-        "Godhuman",
-    },
-
-    Steps = {
-        [1] = {Weapon = "Ice-Ice", Key = "V", Hold = 0.1},
-        [2] = {Weapon = "Ice-Ice", Key = "C", Hold = 0.1},
-        [3] = {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.5},
-        [4] = {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
-        [5] = {Weapon = "Godhuman", Key = "X", Hold = 0.1},
-        [6] = {Weapon = "Godhuman", Key = "C", Hold = 0.5},
-        [7] = {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+    Profiles = {
+        {
+            Name = "Blizzard + Cursed Dual Katana",
+            Enabled = true,
+            RequiredWeapons = {"Blizzard-Blizzard", "Cursed Dual Katana", "Godhuman"},
+            Steps = {
+                {Weapon = "Blizzard-Blizzard", Key = "V", Hold = 0.1},
+                {Weapon = "Blizzard-Blizzard", Key = "C", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+            },
+        },
+        {
+            Name = "Blizzard + Shark Anchor",
+            Enabled = true,
+            RequiredWeapons = {"Blizzard-Blizzard", "Shark Anchor", "Godhuman"},
+            Steps = {
+                {Weapon = "Blizzard-Blizzard", Key = "V", Hold = 0.1},
+                {Weapon = "Blizzard-Blizzard", Key = "C", Hold = 0.1},
+                {Weapon = "Shark Anchor", Key = "X", Hold = 0.1},
+                {Weapon = "Shark Anchor", Key = "Z", Hold = 0.5},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+            },
+        },
     },
 },
 
