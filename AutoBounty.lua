@@ -9,6 +9,12 @@
 -- Filters visible Tool names and equipped/unequipped weapon model WeaponName attributes.
 -- Low-health recovery keeps the selected target and freezes its no-damage countdown.
 -- Selected targets entering safe zones are released only when local InCombat is known false.
+-- SavedAccountHop defaults to true: save this account as AutoBountyAccounts/<UserId>.txt.
+-- At startup, hop if another current player has a saved ID file in the same runner workspace.
+-- Requires host isfolder/makefolder/isfile/writefile functions; AutoHop still controls hopping.
+-- WinEntrance defaults to true: a positive Bounty/Honor change queues the nearest local entrance.
+-- Initial/rebound stats establish a baseline; gains during one pending exit are combined.
+-- Attacks/chasing/hop execution resume after arrival or a bounded 5-second entrance attempt.
 -- Race flags belong in Config.Settings and require an explicit true.
 -- Race V3/V4 activation does not require InCombat or being inside a target hitbox.
 -- NoDamageTimeout allows time for a target health drop or confirmed local InCombat after hitbox entry.
@@ -281,6 +287,7 @@ local INTERNAL = {
     FastTPMinimumDistance = 300,
     FastTPArrivalTolerance = 100,
     EmptyHopEntranceTimeout = 5,
+    WinEntranceTimeout = 5,
     ServerRetryDelay = 3,
     ExternalHopURL = "https://raw.githubusercontent.com/WhiteX1208/Scripts/refs/heads/main/KaitunFindFruit.luau",
     ExternalHopDownloadTimeout = 15,
@@ -539,6 +546,7 @@ local Runtime = {
     CurrentTarget = nil,
     CurrentTargetInfo = nil,
     TargetRecoveryState = nil,
+    WinEntranceAttempt = nil,
     CurrentTool = nil,
     TargetEpoch = 0,
     CharacterEpoch = 0,
@@ -632,6 +640,135 @@ local function warnOnce(key, message)
 
     Warned[key] = true
     warn("[AutoBounty] " .. message)
+end
+
+local SavedAccountCheck = {
+    Enabled = Settings.SavedAccountHop ~= false,
+    Folder = "AutoBountyAccounts",
+    MatchedIds = {},
+    Ready = false,
+}
+
+function SavedAccountCheck.StillCurrent()
+    return Runtime.Running and bootstrapStillCurrent()
+        and Environment.__AutoBountyRuntime == Runtime
+end
+
+function SavedAccountCheck.Initialize()
+    if not SavedAccountCheck.Enabled or not SavedAccountCheck.StillCurrent() then
+        return
+    end
+
+    local folderExists = type(isfolder) == "function" and isfolder or Environment.isfolder
+    local createFolder = type(makefolder) == "function" and makefolder or Environment.makefolder
+    local fileExists = type(isfile) == "function" and isfile or Environment.isfile
+    local saveFile = type(writefile) == "function" and writefile or Environment.writefile
+
+    if type(folderExists) ~= "function" or type(createFolder) ~= "function"
+        or type(fileExists) ~= "function" or type(saveFile) ~= "function" then
+
+        warnOnce("saved-account:filesystem", "SavedAccountHop needs isfolder, makefolder, isfile and writefile; startup account check skipped.")
+        return
+    end
+
+    local function idText(player)
+        local userId = player and player.UserId
+        if isFiniteNumber(userId) and userId > 0 and userId % 1 == 0 then
+            return string.format("%.0f", userId)
+        end
+        return nil
+    end
+
+    local ownId = idText(LocalPlayer)
+    if not ownId then
+        warnOnce("saved-account:local-id", "SavedAccountHop could not read a valid local UserId; startup account check skipped.")
+        return
+    end
+
+    local folder = SavedAccountCheck.Folder
+    local ownPath = folder .. "/" .. ownId .. ".txt"
+    local saved, saveError = pcall(function()
+        local exists = folderExists(folder)
+        if not SavedAccountCheck.StillCurrent() then
+            return
+        end
+
+        if exists ~= true then
+            -- Another account may create this shared folder at the same time.
+            local created, createError = pcall(createFolder, folder)
+            if not SavedAccountCheck.StillCurrent() then
+                return
+            end
+            local nowExists = folderExists(folder)
+            if not SavedAccountCheck.StillCurrent() then
+                return
+            end
+            if nowExists ~= true then
+                error(created and "Account folder was not created" or tostring(createError))
+            end
+        end
+
+        -- The filename is the lookup key; contents are plain text, never executed.
+        saveFile(ownPath, ownId .. "\n")
+        if not SavedAccountCheck.StillCurrent() then
+            return
+        end
+        if fileExists(ownPath) ~= true then
+            error("Local account file was not created")
+        end
+    end)
+
+    if not SavedAccountCheck.StillCurrent() then
+        return
+    end
+    if not saved then
+        warnOnce("saved-account:save", "Could not save local account ID: " .. tostring(saveError) .. "; startup account check skipped.")
+        return
+    end
+
+    print("[AutoBounty][SavedAccounts] Saved local UserId=" .. ownId .. " | File=" .. ownPath)
+    local matchedIds = {}
+    local matchCount = 0
+
+    -- Snapshot only the other accounts present at startup; no filesystem polling.
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.UserId ~= LocalPlayer.UserId and player.Parent == Players then
+            local userId = idText(player)
+            if userId then
+                local checked, exists = pcall(fileExists, folder .. "/" .. userId .. ".txt")
+                if not SavedAccountCheck.StillCurrent() then
+                    return
+                end
+                if not checked then
+                    warnOnce("saved-account:scan", "Could not check saved account files: " .. tostring(exists))
+                elseif exists == true and player.Parent == Players then
+                    matchedIds[player.UserId] = true
+                    matchCount = matchCount + 1
+                end
+            end
+        end
+    end
+
+    SavedAccountCheck.MatchedIds = matchedIds
+    SavedAccountCheck.Ready = true
+    print("[AutoBounty][SavedAccounts] Startup scan | Other saved accounts=" .. tostring(matchCount))
+end
+
+function SavedAccountCheck.FindPresent()
+    if not SavedAccountCheck.Enabled or not SavedAccountCheck.Ready
+        or not SavedAccountCheck.StillCurrent() then
+
+        return nil
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.UserId ~= LocalPlayer.UserId
+            and player.Parent == Players and SavedAccountCheck.MatchedIds[player.UserId] then
+
+            return player
+        end
+    end
+    return nil
 end
 
 local function connect(signal, callback, characterScoped)
@@ -853,42 +990,63 @@ local function updateTargetGUI()
     end
 end
 
+local WinEntrance = {Enabled = Settings.WinEntrance ~= false}
+
 local function startBountyValueBinder()
     task.spawn(function()
         local activeStat
         local statConnection
 
         while Runtime.Running do
-            if not activeStat or not activeStat.Parent then
+            local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+            local bountyStat = leaderstats and leaderstats:FindFirstChild("Bounty/Honor")
+            if bountyStat and not bountyStat:IsA("ValueBase") then
+                bountyStat = nil
+            end
+
+            if activeStat ~= bountyStat then
                 if statConnection then
                     statConnection:Disconnect()
                     statConnection = nil
                     Runtime.BountyConnection = nil
                 end
+                activeStat = bountyStat
 
-                local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
-                local bountyStat = leaderstats and leaderstats:FindFirstChild("Bounty/Honor")
-
-                if bountyStat and bountyStat:IsA("ValueBase") then
-                    activeStat = bountyStat
-
+                if bountyStat then
+                    local previousValue
                     local function update()
+                        if not Runtime.Running or activeStat ~= bountyStat
+                            or LocalPlayer:FindFirstChild("leaderstats") ~= leaderstats
+                            or leaderstats:FindFirstChild("Bounty/Honor") ~= bountyStat then
+
+                            return
+                        end
+                        local value = tonumber(bountyStat.Value)
                         if Runtime.Labels.Bounty then
                             Runtime.Labels.Bounty.Text = "Bounty/Honor: " .. formatNumber(bountyStat.Value)
                         end
+                        if not isFiniteNumber(value) then
+                            previousValue = nil
+                            return
+                        end
+
+                        local before = previousValue
+                        previousValue = value
+                        if before and value > before then
+                            WinEntrance.OnIncrease(before, value)
+                        end
                     end
 
+                    -- A newly bound stat is a baseline, not a combat reward.
                     update()
                     statConnection = bountyStat:GetPropertyChangedSignal("Value"):Connect(update)
                     Runtime.BountyConnection = statConnection
-                else
-                    warnOnce(
-                        "leaderstats:bounty-honor",
-                        'Could not find LocalPlayer.leaderstats["Bounty/Honor"]; the GUI will keep retrying.'
-                    )
                 end
             end
 
+            if not bountyStat then
+                warnOnce("leaderstats:bounty-honor", 'Could not find LocalPlayer.leaderstats["Bounty/Honor"]; the GUI will keep retrying.')
+            end
             task.wait(1)
         end
 
@@ -2110,7 +2268,7 @@ local function invokeEntrance(position, purpose, targetEpoch, validityCheck, bef
         return false
     end
 
-    if purpose == "FastTP" then
+    if purpose == "FastTP" or purpose == "CombatWin" then
         local remaining = INTERNAL.FastTPCooldown - (os.clock() - Runtime.LastEntranceAt)
 
         while Runtime.Running and remaining > 0 do
@@ -2174,6 +2332,169 @@ local function nearestEntrance(targetPosition)
     end
 
     return selected, selectedDistance
+end
+
+function WinEntrance.IsCurrent(attempt)
+    return Runtime.Running and bootstrapStillCurrent()
+        and Environment.__AutoBountyRuntime == Runtime
+        and Runtime.WinEntranceAttempt == attempt
+        and not Runtime.LocalDead
+        and Runtime.CharacterEpoch == attempt.CharacterEpoch
+        and Runtime.Character == attempt.Character
+        and LocalPlayer.Character == attempt.Character
+        and attempt.Character ~= nil and attempt.Character.Parent ~= nil
+        and Runtime.Root == attempt.Root and attempt.Root ~= nil
+        and attempt.Root.Parent ~= nil and attempt.Root:IsDescendantOf(attempt.Character)
+        and isFiniteVector3(attempt.Root.Position)
+        and Runtime.Humanoid == attempt.Humanoid and attempt.Humanoid ~= nil
+        and attempt.Humanoid.Parent == attempt.Character and attempt.Humanoid.Health > 0
+end
+
+function WinEntrance.Finish(attempt, state, message)
+    attempt.Done = true
+    attempt.State = state
+    if Runtime.WinEntranceAttempt ~= attempt then
+        return
+    end
+    Runtime.WinEntranceAttempt = nil
+
+    if not Runtime.Running or Environment.__AutoBountyRuntime ~= Runtime then
+        return
+    end
+    print("[AutoBounty][WinEntrance] " .. message)
+    if Runtime.SafeMode then
+        Runtime.Mode = "SAFE_MODE"
+    elseif Runtime.LocalDead then
+        Runtime.Mode = "RESPAWN"
+    elseif Runtime.HopPending then
+        Runtime.Mode = "HOP_WAIT"
+        setStatus(message .. "; resuming server-hop checks")
+    else
+        Runtime.Mode = Runtime.TargetRecoveryState and "RECOVER_TARGET" or "SCAN"
+        setStatus(message .. "; continuing")
+    end
+end
+
+function WinEntrance.OnIncrease(before, after)
+    if not WinEntrance.Enabled or not Runtime.Running or not bootstrapStillCurrent()
+        or Environment.__AutoBountyRuntime ~= Runtime or Runtime.ExternalHopLaunched
+        or Runtime.LocalDead or not isFiniteNumber(before) or not isFiniteNumber(after)
+        or after <= before then
+
+        return
+    end
+
+    local pending = Runtime.WinEntranceAttempt
+    if pending and WinEntrance.IsCurrent(pending) then
+        pending.Gain = pending.Gain + (after - before)
+        pending.After = after
+        return
+    end
+
+    local attempt = {
+        CharacterEpoch = Runtime.CharacterEpoch,
+        Character = Runtime.Character,
+        Humanoid = Runtime.Humanoid,
+        Root = Runtime.Root,
+        Before = before,
+        After = after,
+        Gain = after - before,
+        Started = false,
+        Done = false,
+        State = "queued",
+    }
+    Runtime.WinEntranceAttempt = attempt
+    if not WinEntrance.IsCurrent(attempt) then
+        Runtime.WinEntranceAttempt = nil
+        return
+    end
+
+    -- The reward may arrive after target death has already cleared CurrentTarget.
+    -- Preserve any current selection without attributing the reward to that player.
+    suspendTargetForRecovery()
+    print(string.format("[AutoBounty][WinEntrance] Bounty/Honor increased by %s (%s -> %s); entrance queued",
+        tostring(attempt.Gain), tostring(before), tostring(after)))
+    if not Runtime.SafeMode then
+        Runtime.Mode = "WIN_ENTRANCE"
+        setStatus("Bounty/Honor increased; preparing nearest entrance")
+    end
+end
+
+function WinEntrance.Update()
+    local attempt = Runtime.WinEntranceAttempt
+    if not attempt then
+        return
+    end
+    if not WinEntrance.IsCurrent(attempt) then
+        WinEntrance.Finish(attempt, "cancelled", "Win entrance cancelled: character changed")
+        return
+    end
+
+    local recovering = Runtime.SafeMode
+        or attempt.Humanoid.Health <= (Runtime.EffectiveLowHealth or LowHealth)
+    if recovering then
+        if attempt.Deadline then
+            WinEntrance.Finish(attempt, "cancelled", "Win entrance interrupted by low-health recovery")
+        end
+        return
+    end
+
+    if not attempt.Deadline then
+        attempt.Entrance = nearestEntrance(attempt.Root.Position)
+        if not attempt.Entrance then
+            WinEntrance.Finish(attempt, "unavailable", "No entrance is configured for this place")
+            return
+        end
+        attempt.Deadline = os.clock() + INTERNAL.WinEntranceTimeout
+        attempt.State = "requesting"
+        Runtime.Mode = "WIN_ENTRANCE"
+        setStatus("Win detected; requesting nearest entrance")
+
+        task.spawn(function()
+            local success = invokeEntrance(attempt.Entrance, "CombatWin", nil, function()
+                return WinEntrance.IsCurrent(attempt) and not attempt.Done
+                    and not Runtime.SafeMode
+                    and attempt.Humanoid.Health > (Runtime.EffectiveLowHealth or LowHealth)
+                    and os.clock() < attempt.Deadline
+            end, function()
+                attempt.Started = true
+                print("[AutoBounty][WinEntrance] requestEntrance dispatched | Entrance=" .. tostring(attempt.Entrance))
+            end)
+
+            -- A timed-out, stopped or replaced attempt cannot affect the next one.
+            if WinEntrance.IsCurrent(attempt) and not attempt.Done then
+                attempt.Returned = true
+                attempt.Success = success
+            end
+        end)
+    end
+
+    -- task.spawn runs the request until its first yield; recheck its context.
+    if not WinEntrance.IsCurrent(attempt) or attempt.Done or Runtime.SafeMode
+        or attempt.Humanoid.Health <= (Runtime.EffectiveLowHealth or LowHealth) then
+
+        return
+    end
+
+    if attempt.Started
+        and (attempt.Root.Position - attempt.Entrance).Magnitude <= INTERNAL.FastTPArrivalTolerance then
+
+        WinEntrance.Finish(attempt, "arrived", "Win entrance reached")
+    elseif os.clock() >= attempt.Deadline then
+        WinEntrance.Finish(attempt, "timeout", attempt.Started
+            and "Win entrance arrival timed out" or "Win entrance request timed out while queued")
+    elseif attempt.Returned and not attempt.Success then
+        WinEntrance.Finish(attempt, "failed", "Win entrance request failed")
+    end
+end
+
+function WinEntrance.StartWorker()
+    task.spawn(function()
+        while Runtime.Running do
+            WinEntrance.Update()
+            task.wait(0.05)
+        end
+    end)
 end
 
 local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer, entrance, optionalShortcut)
@@ -2317,7 +2638,9 @@ local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer, entr
 end
 
 local function setTarget(player, targetInfo, resumeRecovery)
-    if not Runtime.Running or Runtime.SafeMode or Runtime.LocalDead or Runtime.HopPending then
+    if not Runtime.Running or Runtime.SafeMode or Runtime.LocalDead or Runtime.HopPending
+        or Runtime.WinEntranceAttempt then
+
         return false
     end
 
@@ -2531,6 +2854,7 @@ local function canAttack(targetEpoch, attackMode, readOnly)
         or Runtime.SafeMode
         or Runtime.LocalDead
         or Runtime.HopPending
+        or Runtime.WinEntranceAttempt
         or not Runtime.FriendAuditComplete then
 
         return false
@@ -3256,6 +3580,7 @@ local function updateEmptyCombatEntrance()
     local function contextStillValid()
         return Runtime.Running
             and Runtime.HopPending
+            and not Runtime.WinEntranceAttempt
             and not Runtime.SafeMode
             and not Runtime.LocalDead
             and not Runtime.ExternalHopLaunched
@@ -5148,7 +5473,7 @@ local function startMovementWorker()
             return
         end
 
-        if Runtime.HopPending or Runtime.TargetRecoveryState then
+        if Runtime.HopPending or Runtime.TargetRecoveryState or Runtime.WinEntranceAttempt then
             return
         end
 
@@ -5602,6 +5927,11 @@ determineHopReason = function()
         return "friend", friend.Name
     end
 
+    local savedAccount = SavedAccountCheck.FindPresent()
+    if savedAccount then
+        return "saved-account", savedAccount.Name .. " (" .. tostring(savedAccount.UserId) .. ")"
+    end
+
     if Runtime.FollowTimeoutHopDetail then
         return "follow-timeout", Runtime.FollowTimeoutHopDetail
     end
@@ -5616,6 +5946,7 @@ end
 local HOP_PRIORITY = {
     empty = 1,
     ["follow-timeout"] = 1,
+    ["saved-account"] = 2,
     friend = 3,
 }
 
@@ -5668,6 +5999,7 @@ local function validateExternalHopLaunch(launch)
         or os.clock() >= launch.DownloadDeadline
         or not Runtime.Running
         or not Runtime.HopPending
+        or Runtime.WinEntranceAttempt
         or Runtime.SafeMode
         or Runtime.LocalDead
         or Runtime.HopAttemptEpoch ~= launch.HopAttemptEpoch
@@ -5925,6 +6257,11 @@ local function runHopWorker()
 
     task.spawn(function()
         while Runtime.Running and Runtime.HopPending do
+            if Runtime.WinEntranceAttempt then
+                task.wait(0.05)
+                continue
+            end
+
             clearTarget()
 
             while Runtime.Running
@@ -5949,7 +6286,7 @@ local function runHopWorker()
             Runtime.Mode = "HOP_WAIT"
 
             while Runtime.Running and Runtime.HopPending do
-                if Runtime.SafeMode or Runtime.LocalDead then
+                if Runtime.SafeMode or Runtime.LocalDead or Runtime.WinEntranceAttempt then
                     break
                 end
 
@@ -5990,7 +6327,8 @@ local function runHopWorker()
             if not Runtime.Running
                 or not Runtime.HopPending
                 or Runtime.SafeMode
-                or Runtime.LocalDead then
+                or Runtime.LocalDead
+                or Runtime.WinEntranceAttempt then
 
                 task.wait(0.1)
                 continue
@@ -6078,6 +6416,12 @@ local function runHopWorker()
                 and Runtime.HopPending
                 and not launch.Executed
                 and not launch.Finished do
+
+                if Runtime.WinEntranceAttempt then
+                    launch.Cancelled = true
+                    setStatus("Win entrance queued before server hop")
+                    break
+                end
 
                 rebuildCandidates()
 
@@ -6196,7 +6540,9 @@ requestHop = function(reason, detail)
     Runtime.HopPending = true
     Runtime.HopReason = reason
     Runtime.HopDetail = detail
-    clearTarget()
+    if not Runtime.WinEntranceAttempt then
+        clearTarget()
+    end
 
     if Runtime.SafeMode then
         Runtime.Mode = "SAFE_MODE"
@@ -6204,6 +6550,9 @@ requestHop = function(reason, detail)
     elseif Runtime.LocalDead then
         Runtime.Mode = "RESPAWN"
         setStatus("Respawn pending; server hop queued")
+    elseif Runtime.WinEntranceAttempt then
+        Runtime.Mode = "WIN_ENTRANCE"
+        setStatus("Win entrance queued before server hop")
     else
         Runtime.Mode = "HOP_WAIT"
         setStatus("Server hop pending: " .. reason .. (detail and " (" .. detail .. ")" or ""))
@@ -6280,95 +6629,99 @@ end
 local function startTargetWorker()
     task.spawn(function()
         while Runtime.Running do
-            local candidates = rebuildCandidates()
+            if Runtime.WinEntranceAttempt then
+                task.wait(0.05)
+            else
+                local candidates = rebuildCandidates()
 
-            if Runtime.CurrentTarget then
-                local player = Runtime.CurrentTarget
-                local currentInfo = Runtime.CandidateInfo[player]
-                local ignoredWeapon = TargetWeaponFilter.FindIgnored(player)
+                if Runtime.CurrentTarget then
+                    local player = Runtime.CurrentTarget
+                    local currentInfo = Runtime.CandidateInfo[player]
+                    local ignoredWeapon = TargetWeaponFilter.FindIgnored(player)
 
-                if ignoredWeapon then
-                    releaseIgnoredTarget(ignoredWeapon)
-                elseif Runtime.SafeMode then
-                    -- Recovery movement can put the selected target out of range temporarily.
-                    -- Revalidate and resume that player after recovery, without blacklisting.
-                elseif Runtime.TargetRecoveryState then
-                    if not Runtime.LocalDead and not Runtime.HopPending
-                        and not Runtime.TargetRecoveryState.Preparing
-                        and Runtime.FriendAuditComplete then
+                    if ignoredWeapon then
+                        releaseIgnoredTarget(ignoredWeapon)
+                    elseif Runtime.SafeMode then
+                        -- Recovery movement can put the selected target out of range temporarily.
+                        -- Revalidate and resume that player after recovery, without blacklisting.
+                    elseif Runtime.TargetRecoveryState then
+                        if not Runtime.LocalDead and not Runtime.HopPending
+                            and not Runtime.TargetRecoveryState.Preparing
+                            and Runtime.FriendAuditComplete then
 
-                        if not currentInfo or not setTarget(player, currentInfo, true) then
-                            clearTarget("Recovered target no longer qualifies")
+                            if not currentInfo or not setTarget(player, currentInfo, true) then
+                                clearTarget("Recovered target no longer qualifies")
+                            end
+                        end
+                    elseif not Runtime.FriendAuditComplete then
+                        clearTarget("Waiting for initial friend checks")
+                    elseif currentInfo then
+                        local lockedInfo = Runtime.CurrentTargetInfo
+
+                        if (Runtime.Mode == "CHASE" or Runtime.Mode == "ENGAGE")
+                            and currentInfo.Route
+                            and currentInfo.Route.Kind ~= "direct" then
+
+                            clearTarget("Target moved outside MaxTargetDistance; checking other routes")
+                        elseif lockedInfo
+                            and (lockedInfo.Character ~= currentInfo.Character
+                                or lockedInfo.Humanoid ~= currentInfo.Humanoid
+                                or lockedInfo.Root ~= currentInfo.Root) then
+
+                            clearTarget("Target character changed; reacquiring")
+                        else
+                            Runtime.CurrentTargetInfo = currentInfo
+                        end
+                    else
+                        clearTarget("Current target no longer qualifies")
+                    end
+                end
+
+                local emptyInputsReady = Runtime.FriendAuditComplete
+                    and Runtime.SafeZonesFolder ~= nil
+                    and Runtime.SafeZonesFolder.Parent ~= nil
+                    and Runtime.SafeZonesReady
+                local listIsEmpty = #candidates == 0
+                    and Runtime.PendingCandidateCount == 0
+
+                if Runtime.CurrentTarget or not emptyInputsReady or not listIsEmpty then
+                    Runtime.EmptySince = nil
+                elseif not Runtime.LocalDead
+                    and not Runtime.SafeMode
+                    and not Runtime.EmptySince then
+
+                    Runtime.EmptySince = os.clock()
+                end
+
+                if not Runtime.LocalDead and not Runtime.SafeMode and not Runtime.HopPending then
+                    if not Runtime.FriendAuditComplete then
+                        setStatus("Checking players for friends")
+                    elseif not Runtime.SafeZonesFolder or not Runtime.SafeZonesReady then
+                        setStatus("Waiting for workspace._WorldOrigin.SafeZones")
+                    elseif Runtime.CurrentTarget then
+                        -- The selected target owns movement/status, including recovery preparation.
+                    elseif #candidates > 0 then
+                        if not Runtime.CurrentTarget then
+                            setTarget(candidates[1], Runtime.CandidateInfo[candidates[1]])
+                        end
+                    elseif Runtime.PendingCandidateCount > 0 then
+                        setStatus("Waiting for player data or respawn")
+                    elseif not AutoHopEnabled then
+                        setStatus("No eligible players; AutoHop disabled")
+                    else
+                        local elapsed = Runtime.EmptySince
+                            and (os.clock() - Runtime.EmptySince)
+                            or 0
+                        setStatus(string.format("No eligible players; hop check in %.1fs", math.max(INTERNAL.EmptyListGrace - elapsed, 0)))
+
+                        if isEmptyListHopReady() then
+                            requestHop("empty", "No eligible players")
                         end
                     end
-                elseif not Runtime.FriendAuditComplete then
-                    clearTarget("Waiting for initial friend checks")
-                elseif currentInfo then
-                    local lockedInfo = Runtime.CurrentTargetInfo
-
-                    if (Runtime.Mode == "CHASE" or Runtime.Mode == "ENGAGE")
-                        and currentInfo.Route
-                        and currentInfo.Route.Kind ~= "direct" then
-
-                        clearTarget("Target moved outside MaxTargetDistance; checking other routes")
-                    elseif lockedInfo
-                        and (lockedInfo.Character ~= currentInfo.Character
-                            or lockedInfo.Humanoid ~= currentInfo.Humanoid
-                            or lockedInfo.Root ~= currentInfo.Root) then
-
-                        clearTarget("Target character changed; reacquiring")
-                    else
-                        Runtime.CurrentTargetInfo = currentInfo
-                    end
-                else
-                    clearTarget("Current target no longer qualifies")
                 end
+
+                task.wait(INTERNAL.TargetRefreshInterval)
             end
-
-            local emptyInputsReady = Runtime.FriendAuditComplete
-                and Runtime.SafeZonesFolder ~= nil
-                and Runtime.SafeZonesFolder.Parent ~= nil
-                and Runtime.SafeZonesReady
-            local listIsEmpty = #candidates == 0
-                and Runtime.PendingCandidateCount == 0
-
-            if Runtime.CurrentTarget or not emptyInputsReady or not listIsEmpty then
-                Runtime.EmptySince = nil
-            elseif not Runtime.LocalDead
-                and not Runtime.SafeMode
-                and not Runtime.EmptySince then
-
-                Runtime.EmptySince = os.clock()
-            end
-
-            if not Runtime.LocalDead and not Runtime.SafeMode and not Runtime.HopPending then
-                if not Runtime.FriendAuditComplete then
-                    setStatus("Checking players for friends")
-                elseif not Runtime.SafeZonesFolder or not Runtime.SafeZonesReady then
-                    setStatus("Waiting for workspace._WorldOrigin.SafeZones")
-                elseif Runtime.CurrentTarget then
-                    -- The selected target owns movement/status, including recovery preparation.
-                elseif #candidates > 0 then
-                    if not Runtime.CurrentTarget then
-                        setTarget(candidates[1], Runtime.CandidateInfo[candidates[1]])
-                    end
-                elseif Runtime.PendingCandidateCount > 0 then
-                    setStatus("Waiting for player data or respawn")
-                elseif not AutoHopEnabled then
-                    setStatus("No eligible players; AutoHop disabled")
-                else
-                    local elapsed = Runtime.EmptySince
-                        and (os.clock() - Runtime.EmptySince)
-                        or 0
-                    setStatus(string.format("No eligible players; hop check in %.1fs", math.max(INTERNAL.EmptyListGrace - elapsed, 0)))
-
-                    if isEmptyListHopReady() then
-                        requestHop("empty", "No eligible players")
-                    end
-                end
-            end
-
-            task.wait(INTERNAL.TargetRefreshInterval)
         end
     end)
 end
@@ -6410,6 +6763,9 @@ function Runtime:Stop(reason)
     table.clear(self.RouteFailures)
     table.clear(self.IgnoredTargetWeapons)
     self.TargetRecoveryState = nil
+    self.WinEntranceAttempt = nil
+    table.clear(SavedAccountCheck.MatchedIds)
+    SavedAccountCheck.Ready = false
 
     if self.CameraBindName then
         pcall(function()
@@ -6454,10 +6810,28 @@ function Runtime:Stop(reason)
     end
 end
 
+SavedAccountCheck.Initialize()
+if not SavedAccountCheck.StillCurrent() then
+    return
+end
+
 createGUI()
 startBountyValueBinder()
+WinEntrance.StartWorker()
 startSafeZoneBinder()
 installAimHook()
+do
+    local savedAccount = SavedAccountCheck.FindPresent()
+    if savedAccount then
+        local detail = savedAccount.Name .. " (" .. tostring(savedAccount.UserId) .. ")"
+        if AutoHopEnabled then
+            print("[AutoBounty][SavedAccounts] Found " .. detail .. "; queuing server hop")
+            requestHop("saved-account", detail)
+        else
+            warnOnce("saved-account:hop-disabled", "Saved account " .. detail .. " is present, but AutoHop is disabled.")
+        end
+    end
+end
 startFriendWorker()
 startMovementWorker()
 startWeaponWorker()
