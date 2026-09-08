@@ -203,6 +203,7 @@ Combo = {
         ComboDelay = 0, -- No extra delay between skills
         ComboHold = 0, -- Release each key after the minimum input wait
         GunOpenerEnabled = false,
+        MaxTargetDistance = 5000,
 
         Hitbox = {
             Enabled = true,
