@@ -15,6 +15,8 @@
 -- Saved gains need host isfolder/makefolder/isfile/writefile/readfile functions.
 -- SavedAccountHop defaults to true: at startup, hop if another player has a saved ID file.
 -- SavedAccountHop=false disables that scan; gain tracking continues. AutoHop still controls hopping.
+-- Players with AutoBountyAccounts/<UserId>.txt are excluded from targeting, independent of hop settings.
+-- Exact filenames are checked at startup and every second; unchecked accounts wait until verified.
 -- WinEntrance defaults to true: a positive Bounty/Honor change queues the nearest local entrance.
 -- Initial/rebound stats establish a baseline; gains during one pending exit are combined.
 -- Attacks/chasing/hop execution resume after arrival or a bounded 5-second entrance attempt.
@@ -69,7 +71,8 @@
 -- Empty-target hops attempt an entrance first (5s timeout), then wait for known InCombat=false.
 -- AutoHop uses current-PlaceId public servers, fullest first, excluding full/current/attempted JobIds.
 -- Joining uses ReplicatedStorage.__ServerBrowser:InvokeServer("teleport", JobId).
--- There is no minimum player count. Retry another unused JobId every 5 seconds while still here.
+-- There is no minimum player count. Retry another unused JobId every 0.1 seconds while still here.
+-- Public server-list refreshes and failed lookups retain their separate 5-second backoff.
 -- Attempted JobIds and transport locks survive same-server reloads; no external hop script is loaded.
 -- Pending HTTP/teleport calls must return before another call of the same type can start.
 -- Startup order: confirm team, start FPS boost, then continue setup 5 seconds after the boost starts.
@@ -307,7 +310,8 @@ local INTERNAL = {
     FastTPArrivalTolerance = 100,
     EmptyHopEntranceTimeout = 5,
     WinEntranceTimeout = 5,
-    ServerRetryDelay = 5,
+    ServerRetryDelay = 0.1,
+    PublicServerRetryDelay = 5,
     PublicServerPageDelay = 1,
     PublicServerRequestTimeout = 15,
     FPSBoostWait = 5,
@@ -738,6 +742,85 @@ local SavedAccountCheck = {
     MatchedIds = {},
     Ready = false,
 }
+
+local SavedTargetFilter = {Entries = {}, FileExists = nil}
+
+function SavedTargetFilter.StillCurrent()
+    return Runtime.Running and bootstrapStillCurrent()
+        and Environment.__AutoBountyRuntime == Runtime
+end
+
+-- Pure cached lookup: safe in combat, movement and camera validation without yielding.
+function SavedTargetFilter.Reason(player)
+    if not player or player == LocalPlayer or player.Parent ~= Players then
+        return nil
+    end
+    local entry = SavedTargetFilter.Entries[player.UserId]
+    if not entry or entry.Player ~= player or not entry.Known then
+        return "saved-account-check-pending"
+    end
+    if entry.Blocked then
+        return "saved-account-file"
+    end
+    return nil
+end
+
+function SavedTargetFilter.Refresh()
+    if not SavedTargetFilter.StillCurrent() then
+        return
+    end
+    local fileExists = SavedTargetFilter.FileExists
+    if type(fileExists) ~= "function" then
+        fileExists = type(isfile) == "function" and isfile or Environment.isfile
+        SavedTargetFilter.FileExists = fileExists
+    end
+    if type(fileExists) ~= "function" then
+        warnOnce("saved-target:filesystem", "Saved UserId target checks need isfile; targeting waits until account files can be checked.")
+        return
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        local userId = player.UserId
+        if player ~= LocalPlayer and player.Parent == Players
+            and isFiniteNumber(userId) and userId > 0 and userId % 1 == 0 then
+
+            local path = SavedAccountCheck.Folder .. "/" .. string.format("%.0f", userId) .. ".txt"
+            local ok, exists = pcall(fileExists, path)
+            if not SavedTargetFilter.StillCurrent() then
+                return
+            end
+            if player.Parent == Players then
+                local known = ok and type(exists) == "boolean"
+                SavedTargetFilter.Entries[userId] = {Player = player, Known = known, Blocked = exists == true}
+                -- Clear selection/aim/held keys immediately after publishing a blocked or unknown result.
+                if SavedTargetFilter.ReleaseCurrent then
+                    SavedTargetFilter.ReleaseCurrent()
+                end
+                if not known then
+                    warnOnce("saved-target:check:" .. tostring(userId), "Could not verify " .. path .. "; this player is excluded until the file check succeeds.")
+                end
+            end
+        end
+    end
+    for userId, entry in pairs(SavedTargetFilter.Entries) do
+        if entry.Player.Parent ~= Players then
+            SavedTargetFilter.Entries[userId] = nil
+        end
+    end
+end
+
+function SavedTargetFilter.Initialize()
+    SavedTargetFilter.Refresh()
+end
+
+function SavedTargetFilter.StartWorker()
+    task.spawn(function()
+        while SavedTargetFilter.StillCurrent() do
+            task.wait(1)
+            SavedTargetFilter.Refresh()
+        end
+    end)
+end
 
 local SavedBounty = {Record = nil}
 
@@ -2102,6 +2185,11 @@ local function evaluateTarget(player)
         return false, "self-or-left"
     end
 
+    local savedReason = SavedTargetFilter.Reason(player)
+    if savedReason then
+        return false, savedReason
+    end
+
     if TargetWeaponFilter.FindIgnored(player) then
         return false, "ignored-weapon"
     end
@@ -2195,6 +2283,7 @@ local function evaluateTarget(player)
 end
 
 local PENDING_TARGET_REASON = {
+    ["saved-account-check-pending"] = true,
     ["friend-pending"] = true,
     ["level-pending"] = true,
     ["dead-or-respawning"] = true,
@@ -2249,6 +2338,7 @@ local function rebuildCandidates()
                     end
 
                     if result == "local-position-pending"
+                        or result == "saved-account-check-pending"
                         or now - pending.Since < INTERNAL.PendingTargetGrace then
 
                         pendingCount = pendingCount + 1
@@ -2352,19 +2442,25 @@ end
 
 local function clearTarget(reason, markPrevious)
     local ignoredWeapon = TargetWeaponFilter.FindIgnored(Runtime.CurrentTarget)
+    local savedReason = SavedTargetFilter.Reason(Runtime.CurrentTarget)
     Runtime.TargetRecoveryState = nil
 
-    if not ignoredWeapon and markPrevious ~= false
+    if not ignoredWeapon and not savedReason and markPrevious ~= false
         and SkipPreviousTargets and Runtime.CurrentTarget then
 
         Runtime.PreviouslyTargeted[Runtime.CurrentTarget.UserId] = true
     end
 
     local reference = Runtime.SafeModeReference
-    if ignoredWeapon and reference and reference.TargetInfo
+    if (ignoredWeapon or savedReason) and reference and reference.TargetInfo
         and reference.TargetInfo.Player == Runtime.CurrentTarget then
 
         reference.TargetInfo = nil
+    end
+
+    if savedReason and Runtime.ActiveTween then
+        Runtime.ActiveTween:Cancel()
+        Runtime.ActiveTween = nil
     end
 
     Runtime.TargetEpoch = Runtime.TargetEpoch + 1
@@ -2391,6 +2487,19 @@ local function clearTarget(reason, markPrevious)
     end
 
     updateTargetGUI()
+end
+
+function SavedTargetFilter.ReleaseCurrent()
+    local player = Runtime.CurrentTarget
+    local reason = SavedTargetFilter.Reason(player)
+    if not reason then
+        return false
+    end
+    local message = reason == "saved-account-file"
+        and ("Ignoring " .. player.Name .. ": saved UserId file")
+        or ("Waiting for saved UserId check: " .. player.Name)
+    clearTarget(message, false)
+    return true
 end
 
 local function suspendTargetForRecovery()
@@ -2813,6 +2922,7 @@ local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer, entr
             and Runtime.TargetEpoch == targetEpoch
             and Runtime.CharacterEpoch == characterEpoch
             and Runtime.CurrentTarget == targetPlayer
+            and not SavedTargetFilter.Reason(targetPlayer)
             and not TargetWeaponFilter.FindIgnored(targetPlayer)
             and Runtime.Root == localRoot
             and localRoot ~= nil
@@ -3027,6 +3137,7 @@ local function setTarget(player, targetInfo, resumeRecovery)
                 and not Runtime.HopPending
                 and Runtime.TargetEpoch == targetEpoch
                 and Runtime.CurrentTarget == player
+                and not SavedTargetFilter.Reason(player)
                 and Runtime.CharacterEpoch == preparationCharacterEpoch
                 and Runtime.Root == preparationRoot
                 and preparationRoot ~= nil
@@ -3157,7 +3268,8 @@ local function canAttack(targetEpoch, attackMode, readOnly)
         return false
     end
 
-    if TargetWeaponFilter.FindIgnored(Runtime.CurrentTarget) then
+    if SavedTargetFilter.Reason(Runtime.CurrentTarget)
+        or TargetWeaponFilter.FindIgnored(Runtime.CurrentTarget) then
         return false
     end
 
@@ -3497,6 +3609,7 @@ local function getSafeModeGoalY()
 
     if info then
         if info.Player.Parent == Players
+            and not SavedTargetFilter.Reason(info.Player)
             and info.Character and info.Character.Parent
             and info.Player.Character == info.Character
             and info.Humanoid and info.Humanoid.Parent == info.Character
@@ -4016,7 +4129,8 @@ local function faceCameraTowardTarget()
     if not Runtime.Running
         or Runtime.LocalDead
         or Runtime.SafeMode
-        or Runtime.HopPending then
+        or Runtime.HopPending
+        or SavedTargetFilter.Reason(Runtime.CurrentTarget) then
 
         return
     end
@@ -5814,6 +5928,7 @@ local function startMovementWorker()
             return
         end
 
+        SavedTargetFilter.ReleaseCurrent()
         local ignoredWeapon = TargetWeaponFilter.FindIgnored(Runtime.CurrentTarget)
 
         if ignoredWeapon then
@@ -6553,7 +6668,7 @@ function PublicHop.Initialize()
             attempt.Error = tostring(message)
             Runtime.Teleporting = false
             if PublicHop.Validate(attempt.Context) then
-                setStatus("Server hop failed; trying another JobId on the next 5-second retry")
+                setStatus("Server hop failed; trying another JobId on the next 0.1-second retry")
             end
         end
 
@@ -6627,7 +6742,7 @@ end
 
 function PublicHop.PageFailed(message)
     PublicHop.CancelSearch()
-    PublicHop.State.NextQueryAt = os.clock() + INTERNAL.ServerRetryDelay
+    PublicHop.State.NextQueryAt = os.clock() + INTERNAL.PublicServerRetryDelay
     warn("[AutoBounty][ServerHop] Server lookup failed: " .. tostring(message))
     setStatus("Server lookup failed; retrying in 5 seconds")
 end
@@ -6704,7 +6819,7 @@ function PublicHop.AcceptPage(search)
         PublicHop.SeenCursors[cursor] = true
     else
         PublicHop.State.NextQueryAt = math.max(PublicHop.State.NextQueryAt,
-            os.clock() + INTERNAL.ServerRetryDelay)
+            os.clock() + INTERNAL.PublicServerRetryDelay)
     end
     return true
 end
@@ -6716,7 +6831,7 @@ function PublicHop.GetBrowser()
     end
 
     PublicHop.State.NextAttemptAt = os.clock() + INTERNAL.ServerRetryDelay
-    setStatus("Waiting for __ServerBrowser; checking again in 5 seconds")
+    setStatus("Waiting for __ServerBrowser; checking again in 0.1 seconds")
     warnOnce("server-hop:browser-missing", "[AutoBounty][ServerHop] __ServerBrowser RemoteFunction is unavailable; waiting to retry.")
     return nil
 end
@@ -6767,7 +6882,7 @@ function PublicHop.Dispatch(server, context)
         Runtime.Mode = "HOPPING"
         print(string.format("[AutoBounty][ServerHop] Trying via __ServerBrowser | PlaceId=%s | JobId=%s | Players=%d/%d",
             tostring(PublicHop.PlaceId), attempt.JobId, server.Playing, server.MaxPlayers))
-        setStatus(string.format("Joining server (%d/%d); retry in 5 seconds if still here",
+        setStatus(string.format("Joining server (%d/%d); retry in 0.1 seconds if still here",
             server.Playing, server.MaxPlayers))
 
         local ok, err = pcall(function()
@@ -6787,7 +6902,7 @@ function PublicHop.Dispatch(server, context)
             Runtime.Teleporting = false
             warn("[AutoBounty][ServerHop] " .. attempt.JobId .. " failed: " .. tostring(err))
             if PublicHop.Validate(attempt.Context) then
-                setStatus("Server hop failed; trying another JobId on the next 5-second retry")
+                setStatus("Server hop failed; trying another JobId on the next 0.1-second retry")
             end
         end
         -- A successful invocation does not confirm arrival. Retry if this server is still active.
@@ -7049,7 +7164,9 @@ local function startTargetWorker()
                     local currentInfo = Runtime.CandidateInfo[player]
                     local ignoredWeapon = TargetWeaponFilter.FindIgnored(player)
 
-                    if ignoredWeapon then
+                    if SavedTargetFilter.ReleaseCurrent() then
+                        -- Saved accounts stay excluded during recovery and combat as well.
+                    elseif ignoredWeapon then
                         releaseIgnoredTarget(ignoredWeapon)
                     elseif Runtime.SafeMode then
                         -- Recovery movement can put the selected target out of range temporarily.
@@ -7143,6 +7260,7 @@ function Runtime:Stop(reason)
 
     self.Running = false
 
+    table.clear(SavedTargetFilter.Entries)
     StartupFPSBoost.Cancelled = true
     ServerTimeout.Pending = false
     PublicHop.CancelSearch()
@@ -7222,6 +7340,7 @@ function Runtime:Stop(reason)
     end
 end
 
+SavedTargetFilter.Initialize()
 SavedAccountCheck.Initialize()
 if not SavedAccountCheck.StillCurrent() then
     return
@@ -7231,6 +7350,7 @@ createGUI()
 PublicHop.Initialize()
 ServerTimeout.Initialize()
 SavedBounty.StartWorker()
+SavedTargetFilter.StartWorker()
 startBountyValueBinder()
 WinEntrance.StartWorker()
 startSafeZoneBinder()
