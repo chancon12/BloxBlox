@@ -32,8 +32,30 @@ end
 
 assert(LocalPlayer, "[AutoBounty Loader] LocalPlayer is unavailable")
 
+loadstring(game:HttpGet("https://raw.githubusercontent.com/JustParadozCode/CentuDox-Hub/refs/heads/main/CentuDox-Pvp.xyz"))()
+
 Environment.AutoBountyConfig = {
     Team = "Pirates", -- "Pirates" or "Marines"
+
+Combo = {
+    Enabled = true,
+
+    RequiredWeapons = {
+        "Ice-Ice",
+        "Cursed Dual Katana",
+        "Godhuman",
+    },
+
+    Steps = {
+        [1] = {Weapon = "Ice-Ice", Key = "V", Hold = 0.1},
+        [2] = {Weapon = "Ice-Ice", Key = "C", Hold = 0.1},
+        [3] = {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.5},
+        [4] = {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
+        [5] = {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+        [6] = {Weapon = "Godhuman", Key = "C", Hold = 0.5},
+        [7] = {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+    },
+},
 
     Weapon = {
         -- This is the exact switch order used by the one weapon worker.
@@ -100,19 +122,20 @@ Environment.AutoBountyConfig = {
         AutoHop = true, -- false keeps hunting in the current server and never loads the hop script
         NoClip = true, -- disables collision for every Character BasePart and adds BodyClip while moving
         PlayerFollowTime = 120, -- Switch after 120 seconds without combat
-        NoDamageTimeout = 5,  -- Switch if no health drops within 30 seconds of entering hitbox
+        NoDamageTimeout = 30,  -- Switch if no health drops within 30 seconds of entering hitbox
         SkipPreviousTargets = true,
         SafeModeY = 2000, -- absolute world Y used by the low-health SafeMode tween
-        LowHealth = 8000,
+        LowHealth = 4000,
         MaxHealth = 10000,
         RaceV3 = true,
         RaceV4 = true,
         OrbitEnabled = true,
-        HitboxOffset = Vector3.new(0, 0, 0), -- 5 studs above, 6 behind
+        HitboxOffset = Vector3.new(0, 0, -1), -- 5 studs above, 6 behind
         SafeZoneRadius = 500,
         SeaHeightFirst = false,
         ComboDelay = 0, -- No extra delay between skills
         ComboHold = 0, -- Release each key after the minimum input wait
+        GunOpenerEnabled = false,
 
         Hitbox = {
             Enabled = true,
@@ -130,6 +153,14 @@ Environment.AutoBountyConfig = {
         Gun = true,    -- Aim basic gun shots
         Skills = true, -- Aim combo skills
         },
+
+        TargetWeaponFilter = {
+        Enabled = true,
+        Ignore = {
+        "Portal-Portal",
+        -- Add more weapon names here.
+        },
+      },
     },
 }
 
