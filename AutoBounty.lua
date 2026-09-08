@@ -67,11 +67,17 @@
 -- With FastTP enabled, new targets also use a closer entrance before chasing when over 300 studs away.
 -- Optional shortcuts are checked once per acquisition; failed shortcuts fall back to direct chasing.
 -- Empty-target hops attempt an entrance first (5s timeout), then wait for known InCombat=false.
+-- AutoHop uses current-PlaceId public servers, fullest first, excluding full/current/attempted JobIds.
+-- There is no minimum player count. Retry another unused JobId every 5 seconds while still here.
+-- Attempted JobIds and transport locks survive same-server reloads; no external hop script is loaded.
+-- Pending HTTP/teleport calls must return before another call of the same type can start.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Teams = game:GetService("Teams")
 local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
@@ -296,10 +302,9 @@ local INTERNAL = {
     FastTPArrivalTolerance = 100,
     EmptyHopEntranceTimeout = 5,
     WinEntranceTimeout = 5,
-    ServerRetryDelay = 3,
-    ExternalHopURL = "https://raw.githubusercontent.com/WhiteX1208/Scripts/refs/heads/main/KaitunFindFruit.luau",
-    ExternalHopDownloadTimeout = 15,
-    ExternalHopMaxAbandonedDownloads = 3,
+    ServerRetryDelay = 5,
+    PublicServerPageDelay = 1,
+    PublicServerRequestTimeout = 15,
 }
 
 local function isFiniteVector3(value)
@@ -595,10 +600,8 @@ local Runtime = {
     FollowTimeoutHopDetail = nil,
     HopWorkerRunning = false,
     HopAttemptEpoch = 0,
-    ExternalHopLaunch = nil,
-    ExternalHopLaunched = false,
-    ExternalHopTerminalFailure = false,
-    ExternalHopAbandonedDownloads = 0,
+    HopSearch = nil,
+    HopAttempt = nil,
     EmptySince = nil,
     Candidates = {},
     CandidateInfo = {},
@@ -2592,7 +2595,7 @@ end
 
 function WinEntrance.OnIncrease(before, after)
     if not WinEntrance.Enabled or not Runtime.Running or not bootstrapStillCurrent()
-        or Environment.__AutoBountyRuntime ~= Runtime or Runtime.ExternalHopLaunched
+        or Environment.__AutoBountyRuntime ~= Runtime
         or Runtime.LocalDead or not isFiniteNumber(before) or not isFiniteNumber(after)
         or after <= before then
 
@@ -3768,7 +3771,7 @@ local function faceRootTowardTarget(localRoot, targetRoot)
 end
 
 local function emptyHopEntranceFinished()
-    if Runtime.ExternalHopLaunched or not isEmptyListHopReady() then
+    if not isEmptyListHopReady() then
         return true
     end
 
@@ -3782,10 +3785,6 @@ local function emptyHopEntranceFinished()
 end
 
 local function updateEmptyCombatEntrance()
-    if Runtime.ExternalHopLaunched then
-        return true
-    end
-
     local character = Runtime.Character
     local characterEpoch = Runtime.CharacterEpoch
     local root = Runtime.Root
@@ -3798,7 +3797,6 @@ local function updateEmptyCombatEntrance()
             and not Runtime.WinEntranceAttempt
             and not Runtime.SafeMode
             and not Runtime.LocalDead
-            and not Runtime.ExternalHopLaunched
             and Runtime.CurrentTarget == nil
             and Runtime.EmptySince == emptySince
             and Runtime.CharacterEpoch == characterEpoch
@@ -6247,11 +6245,20 @@ local HOP_PRIORITY = {
     friend = 3,
 }
 
-local function stopHopPending(message)
-    local externalLaunch = Runtime.ExternalHopLaunch
+local PublicHop = {
+    PlaceId = game.PlaceId,
+    SourceJobId = game.JobId,
+    Servers = {},
+    Cursor = nil,
+    SeenCursors = {},
+    Finished = false,
+}
 
-    if type(externalLaunch) == "table" and not externalLaunch.Executed then
-        externalLaunch.Cancelled = true
+local function stopHopPending(message)
+    PublicHop.CancelSearch()
+    if Runtime.HopAttempt then
+        Runtime.HopAttempt.Cancelled = true
+        Runtime.HopAttempt = nil
     end
 
     Runtime.HopAttemptEpoch = Runtime.HopAttemptEpoch + 1
@@ -6287,254 +6294,406 @@ cancelFollowTimeoutHop = function(message)
     return true
 end
 
-local function validateExternalHopLaunch(launch)
-    if type(launch) ~= "table"
-        or not AutoHopEnabled
-        or launch.Cancelled
-        or launch.Executed
-        or type(launch.DownloadDeadline) ~= "number"
-        or os.clock() >= launch.DownloadDeadline
-        or not Runtime.Running
-        or not Runtime.HopPending
-        or Runtime.WinEntranceAttempt
-        or Runtime.SafeMode
-        or Runtime.LocalDead
-        or Runtime.HopAttemptEpoch ~= launch.HopAttemptEpoch
-        or Runtime.CharacterEpoch ~= launch.CharacterEpoch
-        or Runtime.Character ~= launch.Character
-        or LocalPlayer.Character ~= launch.Character
-        or Environment.__AutoBountyRuntime ~= Runtime
-        or Environment.__AutoBountyExternalHopLaunch ~= launch then
+function PublicHop.IsCurrent()
+    return Runtime.Running
+        and AutoHopEnabled
+        and bootstrapStillCurrent()
+        and Environment.__AutoBountyRuntime == Runtime
+        and game.PlaceId == PublicHop.PlaceId
+        and game.JobId == PublicHop.SourceJobId
+end
 
-        return false
-    end
+function PublicHop.Snapshot()
+    return {
+        Character = Runtime.Character,
+        CharacterEpoch = Runtime.CharacterEpoch,
+        HopAttemptEpoch = Runtime.HopAttemptEpoch,
+        Root = Runtime.Root,
+        Humanoid = Runtime.Humanoid,
+    }
+end
 
-    local humanoid = Runtime.Humanoid
+function PublicHop.ContextMatches(context)
+    return type(context) == "table"
+        and PublicHop.IsCurrent()
+        and Runtime.HopPending
+        and not Runtime.WinEntranceAttempt
+        and not Runtime.SafeMode
+        and not Runtime.LocalDead
+        and Runtime.Character == context.Character
+        and Runtime.CharacterEpoch == context.CharacterEpoch
+        and Runtime.HopAttemptEpoch == context.HopAttemptEpoch
+        and LocalPlayer.Parent == Players
+        and context.Character ~= nil
+        and LocalPlayer.Character == context.Character
+        and context.Character.Parent ~= nil
+        and Runtime.Root == context.Root
+        and Runtime.Humanoid == context.Humanoid
+        and context.Humanoid ~= nil
+        and context.Humanoid.Parent == context.Character
+        and context.Humanoid.Health > 0
+end
 
-    if not humanoid or humanoid.Parent ~= launch.Character or humanoid.Health <= 0 then
+function PublicHop.Validate(context)
+    if not PublicHop.ContextMatches(context) then
         return false
     end
 
     rebuildCandidates()
-
     local reason, detail = determineHopReason()
     local inCombat, inCombatKnown = readLocalInCombat()
 
-    if not reason or not emptyHopEntranceFinished() or not inCombatKnown or inCombat ~= false then
+    if not reason
+        or not inCombatKnown
+        or inCombat ~= false
+        or not emptyHopEntranceFinished()
+        or not PublicHop.ContextMatches(context) then
+
         return false
     end
 
     Runtime.HopReason = reason
     Runtime.HopDetail = detail
-    launch.Reason = reason
-    launch.Detail = detail
     return true
 end
 
-local function recordExternalHopAbandonedDownload(launch)
-    if launch.AbandonmentCounted then
+function PublicHop.CancelSearch()
+    if Runtime.HopSearch then
+        Runtime.HopSearch.Cancelled = true
+        Runtime.HopSearch = nil
+    end
+
+    local attempt = Runtime.HopAttempt
+    if attempt and not attempt.StartedAt then
+        attempt.Cancelled = true
+        Runtime.HopAttempt = nil
+    end
+
+    PublicHop.Servers = {}
+    PublicHop.Cursor = nil
+    PublicHop.SeenCursors = {}
+    PublicHop.Finished = false
+    -- Actual yielding HTTP/teleport calls retain their shared locks until they return.
+    -- UsedJobs and retry timing also survive cancelled episodes and same-server reloads.
+end
+
+function PublicHop.Initialize()
+    local state = Environment.__AutoBountyPublicHopState
+    if type(state) ~= "table"
+        or state.PlaceId ~= PublicHop.PlaceId
+        or state.SourceJobId ~= PublicHop.SourceJobId
+        or type(state.UsedJobs) ~= "table" then
+
+        state = {
+            PlaceId = PublicHop.PlaceId,
+            SourceJobId = PublicHop.SourceJobId,
+            UsedJobs = {},
+            NextAttemptAt = 0,
+            NextQueryAt = 0,
+        }
+        Environment.__AutoBountyPublicHopState = state
+    end
+
+    state.UsedJobs[PublicHop.SourceJobId] = true
+    PublicHop.State = state
+
+    connect(TeleportService.TeleportInitFailed, function(player, result, message, placeId, options)
+        if not PublicHop.IsCurrent() or player ~= LocalPlayer or placeId ~= PublicHop.PlaceId then
+            return
+        end
+
+        local jobId
+        if options then
+            pcall(function()
+                jobId = options.ServerInstanceId
+            end)
+        end
+
+        local attempt = Runtime.HopAttempt
+        if type(jobId) == "string" and jobId ~= "" then
+            if not attempt or attempt.Cancelled or not attempt.StartedAt or attempt.JobId ~= jobId then
+                return
+            end
+            attempt.Failed = true
+            attempt.Error = tostring(message)
+            Runtime.Teleporting = false
+            if PublicHop.Validate(attempt.Context) then
+                setStatus("Server hop failed; trying another JobId on the next 5-second retry")
+            end
+        end
+
+        -- Without a destination JobId, an event cannot safely be tied to the newest request.
+        warn("[AutoBounty][ServerHop] Teleport failed: " .. tostring(result) .. " | " .. tostring(message))
+    end)
+
+    print(string.format("[AutoBounty][ServerHop] Current PlaceId=%s | JobId=%s",
+        tostring(PublicHop.PlaceId), tostring(PublicHop.SourceJobId)))
+end
+
+function PublicHop.BeginPage(context)
+    local state = PublicHop.State
+    if Runtime.HopSearch or state.HttpCall or os.clock() < state.NextQueryAt
+        or not PublicHop.Validate(context) then
+        return false
+    end
+
+    local url = string.format(
+        "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Desc&excludeFullGames=true&limit=100",
+        tostring(PublicHop.PlaceId)
+    )
+    if PublicHop.Cursor then
+        url = url .. "&cursor=" .. HttpService:UrlEncode(PublicHop.Cursor)
+    end
+
+    local search = {
+        Context = context,
+        Cursor = PublicHop.Cursor,
+        StartedAt = os.clock(),
+        Deadline = os.clock() + INTERNAL.PublicServerRequestTimeout,
+        Cancelled = false,
+        Returned = false,
+    }
+    Runtime.HopSearch = search
+    state.HttpCall = search
+    setStatus("Finding public servers with available slots")
+
+    task.spawn(function()
+        if search.Cancelled or Runtime.HopSearch ~= search or not PublicHop.Validate(context) then
+            search.Cancelled = true
+            search.Returned = true
+            if state.HttpCall == search then
+                state.HttpCall = nil
+            end
+            return
+        end
+
+        search.StartedAt = os.clock()
+        search.Deadline = search.StartedAt + INTERNAL.PublicServerRequestTimeout
+        state.NextQueryAt = search.StartedAt + INTERNAL.PublicServerPageDelay
+        local ok, response = pcall(function()
+            return game:HttpGet(url)
+        end)
+
+        search.Returned = true
+        if state.HttpCall == search then
+            state.HttpCall = nil
+        end
+
+        if search.Cancelled or Runtime.HopSearch ~= search or not PublicHop.IsCurrent() then
+            return
+        end
+
+        search.OK = ok
+        search.Response = response
+        -- Only the guarded hop worker consumes results and chooses a destination.
+    end)
+    return true
+end
+
+function PublicHop.PageFailed(message)
+    PublicHop.CancelSearch()
+    PublicHop.State.NextQueryAt = os.clock() + INTERNAL.ServerRetryDelay
+    warn("[AutoBounty][ServerHop] Server lookup failed: " .. tostring(message))
+    setStatus("Server lookup failed; retrying in 5 seconds")
+end
+
+function PublicHop.AcceptPage(search)
+    if Runtime.HopSearch ~= search or search.Cancelled or not search.Returned then
+        return false
+    end
+    if not PublicHop.Validate(search.Context) then
+        PublicHop.CancelSearch()
+        return false
+    end
+    if os.clock() >= search.Deadline then
+        PublicHop.PageFailed("request timed out")
+        return false
+    end
+    if not search.OK then
+        PublicHop.PageFailed(search.Response)
+        return false
+    end
+
+    local ok, page = pcall(function()
+        return HttpService:JSONDecode(search.Response)
+    end)
+    if not ok or type(page) ~= "table" or type(page.data) ~= "table" then
+        PublicHop.PageFailed("invalid server-list response")
+        return false
+    end
+
+    local cursor = page.nextPageCursor
+    if cursor == "" then
+        cursor = nil
+    end
+    if cursor ~= nil
+        and (type(cursor) ~= "string" or cursor == search.Cursor or PublicHop.SeenCursors[cursor]) then
+        PublicHop.PageFailed("invalid or repeated page cursor")
+        return false
+    end
+
+    local servers, seenJobs = {}, {}
+    for _, server in ipairs(page.data) do
+        if type(server) == "table"
+            and type(server.id) == "string"
+            and server.id ~= ""
+            and not PublicHop.State.UsedJobs[server.id]
+            and not seenJobs[server.id]
+            and isFiniteNumber(server.playing)
+            and isFiniteNumber(server.maxPlayers)
+            and server.playing >= 0
+            and server.playing % 1 == 0
+            and server.maxPlayers % 1 == 0
+            and server.playing < server.maxPlayers then
+
+            seenJobs[server.id] = true
+            table.insert(servers, {
+                JobId = server.id,
+                Playing = server.playing,
+                MaxPlayers = server.maxPlayers,
+            })
+        end
+    end
+    table.sort(servers, function(a, b)
+        if a.Playing == b.Playing then
+            return a.JobId < b.JobId
+        end
+        return a.Playing > b.Playing
+    end)
+
+    Runtime.HopSearch = nil
+    PublicHop.Servers = servers
+    PublicHop.Cursor = cursor
+    PublicHop.Finished = cursor == nil
+    if cursor then
+        PublicHop.SeenCursors[cursor] = true
+    else
+        PublicHop.State.NextQueryAt = math.max(PublicHop.State.NextQueryAt,
+            os.clock() + INTERNAL.ServerRetryDelay)
+    end
+    return true
+end
+
+function PublicHop.Dispatch(server, context)
+    local state = PublicHop.State
+    if state.TeleportCall or state.UsedJobs[server.JobId]
+        or os.clock() < state.NextAttemptAt or not PublicHop.Validate(context) then
+        return false
+    end
+
+    local attempt = {JobId = server.JobId, Context = context, Cancelled = false, Returned = false}
+    Runtime.HopAttempt = attempt
+    state.TeleportCall = attempt
+
+    task.spawn(function()
+        if attempt.Cancelled or Runtime.HopAttempt ~= attempt
+            or state.UsedJobs[attempt.JobId] or not PublicHop.Validate(context) then
+
+            attempt.Cancelled = true
+            attempt.Returned = true
+            if state.TeleportCall == attempt then
+                state.TeleportCall = nil
+            end
+            return
+        end
+
+        -- Consume the JobId only when the request is actually dispatched.
+        attempt.StartedAt = os.clock()
+        state.UsedJobs[attempt.JobId] = true
+        state.NextAttemptAt = attempt.StartedAt + INTERNAL.ServerRetryDelay
+        Runtime.Teleporting = true
+        Runtime.Mode = "HOPPING"
+        print(string.format("[AutoBounty][ServerHop] Trying | PlaceId=%s | JobId=%s | Players=%d/%d",
+            tostring(PublicHop.PlaceId), attempt.JobId, server.Playing, server.MaxPlayers))
+        setStatus(string.format("Joining server (%d/%d); retry in 5 seconds if still here",
+            server.Playing, server.MaxPlayers))
+
+        local ok, err = pcall(function()
+            TeleportService:TeleportToPlaceInstance(PublicHop.PlaceId, attempt.JobId, LocalPlayer)
+        end)
+        attempt.Returned = true
+        if state.TeleportCall == attempt then
+            state.TeleportCall = nil
+        end
+
+        if attempt.Cancelled or Runtime.HopAttempt ~= attempt or not PublicHop.IsCurrent() then
+            return
+        end
+        if not ok then
+            attempt.Failed = true
+            attempt.Error = tostring(err)
+            Runtime.Teleporting = false
+            warn("[AutoBounty][ServerHop] " .. attempt.JobId .. " failed: " .. tostring(err))
+            if PublicHop.Validate(attempt.Context) then
+                setStatus("Server hop failed; trying another JobId on the next 5-second retry")
+            end
+        end
+        -- A successful invocation does not confirm arrival. Retry if this server is still active.
+    end)
+    return true
+end
+
+function PublicHop.Tick(context)
+    if not PublicHop.Validate(context) then
+        PublicHop.CancelSearch()
         return
     end
 
-    launch.AbandonmentCounted = true
-
-    if launch.Runtime == Runtime then
-        Runtime.ExternalHopAbandonedDownloads = Runtime.ExternalHopAbandonedDownloads + 1
-    end
-end
-
-local function beginExternalHopLaunch(reason, detail)
-    if not AutoHopEnabled then
-        return nil, false, "auto-hop-disabled"
-    end
-
-    local existing = Environment.__AutoBountyExternalHopLaunch
-
-    if type(existing) == "table"
-        and existing.Active
-        and existing.URL == INTERNAL.ExternalHopURL then
-
-        local downloadExpired = not existing.Executed
-            and type(existing.DownloadDeadline) == "number"
-            and os.clock() >= existing.DownloadDeadline
-
-        if existing.Executed then
-            Runtime.ExternalHopLaunch = existing
-            Runtime.ExternalHopLaunched = true
-            return existing, false, "already-executing"
-        end
-
-        if not existing.Cancelled and not downloadExpired and existing.Runtime == Runtime then
-            Runtime.ExternalHopLaunch = existing
-            return existing, false, "already-loading"
-        end
-
-        -- A cancelled, expired, or superseded download cannot be stopped at
-        -- the transport layer. Abandon its token; its final guard prevents a
-        -- late response from executing.
-        existing.Cancelled = true
-        existing.Active = false
-        recordExternalHopAbandonedDownload(existing)
-
-        if downloadExpired then
-            existing.Stage = "download-timeout"
-            existing.Error = "External hop download exceeded "
-                .. tostring(INTERNAL.ExternalHopDownloadTimeout)
-                .. " seconds"
-        end
-
-        if Environment.__AutoBountyExternalHopLaunch == existing then
-            Environment.__AutoBountyExternalHopLaunch = nil
-        end
-    end
-
-    if Runtime.ExternalHopAbandonedDownloads
-        >= INTERNAL.ExternalHopMaxAbandonedDownloads then
-
-        Runtime.ExternalHopTerminalFailure = true
-        return nil, false, "download-abandon-limit"
-    end
-
-    Runtime.HopAttemptEpoch = Runtime.HopAttemptEpoch + 1
-
-    local launch = {
-        URL = INTERNAL.ExternalHopURL,
-        Runtime = Runtime,
-        Character = Runtime.Character,
-        CharacterEpoch = Runtime.CharacterEpoch,
-        HopAttemptEpoch = Runtime.HopAttemptEpoch,
-        Reason = reason,
-        Detail = detail,
-        Active = true,
-        Cancelled = false,
-        Executed = false,
-        Finished = false,
-        Success = nil,
-        Error = nil,
-        Stage = "downloading",
-        DownloadDeadline = os.clock() + INTERNAL.ExternalHopDownloadTimeout,
-    }
-
-    Runtime.ExternalHopLaunch = launch
-    Runtime.ExternalHopLaunched = false
-    Environment.__AutoBountyExternalHopLaunch = launch
-
-    local function finishBeforeExecution(stage, message)
-        launch.Stage = stage
-        launch.Error = message
-        launch.Finished = true
-        launch.Active = false
-
-        if Environment.__AutoBountyExternalHopLaunch == launch then
-            Environment.__AutoBountyExternalHopLaunch = nil
-        end
-    end
-
-    task.spawn(function()
-        local downloadOk, source = pcall(function()
-            return game:HttpGet(launch.URL)
-        end)
-
-        if launch.Cancelled then
-            finishBeforeExecution("cancelled", "External hop download was cancelled")
-            return
-        end
-
-        if not downloadOk or type(source) ~= "string" or source == "" then
-            finishBeforeExecution(
-                "download-failed",
-                downloadOk and "The external hop response was empty" or tostring(source)
-            )
-            return
-        end
-
-        if os.clock() >= launch.DownloadDeadline then
-            launch.Cancelled = true
-            recordExternalHopAbandonedDownload(launch)
-            finishBeforeExecution(
-                "download-timeout",
-                "External hop download exceeded "
-                    .. tostring(INTERNAL.ExternalHopDownloadTimeout)
-                    .. " seconds"
-            )
-            return
-        end
-
-        if not validateExternalHopLaunch(launch) then
-            launch.Cancelled = true
-            finishBeforeExecution("cancelled", "Hop state changed after download")
-            return
-        end
-
-        launch.Stage = "compiling"
-
-        local chunk
-        local compileError
-        local compileOk, compileCallError = pcall(function()
-            if type(loadstring) ~= "function" then
-                error("loadstring is unavailable")
+    local state = PublicHop.State
+    local attempt = Runtime.HopAttempt
+    if attempt then
+        if not attempt.Returned or (attempt.StartedAt and os.clock() < state.NextAttemptAt) then
+            if attempt.StartedAt and not attempt.Returned and os.clock() >= state.NextAttemptAt then
+                setStatus("Teleport request still pending; waiting before trying another JobId")
             end
-
-            chunk, compileError = loadstring(source)
-        end)
-
-        if not compileOk or type(chunk) ~= "function" then
-            finishBeforeExecution(
-                "compile-failed",
-                tostring(compileOk and compileError or compileCallError)
-            )
             return
         end
+        Runtime.HopAttempt = nil
+        Runtime.Teleporting = false
+    end
 
-        -- HttpGet yielded, so perform the full guard again immediately before
-        -- giving control to the external script.
-        if not validateExternalHopLaunch(launch) then
-            launch.Cancelled = true
-            finishBeforeExecution("cancelled", "Hop state changed before external execution")
+    if state.TeleportCall then
+        setStatus("Waiting for the previous teleport request to return")
+        return
+    end
+    if os.clock() < state.NextAttemptAt then
+        return
+    end
+
+    local search = Runtime.HopSearch
+    if search then
+        if search.Cancelled or not PublicHop.ContextMatches(search.Context) then
+            PublicHop.CancelSearch()
+            return
+        elseif os.clock() >= search.Deadline then
+            PublicHop.PageFailed("request timed out; any pending request must finish before another starts")
+            return
+        elseif not search.Returned then
+            return
+        elseif not PublicHop.AcceptPage(search) then
             return
         end
+    end
 
-        launch.Stage = "executing"
-        launch.Executed = true
-        Runtime.ExternalHopLaunched = true
-
-        if Environment.__AutoBountyRuntime == Runtime then
-            setStatus("External server-hop script loaded (" .. tostring(launch.Reason) .. ")")
-        end
-
-        local runOk, runResult = pcall(chunk)
-        launch.Finished = true
-        launch.Success = runOk
-        launch.Result = runResult
-
-        if runOk then
-            -- A successful return may mean the external payload spawned its
-            -- own workers. Keep the launch sticky so repeated friend/empty
-            -- checks cannot execute another opaque copy.
-            launch.Stage = "launched"
+    while #PublicHop.Servers > 0 do
+        local server = table.remove(PublicHop.Servers, 1)
+        if not state.UsedJobs[server.JobId] then
+            PublicHop.Dispatch(server, context)
             return
         end
+    end
 
-        launch.Stage = "runtime-failed"
-        launch.Error = tostring(runResult)
-        launch.Active = false
-
-        if Environment.__AutoBountyExternalHopLaunch == launch then
-            Environment.__AutoBountyExternalHopLaunch = nil
-        end
-
-        if Environment.__AutoBountyRuntime == Runtime and Runtime.Running then
-            Runtime.ExternalHopTerminalFailure = true
-            warnOnce(
-                "external-hop:runtime",
-                "External server-hop script failed after execution began: "
-                    .. tostring(runResult)
-            )
-            setStatus("External server-hop script failed; reload to retry")
-        end
-    end)
-
-    return launch, true, "started"
+    if PublicHop.Finished then
+        PublicHop.Cursor = nil
+        PublicHop.SeenCursors = {}
+        PublicHop.Finished = false
+        setStatus("No untried servers in this list; refreshing every 5 seconds")
+    end
+    if state.HttpCall then
+        setStatus("Server lookup still pending; waiting for the request to return")
+        return
+    end
+    PublicHop.BeginPage(context)
 end
 
 local function runHopWorker()
@@ -6542,277 +6701,67 @@ local function runHopWorker()
         if Runtime.HopPending then
             stopHopPending("AutoHop disabled; scanning")
         end
-
         return
     end
-
     if Runtime.HopWorkerRunning then
         return
     end
 
     Runtime.HopWorkerRunning = true
-
     task.spawn(function()
-        while Runtime.Running and Runtime.HopPending do
+        while PublicHop.IsCurrent() and Runtime.HopPending do
             if Runtime.WinEntranceAttempt then
+                PublicHop.CancelSearch()
                 task.wait(0.05)
                 continue
             end
-
-            clearTarget()
-
-            while Runtime.Running
-                and Runtime.HopPending
-                and (Runtime.SafeMode or Runtime.LocalDead) do
-
-                if Runtime.SafeMode then
-                    Runtime.Mode = "SAFE_MODE"
-                    setStatus("SafeMode active; external server hop queued")
-                else
-                    Runtime.Mode = "RESPAWN"
-                    setStatus("Waiting for respawn before external server hop")
-                end
-
+            if Runtime.CurrentTarget then
+                clearTarget()
+            end
+            if Runtime.SafeMode or Runtime.LocalDead then
+                PublicHop.CancelSearch()
+                Runtime.Mode = Runtime.SafeMode and "SAFE_MODE" or "RESPAWN"
+                setStatus(Runtime.SafeMode and "SafeMode active; server hop queued"
+                    or "Waiting for respawn before server hop")
                 task.wait(0.25)
-            end
-
-            if not Runtime.Running or not Runtime.HopPending then
-                break
-            end
-
-            Runtime.Mode = "HOP_WAIT"
-
-            while Runtime.Running and Runtime.HopPending do
-                if Runtime.SafeMode or Runtime.LocalDead or Runtime.WinEntranceAttempt then
-                    break
-                end
-
-                rebuildCandidates()
-
-                local activeReason = determineHopReason()
-
-                if not activeReason then
-                    stopHopPending("Hop condition cleared; scanning")
-                    break
-                end
-
-                local inCombat, inCombatKnown = readLocalInCombat()
-
-                if activeReason == "follow-timeout"
-                    and inCombatKnown
-                    and inCombat == true then
-
-                    stopHopPending("Combat started; PlayerFollowTime reset")
-                    break
-                end
-
-                local entranceReady = not isEmptyListHopReady() or updateEmptyCombatEntrance()
-
-                if entranceReady and inCombatKnown and inCombat == false then
-                    break
-                end
-
-                if entranceReady then
-                    setStatus(inCombatKnown
-                        and "Waiting for InCombat to turn off before external hop"
-                        or "Waiting for a boolean Character.InCombat before external hop")
-                end
-
-                task.wait(0.25)
-            end
-
-            if not Runtime.Running
-                or not Runtime.HopPending
-                or Runtime.SafeMode
-                or Runtime.LocalDead
-                or Runtime.WinEntranceAttempt then
-
-                task.wait(0.1)
                 continue
             end
 
             rebuildCandidates()
-
             local reason, detail = determineHopReason()
-            local inCombat, inCombatKnown = readLocalInCombat()
-
             if not reason then
                 stopHopPending("Hop condition cleared; scanning")
                 break
             end
 
-            if isEmptyListHopReady() and not updateEmptyCombatEntrance() then
-                task.wait(0.05)
-                continue
-            end
-
-            if not inCombatKnown or inCombat ~= false then
-                setStatus(inCombatKnown
-                    and "Waiting for InCombat to turn off before external hop"
-                    or "Waiting for Character.InCombat before external hop")
-                task.wait(0.25)
-                continue
-            end
-
-            if Runtime.ExternalHopTerminalFailure then
-                setStatus("External server-hop script failed; reload to retry")
+            local inCombat, inCombatKnown = readLocalInCombat()
+            if reason == "follow-timeout" and inCombatKnown and inCombat == true then
+                stopHopPending("Combat started; PlayerFollowTime reset")
                 break
             end
 
             Runtime.HopReason = reason
             Runtime.HopDetail = detail
-            Runtime.Mode = "HOPPING"
-            setStatus("Downloading external server-hop script (" .. reason .. ")")
-
-            local launch, started, state = beginExternalHopLaunch(reason, detail)
-
-            if not started then
-                if state == "download-abandon-limit" then
-                    setStatus("External server-hop downloads remain pending; reload to retry")
-                    break
+            local entranceReady = not isEmptyListHopReady() or updateEmptyCombatEntrance()
+            if not entranceReady or not inCombatKnown or inCombat ~= false then
+                PublicHop.CancelSearch()
+                Runtime.Mode = "HOP_WAIT"
+                if entranceReady then
+                    setStatus(inCombatKnown and "Waiting for InCombat to turn off before server hop"
+                        or "Waiting for a boolean Character.InCombat before server hop")
                 end
-
-                if state == "already-executing" then
-                    if launch.Runtime ~= Runtime and not launch.Finished then
-                        setStatus("Waiting for the previous external server-hop script")
-
-                        while Runtime.Running
-                            and Runtime.HopPending
-                            and not launch.Finished do
-
-                            task.wait(0.25)
-                        end
-                    end
-
-                    if not Runtime.Running or not Runtime.HopPending then
-                        break
-                    end
-
-                    if launch.Finished and launch.Success == false then
-                        if Environment.__AutoBountyExternalHopLaunch == launch then
-                            Environment.__AutoBountyExternalHopLaunch = nil
-                        end
-
-                        Runtime.ExternalHopLaunch = nil
-                        Runtime.ExternalHopLaunched = false
-                        setStatus("Previous external server-hop script failed; retrying")
-                        task.wait(INTERNAL.ServerRetryDelay)
-                        continue
-                    end
-
-                    setStatus("External server-hop script is already active")
-                    break
-                end
-
-                setStatus("External server-hop script is still downloading")
                 task.wait(0.25)
                 continue
             end
 
-            while Runtime.Running
-                and Runtime.HopPending
-                and not launch.Executed
-                and not launch.Finished do
-
-                if Runtime.WinEntranceAttempt then
-                    launch.Cancelled = true
-                    setStatus("Win entrance queued before server hop")
-                    break
-                end
-
-                rebuildCandidates()
-
-                local currentReason = determineHopReason()
-                local currentInCombat, currentInCombatKnown = readLocalInCombat()
-
-                if launch.Stage == "downloading"
-                    and os.clock() >= launch.DownloadDeadline then
-
-                    launch.Cancelled = true
-                    recordExternalHopAbandonedDownload(launch)
-                    launch.Active = false
-                    launch.Finished = true
-                    launch.Stage = "download-timeout"
-                    launch.Error = "External hop download exceeded "
-                        .. tostring(INTERNAL.ExternalHopDownloadTimeout)
-                        .. " seconds"
-
-                    if Environment.__AutoBountyExternalHopLaunch == launch then
-                        Environment.__AutoBountyExternalHopLaunch = nil
-                    end
-
-                    break
-                end
-
-                if not currentReason then
-                    launch.Cancelled = true
-                    stopHopPending("Hop condition cleared; scanning")
-                    break
-                end
-
-                if currentReason == "follow-timeout"
-                    and currentInCombatKnown
-                    and currentInCombat == true then
-
-                    launch.Cancelled = true
-                    stopHopPending("Combat started; PlayerFollowTime reset")
-                    break
-                end
-
-                if Runtime.SafeMode
-                    or Runtime.LocalDead
-                    or not currentInCombatKnown
-                    or currentInCombat ~= false then
-
-                    launch.Cancelled = true
-                    setStatus(Runtime.SafeMode
-                        and "SafeMode interrupted external hop download"
-                        or "Combat/respawn interrupted external hop download")
-                    break
-                end
-
-                task.wait(0.1)
-            end
-
-            if launch.Stage == "runtime-failed" then
-                setStatus("External server-hop script failed; reload to retry")
-                break
-            end
-
-            if launch.Stage == "download-timeout" then
-                warnOnce(
-                    "external-hop:download-timeout",
-                    tostring(launch.Error) .. "; retrying."
-                )
-                setStatus("External server-hop download timed out; retrying")
-                task.wait(INTERNAL.ServerRetryDelay)
-                continue
-            end
-
-            if launch.Executed then
-                setStatus("External server-hop script loaded (" .. tostring(launch.Reason) .. ")")
-                break
-            end
-
-            if launch.Finished
-                and not launch.Cancelled
-                and launch.Stage ~= "runtime-failed" then
-
-                warnOnce(
-                    "external-hop:" .. tostring(launch.Stage),
-                    "External server-hop script could not start: "
-                        .. tostring(launch.Error)
-                )
-                setStatus("External server-hop load failed; retrying")
-                task.wait(INTERNAL.ServerRetryDelay)
-            else
-                task.wait(0.1)
-            end
+            PublicHop.Tick(PublicHop.Snapshot())
+            task.wait(0.1)
         end
-
+        PublicHop.CancelSearch()
         Runtime.HopWorkerRunning = false
     end)
 end
+
 
 requestHop = function(reason, detail)
     if not Runtime.Running or not AutoHopEnabled then
@@ -7030,10 +6979,10 @@ function Runtime:Stop(reason)
 
     self.Running = false
 
-    if type(self.ExternalHopLaunch) == "table"
-        and not self.ExternalHopLaunch.Executed then
-
-        self.ExternalHopLaunch.Cancelled = true
+    PublicHop.CancelSearch()
+    if self.HopAttempt then
+        self.HopAttempt.Cancelled = true
+        self.HopAttempt = nil
     end
 
     self.HopPending = false
@@ -7113,6 +7062,7 @@ if not SavedAccountCheck.StillCurrent() then
 end
 
 createGUI()
+PublicHop.Initialize()
 SavedBounty.StartWorker()
 startBountyValueBinder()
 WinEntrance.StartWorker()
