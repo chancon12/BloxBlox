@@ -205,6 +205,7 @@ Combo = {
         GunOpenerEnabled = false,
         MaxTargetDistance = 5000,
         SafeModeType = "Above",
+        FPSBoost = false, -- true = enabled, false = disabled
 
         Hitbox = {
             Enabled = true,
