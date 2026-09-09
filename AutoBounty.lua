@@ -5,6 +5,7 @@
 -- ClickAttack, HitboxOffset, TweenHitbox, SafeZoneRadius, combo timings, panic movement,
 -- SeaHeightFirst, SeaHeightStallTimeout, GunOpenerEnabled, GunEngageDistance, MaxTargetDistance,
 -- Aimbot, TargetWeaponFilter, optional Config.Combo, and optional ReadSkillCooldown.
+-- Settings.FPSBoost defaults to true; false skips startup graphics changes and their 5-second wait.
 -- Settings.TargetWeaponFilter = {Enabled=true, Ignore={"Portal-Portal"}}; false disables it.
 -- Filters visible Tool names and equipped/unequipped weapon model WeaponName attributes.
 -- Low-health recovery keeps the selected target and freezes its no-damage countdown.
@@ -464,7 +465,7 @@ assert(
 
 -- The startup delay is measured from the start of the FPS boost, not its completion.
 local StartupFPSBoost = {Cancelled = false}
-do
+if Settings.FPSBoost ~= false then
     local resumeAt = os.clock() + INTERNAL.FPSBoostWait
     print("[AutoBounty][FPSBoost] Team confirmed; applying FPS boost")
     task.spawn(function()
@@ -532,6 +533,8 @@ do
         return
     end
     print("[AutoBounty][FPSBoost] Startup delay finished; continuing startup")
+else
+    print("[AutoBounty][FPSBoost] Disabled; continuing startup")
 end
 
 print("[AutoBounty] Waiting for DataLoaded marker and Data.Level")
