@@ -204,7 +204,7 @@ Combo = {
         ComboHold = 0, -- Release each key after the minimum input wait
         GunOpenerEnabled = false,
         MaxTargetDistance = 5000,
-        SafeModeType = "Entrance",
+        SafeModeType = "Above",
 
         Hitbox = {
             Enabled = true,
