@@ -6,6 +6,8 @@
 -- SeaHeightFirst, SeaHeightStallTimeout, GunOpenerEnabled, GunEngageDistance, MaxTargetDistance,
 -- Aimbot, TargetWeaponFilter, optional Config.Combo, and optional ReadSkillCooldown.
 -- Settings.FPSBoost defaults to true; false skips startup graphics changes and their 5-second wait.
+-- Settings.Region = "Singapore, America" accepts either reported region (case-insensitive substring).
+-- Region = "" or omitted allows any region. Filtered hops use __ServerBrowser region listings.
 -- Settings.TargetWeaponFilter = {Enabled=true, Ignore={"Portal-Portal"}}; false disables it.
 -- Filters visible Tool names and equipped/unequipped weapon model WeaponName attributes.
 -- Low-health recovery keeps the selected target and freezes its no-damage countdown.
@@ -74,14 +76,15 @@
 -- MaxTargetDistance defaults to 10000 studs (3D): direct targets first, then entrance routes.
 -- With FastTP enabled, new targets also use a closer entrance before chasing when over 300 studs away.
 -- Optional shortcuts are checked once per acquisition; failed shortcuts fall back to direct chasing.
--- Empty-target hops attempt an entrance first (5s timeout), then wait for known InCombat=false.
--- AutoHop uses current-PlaceId public servers, fullest first, excluding full/current/attempted JobIds.
+-- Empty-target hops rise continuously, lock target selection, and wait for known InCombat=false.
+-- AutoHop sorts each fetched server page by population, excluding full/current/attempted JobIds.
+-- Region-filtered browser buckets use the existing 1-second page spacing; join retries remain 0.1s.
 -- Joining uses ReplicatedStorage.__ServerBrowser:InvokeServer("teleport", JobId).
 -- There is no minimum player count. Retry another unused JobId every 0.1 seconds while still here.
 -- Public server-list refreshes and failed lookups retain their separate 5-second backoff.
 -- Attempted JobIds and transport locks survive same-server reloads; no external hop script is loaded.
--- Pending HTTP/teleport calls must return before another call of the same type can start.
--- Startup order: confirm team, start FPS boost, then continue setup 5 seconds after the boost starts.
+-- Pending server-list/teleport calls must return before another call of the same type can start.
+-- Startup order: confirm team, run enabled FPS boost, then continue setup 5 seconds after it starts.
 -- A longer FPS pass continues in the background without extending the startup delay.
 -- After 300 seconds in this script's server session, queue a hop when local InCombat is known false.
 -- This timeout respects AutoHop/recovery gates and survives same-server reloads.
@@ -115,6 +118,8 @@ assert(
 )
 
 local Settings = type(Config.Settings) == "table" and Config.Settings or {}
+assert(Settings.Region == nil or type(Settings.Region) == "string",
+    '[AutoBounty] Settings.Region must be a comma-separated string, or "" for any region')
 local WeaponConfig = type(Config.Weapon) == "table" and Config.Weapon or {}
 local HitboxConfig = type(Settings.Hitbox) == "table" and Settings.Hitbox or {}
 local TweenHitboxConfig = type(Settings.TweenHitbox) == "table" and Settings.TweenHitbox or {}
@@ -327,6 +332,7 @@ local INTERNAL = {
     PublicServerRetryDelay = 5,
     PublicServerPageDelay = 1,
     PublicServerRequestTimeout = 15,
+    ServerBrowserPages = 100,
     FPSBoostWait = 5,
     ServerTimeout = 300,
 }
@@ -6612,7 +6618,45 @@ local PublicHop = {
     Cursor = nil,
     SeenCursors = {},
     Finished = false,
+    BrowserPage = 1,
+    Regions = {},
+    RegionLabel = "",
+    RegionFiltered = false,
 }
+
+function PublicHop.ConfigureRegions(value)
+    assert(value == nil or type(value) == "string",
+        '[AutoBounty] Settings.Region must be a comma-separated string, or "" for any region')
+    local regions, labels, seen = {}, {}, {}
+    for part in string.gmatch(value or "", "[^,]+") do
+        local label = part:match("^%s*(.-)%s*$")
+        local name = string.lower(label)
+        if name ~= "" and not seen[name] then
+            seen[name] = true
+            table.insert(regions, name)
+            table.insert(labels, label)
+        end
+    end
+    PublicHop.Regions = regions
+    PublicHop.RegionLabel = table.concat(labels, ", ")
+    PublicHop.RegionFiltered = #regions > 0
+end
+
+function PublicHop.RegionMatches(region)
+    if not PublicHop.RegionFiltered then
+        return true
+    end
+    if type(region) ~= "string" then
+        return false
+    end
+    local name = string.lower(region)
+    for _, wanted in ipairs(PublicHop.Regions) do
+        if string.find(name, wanted, 1, true) then
+            return true
+        end
+    end
+    return false
+end
 
 local function stopHopPending(message)
     ServerTimeout.Pending = false
@@ -6736,11 +6780,13 @@ function PublicHop.CancelSearch()
     PublicHop.Cursor = nil
     PublicHop.SeenCursors = {}
     PublicHop.Finished = false
-    -- Actual yielding HTTP/teleport calls retain their shared locks until they return.
+    PublicHop.BrowserPage = 1
+    -- Actual yielding server-list/teleport calls retain their shared locks until they return.
     -- UsedJobs and retry timing also survive cancelled episodes and same-server reloads.
 end
 
 function PublicHop.Initialize()
+    PublicHop.ConfigureRegions(Settings.Region)
     local state = Environment.__AutoBountyPublicHopState
     if type(state) ~= "table"
         or state.PlaceId ~= PublicHop.PlaceId
@@ -6795,30 +6841,42 @@ end
 
 function PublicHop.BeginPage(context)
     local state = PublicHop.State
-    if Runtime.HopSearch or state.HttpCall or os.clock() < state.NextQueryAt
+    if Runtime.HopSearch or state.HttpCall or state.TeleportCall or os.clock() < state.NextQueryAt
         or not PublicHop.Validate(context) then
         return false
     end
 
-    local url = string.format(
-        "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Desc&excludeFullGames=true&limit=100",
-        tostring(PublicHop.PlaceId)
-    )
-    if PublicHop.Cursor then
-        url = url .. "&cursor=" .. HttpService:UrlEncode(PublicHop.Cursor)
+    local browserPage = PublicHop.RegionFiltered and PublicHop.BrowserPage or nil
+    local url
+    if browserPage then
+        if not PublicHop.GetBrowser() then
+            return false
+        end
+    else
+        url = string.format(
+            "https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Desc&excludeFullGames=true&limit=100",
+            tostring(PublicHop.PlaceId)
+        )
+        if PublicHop.Cursor then
+            url = url .. "&cursor=" .. HttpService:UrlEncode(PublicHop.Cursor)
+        end
     end
 
     local search = {
         Context = context,
         Cursor = PublicHop.Cursor,
+        BrowserPage = browserPage,
         StartedAt = os.clock(),
         Deadline = os.clock() + INTERNAL.PublicServerRequestTimeout,
         Cancelled = false,
         Returned = false,
     }
     Runtime.HopSearch = search
+    -- Share the existing lookup lock across HTTP and browser RPCs, including reloads.
     state.HttpCall = search
-    setStatus("Finding public servers with available slots")
+    setStatus(browserPage and string.format("Finding regions: %s (%d/%d)",
+        PublicHop.RegionLabel, browserPage, INTERNAL.ServerBrowserPages)
+        or "Finding public servers with available slots")
 
     task.spawn(function()
         if search.Cancelled or Runtime.HopSearch ~= search or not PublicHop.Validate(context) then
@@ -6834,6 +6892,13 @@ function PublicHop.BeginPage(context)
         search.Deadline = search.StartedAt + INTERNAL.PublicServerRequestTimeout
         state.NextQueryAt = search.StartedAt + INTERNAL.PublicServerPageDelay
         local ok, response = pcall(function()
+            if search.BrowserPage then
+                local browser = PublicHop.GetBrowser()
+                if not browser then
+                    error("__ServerBrowser is unavailable for region lookup")
+                end
+                return browser:InvokeServer(search.BrowserPage)
+            end
             return game:HttpGet(url)
         end)
 
@@ -6878,7 +6943,27 @@ function PublicHop.AcceptPage(search)
     end
 
     local ok, page = pcall(function()
-        return HttpService:JSONDecode(search.Response)
+        if not search.BrowserPage then
+            return HttpService:JSONDecode(search.Response)
+        end
+        if type(search.Response) ~= "table" then
+            error("invalid region server-list response")
+        end
+        local capacity = Players.MaxPlayers
+        if not isFiniteNumber(capacity) or capacity <= 0 or capacity % 1 ~= 0 then
+            error("server capacity is unavailable")
+        end
+        local records = {}
+        -- Browser responses are dictionaries keyed by JobId; Job is added only by its UI.
+        for jobId, server in pairs(search.Response) do
+            if type(jobId) == "string" and type(server) == "table"
+                and PublicHop.RegionMatches(server.Region) then
+
+                table.insert(records, {id = jobId, playing = tonumber(server.Count),
+                    maxPlayers = capacity, region = server.Region})
+            end
+        end
+        return {data = records}
     end)
     if not ok or type(page) ~= "table" or type(page.data) ~= "table" then
         PublicHop.PageFailed("invalid server-list response")
@@ -6900,6 +6985,7 @@ function PublicHop.AcceptPage(search)
         if type(server) == "table"
             and type(server.id) == "string"
             and server.id ~= ""
+            and PublicHop.RegionMatches(server.region)
             and not PublicHop.State.UsedJobs[server.id]
             and not seenJobs[server.id]
             and isFiniteNumber(server.playing)
@@ -6914,6 +7000,7 @@ function PublicHop.AcceptPage(search)
                 JobId = server.id,
                 Playing = server.playing,
                 MaxPlayers = server.maxPlayers,
+                Region = server.region,
             })
         end
     end
@@ -6927,10 +7014,16 @@ function PublicHop.AcceptPage(search)
     Runtime.HopSearch = nil
     PublicHop.Servers = servers
     PublicHop.Cursor = cursor
-    PublicHop.Finished = cursor == nil
+    if search.BrowserPage then
+        -- Empty buckets are valid; the browser reads all 100, not just until the first empty one.
+        PublicHop.BrowserPage = search.BrowserPage + 1
+        PublicHop.Finished = search.BrowserPage >= INTERNAL.ServerBrowserPages
+    else
+        PublicHop.Finished = cursor == nil
+    end
     if cursor then
         PublicHop.SeenCursors[cursor] = true
-    else
+    elseif PublicHop.Finished then
         PublicHop.State.NextQueryAt = math.max(PublicHop.State.NextQueryAt,
             os.clock() + INTERNAL.PublicServerRetryDelay)
     end
@@ -6951,7 +7044,7 @@ end
 
 function PublicHop.Dispatch(server, context)
     local state = PublicHop.State
-    if state.TeleportCall or state.UsedJobs[server.JobId]
+    if state.TeleportCall or state.UsedJobs[server.JobId] or not PublicHop.RegionMatches(server.Region)
         or os.clock() < state.NextAttemptAt or not PublicHop.Validate(context) then
         return false
     end
@@ -6965,7 +7058,8 @@ function PublicHop.Dispatch(server, context)
 
     task.spawn(function()
         if attempt.Cancelled or Runtime.HopAttempt ~= attempt
-            or state.UsedJobs[attempt.JobId] or not PublicHop.Validate(context) then
+            or state.UsedJobs[attempt.JobId] or not PublicHop.RegionMatches(server.Region)
+            or not PublicHop.Validate(context) then
 
             attempt.Cancelled = true
             attempt.Returned = true
@@ -6993,8 +7087,9 @@ function PublicHop.Dispatch(server, context)
         state.NextAttemptAt = attempt.StartedAt + INTERNAL.ServerRetryDelay
         Runtime.Teleporting = true
         Runtime.Mode = "HOPPING"
-        print(string.format("[AutoBounty][ServerHop] Trying via __ServerBrowser | PlaceId=%s | JobId=%s | Players=%d/%d",
-            tostring(PublicHop.PlaceId), attempt.JobId, server.Playing, server.MaxPlayers))
+        print(string.format("[AutoBounty][ServerHop] Trying via __ServerBrowser | PlaceId=%s | JobId=%s | Players=%d/%d | Region=%s",
+            tostring(PublicHop.PlaceId), attempt.JobId, server.Playing, server.MaxPlayers,
+            tostring(server.Region or "Any")))
         setStatus(string.format("Joining server (%d/%d); retry in 0.1 seconds if still here",
             server.Playing, server.MaxPlayers))
 
@@ -7079,7 +7174,10 @@ function PublicHop.Tick(context)
         PublicHop.Cursor = nil
         PublicHop.SeenCursors = {}
         PublicHop.Finished = false
-        setStatus("No untried servers in this list; refreshing every 5 seconds")
+        PublicHop.BrowserPage = 1
+        setStatus(PublicHop.RegionFiltered
+            and ("No untried matching servers for " .. PublicHop.RegionLabel .. "; refreshing in 5 seconds")
+            or "No untried servers in this list; refreshing every 5 seconds")
     end
     if state.HttpCall then
         setStatus("Server lookup still pending; waiting for the request to return")
