@@ -206,7 +206,7 @@ Combo = {
         MaxTargetDistance = 5000,
         SafeModeType = "Above",
         FPSBoost = false, -- true = enabled, false = disabled
-        Region = "Singapore", -- "" = any region
+        Region = "", -- "" = any region
         ServerHopMode = "Random",
 
         Hitbox = {
