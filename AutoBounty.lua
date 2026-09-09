@@ -46,6 +46,10 @@
 -- SafeModeY is the height above the target, refreshed every Heartbeat during recovery.
 -- If the target is lost, hold the last height; without a target, rise above your entry height.
 -- Combo order follows Weapon.Order and each weapon's SkillOrder (default Z, X, C, V, F).
+-- Default passes (including custom-combo follow-ups) cycle skills even on cooldown.
+-- Default Hold=0 presses last one Heartbeat; positive Hold/ComboHold lasts its configured duration.
+-- Default passes ignore ComboDelay and ComboRetryDelay, then advance to the next enabled skill.
+-- Custom combo presses retain their configured holds, delays, cooldown checks, and retry limits.
 -- ComboDelay defaults to 0.03 seconds, replacing weapon Delay between casts.
 -- Optional ComboHold overrides every skill Hold; omit it to keep per-skill holds.
 -- ComboRetryDelay defaults to 1 second when cooldown activation cannot be confirmed.
@@ -4486,7 +4490,7 @@ local function resolveTool(category, categoryConfig)
     return nil
 end
 
-local function waitWhileAttackable(duration, targetEpoch, attackMode)
+local function waitWhileAttackable(duration, targetEpoch, attackMode, stillValid)
     local deadline = os.clock() + math.max(tonumber(duration) or 0, 0)
     local yielded = false
 
@@ -4494,7 +4498,7 @@ local function waitWhileAttackable(duration, targetEpoch, attackMode)
         task.wait()
         yielded = true
 
-        if not canAttack(targetEpoch, attackMode) then
+        if not canAttack(targetEpoch, attackMode) or (stillValid and not stillValid()) then
             return false
         end
     until os.clock() >= deadline and yielded
@@ -4698,6 +4702,102 @@ end
 function CombatActions.MarkAttempt(entry)
     local attempt = CombatActions.ObserveCooldown(entry.Tool, entry.Key, entry.Cooling)
     attempt.NextAttemptAt = os.clock() + getComboNumberSetting("ComboRetryDelay", 1)
+end
+
+function CombatActions.DefaultEntryValid(entry)
+    return entry.ComboConfig == nil
+        and WeaponConfig[entry.Category] == entry.CategoryConfig
+        and entry.CategoryConfig.Enabled == true
+        and type(entry.CategoryConfig.Skills) == "table"
+        and entry.CategoryConfig.Skills[entry.Key] == entry.Config
+        and entry.Config.Enabled == true
+        and CombatActions.IsOwnedTool(entry.Tool)
+        and resolveTool(entry.Category, entry.CategoryConfig) == entry.Tool
+end
+
+function CombatActions.EquipDefaultTool(entry, targetEpoch, characterEpoch)
+    if Runtime.CharacterEpoch ~= characterEpoch or not canAttack(targetEpoch)
+        or not CombatActions.DefaultEntryValid(entry) then
+        return false
+    end
+
+    local character = Runtime.Character
+    local humanoid = Runtime.Humanoid
+    local tool = entry.Tool
+    if tool.Parent ~= character then
+        local ok, err = pcall(function()
+            humanoid:UnequipTools()
+            humanoid:EquipTool(tool)
+        end)
+        if not ok then
+            warnOnce("weapon:default-equip:" .. tool.Name,
+                "Default skill equip failed for " .. tool.Name .. ": " .. tostring(err))
+            return false
+        end
+    end
+
+    -- Never wait for equip readiness or press a key for a different equipped tool.
+    if Runtime.CharacterEpoch ~= characterEpoch or Runtime.Character ~= character
+        or not canAttack(targetEpoch) or tool.Parent ~= character
+        or not CombatActions.DefaultEntryValid(entry) then
+        return false
+    end
+    Runtime.CurrentTool = tool
+    return true
+end
+
+function CombatActions.CastDefaultSkill(entry, targetEpoch, characterEpoch)
+    if Runtime.CharacterEpoch ~= characterEpoch or not canAttack(targetEpoch)
+        or not CombatActions.DefaultEntryValid(entry)
+        or entry.Tool.Parent ~= Runtime.Character or Runtime.CurrentTool ~= entry.Tool then
+        return false
+    end
+
+    local holdTime = getComboNumberSetting("ComboHold", nil)
+    if holdTime == nil then
+        local configuredHold = tonumber(entry.Config.Hold)
+        holdTime = isFiniteNumber(configuredHold) and math.max(configuredHold, 0) or 0
+    end
+
+    Runtime.AttackBusy = true
+    Runtime.GunAimActive = false
+    Runtime.AimActive = SkillAimbotEnabled
+    if Runtime.AimActive then
+        Runtime.AimPosition = Runtime.CurrentTargetInfo.Root.Position
+        faceCameraTowardTarget()
+    end
+
+    if not pressKeyDown(entry.Key) then
+        Runtime.AttackBusy = false
+        Runtime.AimActive = false
+        return false
+    end
+    print(string.format(
+        "[AutoBounty][Combo] KeyDown | Mode=DefaultSpam | Weapon=%s | Key=%s | Hold=%s | Target=%s",
+        entry.Tool.Name, entry.Key, holdTime > 0 and string.format("%.2fs", holdTime) or "1 Heartbeat",
+        tostring(Runtime.CurrentTarget and Runtime.CurrentTarget.Name or "None")))
+
+    -- A single worker owns the key until its hold ends; zero means one Heartbeat.
+    local ok, err = pcall(function()
+        if holdTime > 0 then
+            return waitWhileAttackable(holdTime, targetEpoch, nil, function()
+                return Runtime.CharacterEpoch == characterEpoch
+                    and entry.Tool.Parent == Runtime.Character
+                    and Runtime.CurrentTool == entry.Tool
+                    and CombatActions.DefaultEntryValid(entry)
+            end)
+        end
+        RunService.Heartbeat:Wait()
+        return true
+    end)
+    releaseKey(entry.Key)
+    Runtime.AttackBusy = false
+    Runtime.AimActive = false
+    Runtime.GunAimActive = false
+    if not ok then
+        warnOnce("skill:default-heartbeat", "Default skill wait failed: " .. tostring(err))
+    end
+    return ok
 end
 
 function CombatActions.GetComboConfig()
@@ -5048,7 +5148,7 @@ function CombatActions.NoAttemptableSkills(entries)
     end
 
     for _, entry in ipairs(entries) do
-        -- Use the same live cooldown and per-key retry check as skill selection.
+        -- Blade fallback still checks cooldowns/retries while default key cycling ignores them.
         if CombatActions.CanAttempt(entry) then
             return false
         end
@@ -5057,13 +5157,14 @@ function CombatActions.NoAttemptableSkills(entries)
     return true
 end
 
-function CombatActions.SelectSkill(entries, cursor)
+function CombatActions.SelectSkill(entries, cursor, ignoreCooldown)
     -- A pass advances only forward. Ready and unknown skills share the same
     -- order, so one ready skill cannot repeatedly jump ahead of later skills.
     for index = cursor, #entries do
         local entry = entries[index]
 
-        if CombatActions.CanAttempt(entry) then
+        if (ignoreCooldown and CombatActions.DefaultEntryValid(entry))
+            or (not ignoreCooldown and CombatActions.CanAttempt(entry)) then
             return entry, index
         end
     end
@@ -5507,6 +5608,7 @@ local function startWeaponWorker()
                 end
 
                 local passCombo = selectedCombo()
+                local defaultPass = passCombo == nil
 
                 if comboEntries and comboEntries[1]
                     and comboEntries[1].ComboConfig ~= passCombo then
@@ -5522,8 +5624,14 @@ local function startWeaponWorker()
                 local customBlocked = passCombo ~= nil and #comboEntries == 0
                 CombatActions.UpdateComboGUI(passCombo, customBlocked and "Blocked"
                     or (followupCombo and "Default skills (follow-up)" or nil))
-                local entry, entryIndex = CombatActions.SelectSkill(comboEntries, skillCursor)
+                local entry, entryIndex = CombatActions.SelectSkill(comboEntries, skillCursor, defaultPass)
                 local castCompleted = false
+
+                if not entry and defaultPass and not followupCombo then
+                    -- Restart a default-only cycle on this same Heartbeat, without a boundary pause.
+                    comboEntries = CombatActions.GetSkills(combatWeaponOrder, true)
+                    entry, entryIndex = CombatActions.SelectSkill(comboEntries, 1, true)
+                end
 
                 skillCursor = entryIndex + 1
 
@@ -5534,6 +5642,30 @@ local function startWeaponWorker()
 
                         comboEntries = nil
                         skillCursor = 1
+                    elseif defaultPass then
+                        if CombatActions.EquipDefaultTool(entry, targetEpoch, comboCharacterEpoch) then
+                            if customCombo ~= CombatActions.GetActiveComboConfig()
+                                or selectedCombo() ~= nil then
+
+                                comboEntries = nil
+                                skillCursor = 1
+                            else
+                                -- Keep blade clicks available without a separate yielding weapon switch.
+                                if ClickAttackEnabled and (entry.Category == "Melee" or entry.Category == "Sword")
+                                    and os.clock() >= CombatActions.NextNormalAttackAt
+                                    and CombatActions.NoAttemptableSkills(CombatActions.GetClickSkills(combatWeaponOrder)) then
+
+                                    CombatActions.NormalAttack(targetEpoch)
+                                end
+
+                                if customCombo == CombatActions.GetActiveComboConfig() and selectedCombo() == nil then
+                                    castCompleted = CombatActions.CastDefaultSkill(entry, targetEpoch, comboCharacterEpoch)
+                                else
+                                    comboEntries = nil
+                                    skillCursor = 1
+                                end
+                            end
+                        end
                     elseif equipTool(entry.Tool, targetEpoch, attackMode)
                         and canAttack(targetEpoch, attackMode)
                         and Runtime.CharacterEpoch == comboCharacterEpoch
@@ -5587,7 +5719,7 @@ local function startWeaponWorker()
                     comboEntries = nil
                     local latestEntries = CombatActions.GetClickSkills(combatWeaponOrder)
 
-                    if ClickAttackEnabled and CombatActions.NoAttemptableSkills(latestEntries)
+                    if not defaultPass and ClickAttackEnabled and CombatActions.NoAttemptableSkills(latestEntries)
                         and os.clock() >= CombatActions.NextNormalAttackAt then
 
                         local tool = CombatActions.GetNormalTool(combatWeaponOrder)
@@ -5613,10 +5745,14 @@ local function startWeaponWorker()
                 Runtime.AimActive = false
                 Runtime.GunAimActive = false
 
-                -- Successful casts already yield during Hold/ComboDelay. Cooling
-                -- skills are skipped together without sleeping for each key.
+                -- A default attempt already waits for its hold. Even an empty/invalid
+                -- default pass must yield; custom passes retain their previous timing.
                 if not castCompleted then
-                    task.wait(customBlocked and 0.1 or 0.01)
+                    if defaultPass then
+                        RunService.Heartbeat:Wait()
+                    else
+                        task.wait(customBlocked and 0.1 or 0.01)
+                    end
                 end
             end
         end
