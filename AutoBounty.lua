@@ -316,7 +316,7 @@ end
 local INTERNAL = {
     MaxLevelDifference = 700,
     TargetRefreshInterval = 0.25,
-    EmptyListGrace = 5,
+    EmptyListGrace = 0,
     PendingTargetGrace = 8,
     FriendRefreshInterval = 2,
     NonFriendCacheTTL = 300,
