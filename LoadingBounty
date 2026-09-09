@@ -203,7 +203,7 @@ Combo = {
         ComboDelay = 0, -- No extra delay between skills
         ComboHold = 0, -- Release each key after the minimum input wait
         GunOpenerEnabled = false,
-        MaxTargetDistance = 5000,
+        MaxTargetDistance = 10000,
         SafeModeType = "Above",
         FPSBoost = false, -- true = enabled, false = disabled
         Region = "", -- "" = any region
