@@ -208,6 +208,8 @@ Combo = {
         FPSBoost = false, -- true = enabled, false = disabled
         Region = "", -- "" = any region
         ServerHopMode = "Random",
+        DefaultSkillPressTime = 0.1,
+        EmptyListGrace = 0,
 
         Hitbox = {
             Enabled = true,
