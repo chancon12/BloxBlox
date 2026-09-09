@@ -41,6 +41,8 @@
 -- For a zone inside a Model, use the nearest ancestor Model's valid PrimaryPart when available.
 -- SafeModePanicEnabled defaults to true; SafeModePanicRadius defaults to 200 studs.
 -- Settings.SafeModeType = "Above" (default) or "Entrance".
+-- Settings.SafeModeTweenSpeed sets Above recovery movement speed in studs per second, including X/Z panic movement.
+-- It defaults to TweenSpeed; invalid/nonpositive values also fall back to TweenSpeed.
 -- Entrance: request the nearest local entrance, hold the landing point until configured MaxHealth,
 -- then select the nearest eligible target afresh. Low health does not mark the old target previous.
 -- SafeModeY is the height above the target, refreshed every Heartbeat during recovery.
@@ -239,6 +241,14 @@ if not isFiniteNumber(TweenSpeed) or TweenSpeed <= 0 then
     TweenSpeed = 180
 end
 
+local SafeModeTweenSpeed = Settings.SafeModeTweenSpeed == nil
+    and TweenSpeed or tonumber(Settings.SafeModeTweenSpeed)
+
+if not isFiniteNumber(SafeModeTweenSpeed) or SafeModeTweenSpeed <= 0 then
+    warn("[AutoBounty] SafeModeTweenSpeed must be a finite number above 0; using TweenSpeed.")
+    SafeModeTweenSpeed = TweenSpeed
+end
+
 if SafeModeType ~= "Above" and SafeModeType ~= "Entrance" then
     warn('[AutoBounty] SafeModeType must be "Above" or "Entrance"; using "Above".')
     SafeModeType = "Above"
@@ -314,9 +324,9 @@ elseif ConfiguredHitboxTransparency < 0 or ConfiguredHitboxTransparency > 1 then
 end
 
 local INTERNAL = {
-    MaxLevelDifference = 700,
+    MaxLevelDifference = 800,
     TargetRefreshInterval = 0.25,
-    EmptyListGrace = 0,
+    EmptyListGrace = 5,
     PendingTargetGrace = 8,
     FriendRefreshInterval = 2,
     NonFriendCacheTTL = 300,
@@ -738,6 +748,7 @@ local Runtime = {
     AttackEnabled = AttackEnabled,
     AutoHopEnabled = AutoHopEnabled,
     SafeModeY = SafeModeY,
+    SafeModeTweenSpeed = SafeModeTweenSpeed,
     SafeModeType = SafeModeType,
     NoClipEnabled = NoClipEnabled,
     BodyClip = nil,
@@ -3569,7 +3580,7 @@ local function getTargetTweenTimeMultiplier(localRoot, targetRoot)
     return 1
 end
 
-local function AutoTween(goalCFrame, deltaTime, insideHitbox, timeMultiplier)
+local function AutoTween(goalCFrame, deltaTime, insideHitbox, timeMultiplier, speedOverride)
     stopSeaHeightMovement()
     local root = Runtime.Root
 
@@ -3585,9 +3596,10 @@ local function AutoTween(goalCFrame, deltaTime, insideHitbox, timeMultiplier)
     end
 
     local distance = (safeGoalCFrame.Position - currentCFrame.Position).Magnitude
+    local baseSpeed = speedOverride or TweenSpeed
     local speed = insideHitbox
-        and TweenSpeed * INTERNAL.InHitboxSpeedMultiplier
-        or TweenSpeed
+        and baseSpeed * INTERNAL.InHitboxSpeedMultiplier
+        or baseSpeed
 
     if speed <= 0 then
         return
@@ -3913,7 +3925,7 @@ local function updateSafeModeMovement(deltaTime)
 
     local safeGoal = getSafeModeMovementGoal(root)
 
-    AutoTween(safeGoal, deltaTime, false)
+    AutoTween(safeGoal, deltaTime, false, nil, SafeModeTweenSpeed)
     Runtime.SafeModeMovement.Tween = Runtime.ActiveTween
 
     if not Runtime.Running
