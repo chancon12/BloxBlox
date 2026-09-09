@@ -314,7 +314,7 @@ elseif ConfiguredHitboxTransparency < 0 or ConfiguredHitboxTransparency > 1 then
 end
 
 local INTERNAL = {
-    MaxLevelDifference = 800,
+    MaxLevelDifference = 700,
     TargetRefreshInterval = 0.25,
     EmptyListGrace = 5,
     PendingTargetGrace = 8,
