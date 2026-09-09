@@ -47,7 +47,8 @@
 -- If the target is lost, hold the last height; without a target, rise above your entry height.
 -- Combo order follows Weapon.Order and each weapon's SkillOrder (default Z, X, C, V, F).
 -- Default passes (including custom-combo follow-ups) cycle skills even on cooldown.
--- Default Hold=0 presses last one Heartbeat; positive Hold/ComboHold lasts its configured duration.
+-- Default Hold=0 uses Settings.DefaultSkillPressTime (default 0.1 seconds; 0 = one Heartbeat).
+-- Positive Hold/ComboHold lasts its configured duration; invalid/negative press times use 0.1.
 -- Default passes ignore ComboDelay and ComboRetryDelay, then advance to the next enabled skill.
 -- Custom combo presses retain their configured holds, delays, cooldown checks, and retry limits.
 -- ComboDelay defaults to 0.03 seconds, replacing weapon Delay between casts.
@@ -4758,6 +4759,9 @@ function CombatActions.CastDefaultSkill(entry, targetEpoch, characterEpoch)
         local configuredHold = tonumber(entry.Config.Hold)
         holdTime = isFiniteNumber(configuredHold) and math.max(configuredHold, 0) or 0
     end
+    if holdTime == 0 then
+        holdTime = getComboNumberSetting("DefaultSkillPressTime", 0.1)
+    end
 
     Runtime.AttackBusy = true
     Runtime.GunAimActive = false
@@ -4774,28 +4778,28 @@ function CombatActions.CastDefaultSkill(entry, targetEpoch, characterEpoch)
     end
     print(string.format(
         "[AutoBounty][Combo] KeyDown | Mode=DefaultSpam | Weapon=%s | Key=%s | Hold=%s | Target=%s",
-        entry.Tool.Name, entry.Key, holdTime > 0 and string.format("%.2fs", holdTime) or "1 Heartbeat",
+        entry.Tool.Name, entry.Key, holdTime == 0 and "1 Heartbeat" or string.format("%.2fs", holdTime),
         tostring(Runtime.CurrentTarget and Runtime.CurrentTarget.Name or "None")))
 
-    -- A single worker owns the key until its hold ends; zero means one Heartbeat.
+    -- A single worker owns the key for one Heartbeat or the resolved duration.
     local ok, err = pcall(function()
-        if holdTime > 0 then
-            return waitWhileAttackable(holdTime, targetEpoch, nil, function()
-                return Runtime.CharacterEpoch == characterEpoch
-                    and entry.Tool.Parent == Runtime.Character
-                    and Runtime.CurrentTool == entry.Tool
-                    and CombatActions.DefaultEntryValid(entry)
-            end)
+        if holdTime == 0 then
+            RunService.Heartbeat:Wait()
+            return true
         end
-        RunService.Heartbeat:Wait()
-        return true
+        return waitWhileAttackable(holdTime, targetEpoch, nil, function()
+            return Runtime.CharacterEpoch == characterEpoch
+                and entry.Tool.Parent == Runtime.Character
+                and Runtime.CurrentTool == entry.Tool
+                and CombatActions.DefaultEntryValid(entry)
+        end)
     end)
     releaseKey(entry.Key)
     Runtime.AttackBusy = false
     Runtime.AimActive = false
     Runtime.GunAimActive = false
     if not ok then
-        warnOnce("skill:default-heartbeat", "Default skill wait failed: " .. tostring(err))
+        warnOnce("skill:default-press", "Default skill wait failed: " .. tostring(err))
     end
     return ok
 end
@@ -5628,7 +5632,7 @@ local function startWeaponWorker()
                 local castCompleted = false
 
                 if not entry and defaultPass and not followupCombo then
-                    -- Restart a default-only cycle on this same Heartbeat, without a boundary pause.
+                    -- Restart a default-only cycle immediately, without a boundary pause.
                     comboEntries = CombatActions.GetSkills(combatWeaponOrder, true)
                     entry, entryIndex = CombatActions.SelectSkill(comboEntries, 1, true)
                 end
