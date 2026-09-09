@@ -30,10 +30,15 @@
 -- ClickAttack also pauses while the local player's health is below 20% of MaxHealth.
 -- HitboxOffset defaults to Vector3.new(0, 0, 0), relative to the target's CFrame:
 -- +X right, +Y up, -Z front, +Z behind. Positions stay inside the hitbox and above sea level.
--- Empty targets during combat: request the nearest entrance once per wait/character, then wait to hop.
+-- Empty-target hop: rise continuously at TweenSpeed with fixed X/Z until the server hop.
+-- SafeModeY does not cap this ascent; each update puts the goal above the current height.
+-- Once ascent starts, new targets cannot cancel the hop; the commitment survives recovery/respawn.
 -- SafeZoneRadius defaults to 100 studs from each zone part's center (3D distance).
 -- For a zone inside a Model, use the nearest ancestor Model's valid PrimaryPart when available.
 -- SafeModePanicEnabled defaults to true; SafeModePanicRadius defaults to 200 studs.
+-- Settings.SafeModeType = "Above" (default) or "Entrance".
+-- Entrance: request the nearest local entrance, hold the landing point until configured MaxHealth,
+-- then select the nearest eligible target afresh. Low health does not mark the old target previous.
 -- SafeModeY is the height above the target, refreshed every Heartbeat during recovery.
 -- If the target is lost, hold the last height; without a target, rise above your entry height.
 -- Combo order follows Weapon.Order and each weapon's SkillOrder (default Z, X, C, V, F).
@@ -147,6 +152,7 @@ local RawTweenSpeed = Settings.TweenSpeed
 local TweenSpeed = RawTweenSpeed == nil and 180 or tonumber(RawTweenSpeed)
 local RawSafeModeY = Settings.SafeModeY
 local SafeModeY = RawSafeModeY == nil and 1000 or tonumber(RawSafeModeY)
+local SafeModeType = Settings.SafeModeType == nil and "Above" or Settings.SafeModeType
 local SafeModePanicEnabled = Settings.SafeModePanicEnabled ~= false
 local SafeModePanicRadius = Settings.SafeModePanicRadius == nil
     and 200 or tonumber(Settings.SafeModePanicRadius)
@@ -216,6 +222,11 @@ end
 if not isFiniteNumber(TweenSpeed) or TweenSpeed <= 0 then
     warn("[AutoBounty] TweenSpeed must be a finite number above 0; using 180 studs per second.")
     TweenSpeed = 180
+end
+
+if SafeModeType ~= "Above" and SafeModeType ~= "Entrance" then
+    warn('[AutoBounty] SafeModeType must be "Above" or "Entrance"; using "Above".')
+    SafeModeType = "Above"
 end
 
 if not isFiniteNumber(SafeModeY) or SafeModeY <= 0 then
@@ -308,8 +319,9 @@ local INTERNAL = {
     FastTPCooldown = 2,
     FastTPMinimumDistance = 300,
     FastTPArrivalTolerance = 100,
-    EmptyHopEntranceTimeout = 5,
     WinEntranceTimeout = 5,
+    SafeModeEntranceTimeout = 5,
+    SafeModeEntranceRetryDelay = 5,
     ServerRetryDelay = 0.1,
     PublicServerRetryDelay = 5,
     PublicServerPageDelay = 1,
@@ -673,12 +685,14 @@ local Runtime = {
     SafeModeAtAltitude = false,
     SafeModeMovement = nil,
     SafeModeReference = nil,
+    SafeModeEntrance = nil,
     LocalDead = true,
     Teleporting = false,
     EntranceBusy = false,
     LastEntranceAt = 0,
     HopPending = false,
-    EmptyCombatEntranceAttempt = nil,
+    EmptyHopCommitted = false,
+    EmptyHopMovement = nil,
     HopReason = nil,
     FollowTimeoutHopDetail = nil,
     HopWorkerRunning = false,
@@ -706,6 +720,7 @@ local Runtime = {
     AttackEnabled = AttackEnabled,
     AutoHopEnabled = AutoHopEnabled,
     SafeModeY = SafeModeY,
+    SafeModeType = SafeModeType,
     NoClipEnabled = NoClipEnabled,
     BodyClip = nil,
     BodyClipRoot = nil,
@@ -2398,7 +2413,27 @@ local function stopSeaHeightMovement()
     end
 end
 
+local function stopEmptyHopMovement()
+    local movement = Runtime.EmptyHopMovement
+    Runtime.EmptyHopMovement = nil
+    if movement and movement.Tween then
+        movement.Tween:Cancel()
+        if Runtime.ActiveTween == movement.Tween then
+            Runtime.ActiveTween = nil
+        end
+    end
+end
+
 local function stopSafeModeMovement()
+    local entrance = Runtime.SafeModeEntrance
+    Runtime.SafeModeEntrance = nil
+    if entrance then
+        entrance.Cancelled = true
+        if entrance.Request then
+            entrance.Request.Cancelled = true
+        end
+    end
+
     local movement = Runtime.SafeModeMovement
     Runtime.SafeModeMovement = nil
 
@@ -2421,6 +2456,10 @@ local function stopSafeModeMovement()
 end
 
 local function resetTargetTimers()
+    if not Runtime.Running or Runtime.LocalDead or not Runtime.HopPending then
+        stopEmptyHopMovement()
+    end
+
     -- Hop requests may clear targets while recovery continues; keep its center.
     if not Runtime.Running or not Runtime.SafeMode then
         stopSafeModeMovement()
@@ -2740,6 +2779,120 @@ local function nearestEntrance(targetPosition)
     return selected, selectedDistance
 end
 
+local SafeEntrance = {}
+
+function SafeEntrance.IsCurrent(attempt)
+    return Runtime.Running and bootstrapStillCurrent()
+        and Environment.__AutoBountyRuntime == Runtime
+        and Runtime.SafeMode and SafeModeType == "Entrance" and not Runtime.LocalDead
+        and Runtime.SafeModeEntrance == attempt and not attempt.Cancelled
+        and Runtime.SafeEpoch == attempt.SafeEpoch
+        and Runtime.CharacterEpoch == attempt.CharacterEpoch
+        and Runtime.Character == attempt.Character
+        and LocalPlayer.Character == attempt.Character
+        and attempt.Character ~= nil and attempt.Character.Parent ~= nil
+        and Runtime.Root == attempt.Root and attempt.Root ~= nil
+        and attempt.Root.Parent ~= nil and attempt.Root:IsDescendantOf(attempt.Character)
+        and isFiniteVector3(attempt.Root.Position)
+        and Runtime.Humanoid == attempt.Humanoid and attempt.Humanoid ~= nil
+        and attempt.Humanoid.Parent == attempt.Character and attempt.Humanoid.Health > 0
+end
+
+function SafeEntrance.Hold(attempt)
+    if not SafeEntrance.IsCurrent(attempt) or not attempt.HoldCFrame then
+        return false
+    end
+    local root = attempt.Root
+    root.CFrame = attempt.HoldCFrame
+    root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+    root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+    local status = attempt.Entrance
+        and "SafeMode: holding at entrance until MaxHealth"
+        or "SafeMode: no entrance available; holding here until MaxHealth"
+    if Runtime.Status ~= status then
+        setStatus(status)
+    end
+    return true
+end
+
+function SafeEntrance.Update(root)
+    local attempt = Runtime.SafeModeEntrance
+    if not attempt or not SafeEntrance.IsCurrent(attempt) then
+        if attempt then
+            stopSafeModeMovement()
+        end
+        attempt = {
+            Character = Runtime.Character,
+            Humanoid = Runtime.Humanoid,
+            Root = root,
+            SafeEpoch = Runtime.SafeEpoch,
+            CharacterEpoch = Runtime.CharacterEpoch,
+            Entrance = nearestEntrance(root.Position),
+            NextRetryAt = 0,
+        }
+        Runtime.SafeModeEntrance = attempt
+        if not SafeEntrance.IsCurrent(attempt) then
+            return false
+        end
+        if not attempt.Entrance then
+            attempt.HoldCFrame = clampCFrameAboveSea(root.CFrame)
+        end
+    end
+
+    if attempt.HoldCFrame then
+        return SafeEntrance.Hold(attempt)
+    end
+    if not attempt.Entrance then
+        setStatus("SafeMode: waiting for a valid recovery position")
+        return false
+    end
+
+    local now = os.clock()
+    local request = attempt.Request
+    if request then
+        if request.Started
+            and (not request.StartedNearEntrance or (request.Returned and request.Success))
+            and (root.Position - attempt.Entrance).Magnitude <= INTERNAL.FastTPArrivalTolerance then
+
+            attempt.HoldCFrame = clampCFrameAboveSea(root.CFrame)
+            if attempt.HoldCFrame then
+                request.Cancelled = true
+                return SafeEntrance.Hold(attempt)
+            end
+        end
+
+        if now >= request.Deadline or (request.Returned and request.Success == false) then
+            request.Cancelled = true
+            attempt.Request = nil
+            attempt.NextRetryAt = now + INTERNAL.SafeModeEntranceRetryDelay
+            setStatus("SafeMode: entrance unavailable or timed out; retrying in 5 seconds")
+        end
+        return true
+    end
+    if now < attempt.NextRetryAt then
+        return true
+    end
+
+    request = {Deadline = now + INTERNAL.SafeModeEntranceTimeout, Started = false, Returned = false}
+    attempt.Request = request
+    setStatus("SafeMode: requesting nearest entrance")
+    task.spawn(function()
+        local success = invokeEntrance(attempt.Entrance, "SafeMode", nil, function()
+            return SafeEntrance.IsCurrent(attempt)
+                and attempt.Request == request and not request.Cancelled
+                and os.clock() < request.Deadline
+        end, function()
+            request.StartedNearEntrance = (root.Position - attempt.Entrance).Magnitude
+                <= INTERNAL.FastTPArrivalTolerance
+            request.Started = true
+        end)
+        request.Returned = true
+        request.Success = success
+        -- Only the current recovery update may capture a landing point or schedule another request.
+    end)
+    return true
+end
+
 function WinEntrance.IsCurrent(attempt)
     return Runtime.Running and bootstrapStillCurrent()
         and Environment.__AutoBountyRuntime == Runtime
@@ -2784,6 +2937,7 @@ end
 function WinEntrance.OnIncrease(before, after)
     if not WinEntrance.Enabled or not Runtime.Running or not bootstrapStillCurrent()
         or Environment.__AutoBountyRuntime ~= Runtime
+        or Runtime.EmptyHopCommitted
         or Runtime.LocalDead or not isFiniteNumber(before) or not isFiniteNumber(after)
         or after <= before then
 
@@ -3046,7 +3200,7 @@ end
 
 local function setTarget(player, targetInfo, resumeRecovery)
     if not Runtime.Running or Runtime.SafeMode or Runtime.LocalDead or Runtime.HopPending
-        or Runtime.WinEntranceAttempt then
+        or Runtime.EmptyHopCommitted or Runtime.WinEntranceAttempt then
 
         return false
     end
@@ -3059,7 +3213,8 @@ local function setTarget(player, targetInfo, resumeRecovery)
 
     local route = getTargetRoute(player, refreshedInfo or targetInfo)
 
-    if not route then
+    if not route or not Runtime.Running or Runtime.SafeMode or Runtime.LocalDead
+        or Runtime.HopPending or Runtime.EmptyHopCommitted or Runtime.WinEntranceAttempt then
         return false
     end
 
@@ -3734,6 +3889,10 @@ local function updateSafeModeMovement(deltaTime)
 
     applyLocalNoClip()
 
+    if SafeModeType == "Entrance" then
+        return SafeEntrance.Update(root)
+    end
+
     local safeGoal = getSafeModeMovementGoal(root)
 
     AutoTween(safeGoal, deltaTime, false)
@@ -3962,167 +4121,80 @@ local function faceRootTowardTarget(localRoot, targetRoot)
     end
 end
 
-local function emptyHopEntranceFinished()
-    if not isEmptyListHopReady() then
-        return true
-    end
-
-    local attempt = Runtime.EmptyCombatEntranceAttempt
-
-    return attempt ~= nil
-        and attempt.EmptySince == Runtime.EmptySince
-        and attempt.CharacterEpoch == Runtime.CharacterEpoch
-        and attempt.Root == Runtime.Root
-        and attempt.Done == true
-end
-
-local function updateEmptyCombatEntrance()
+local function updateEmptyHopMovement(deltaTime)
     local character = Runtime.Character
-    local characterEpoch = Runtime.CharacterEpoch
-    local root = Runtime.Root
     local humanoid = Runtime.Humanoid
-    local emptySince = Runtime.EmptySince
+    local root = Runtime.Root
 
-    local function contextStillValid()
-        return Runtime.Running
-            and Runtime.HopPending
-            and not Runtime.WinEntranceAttempt
-            and not Runtime.SafeMode
-            and not Runtime.LocalDead
-            and Runtime.CurrentTarget == nil
-            and Runtime.EmptySince == emptySince
-            and Runtime.CharacterEpoch == characterEpoch
-            and character ~= nil
-            and Runtime.Character == character
-            and LocalPlayer.Character == character
-            and root ~= nil
-            and Runtime.Root == root
-            and root.Parent ~= nil
-            and root:IsDescendantOf(character)
-            and isFiniteVector3(root.Position)
-            and humanoid ~= nil
-            and Runtime.Humanoid == humanoid
-            and humanoid.Parent == character
-            and humanoid.Health > 0
-            and isEmptyListHopReady()
-    end
+    if not Runtime.Running or not AutoHopEnabled or not Runtime.HopPending
+        or Runtime.LocalDead
+        or (not Runtime.EmptyHopCommitted and (Runtime.SafeMode
+            or Runtime.WinEntranceAttempt or not isEmptyListHopReady()))
+        or not character or character ~= LocalPlayer.Character or not character.Parent
+        or not humanoid or humanoid.Parent ~= character or humanoid.Health <= 0 then
 
-    if not contextStillValid() then
+        stopEmptyHopMovement()
         return false
     end
 
-    local function finish(attempt, state, message)
-        if attempt.Done then
-            return
-        end
+    if not root or not root.Parent or not root:IsA("BasePart")
+        or not root:IsDescendantOf(character) then
 
-        attempt.Done = true
-        attempt.State = state
-
-        if Runtime.EmptyCombatEntranceAttempt == attempt and contextStillValid() then
-            print("[AutoBounty][HopEntrance] " .. message)
-            setStatus(message)
+        stopEmptyHopMovement()
+        restoreLocalCollision()
+        local replacement = character:FindFirstChild("HumanoidRootPart")
+        if not replacement or not replacement:IsA("BasePart") then
+            return false
         end
+        Runtime.Root = replacement
+        root = replacement
     end
 
-    local attempt = Runtime.EmptyCombatEntranceAttempt
-
-    if attempt
-        and attempt.EmptySince == emptySince
-        and attempt.CharacterEpoch == characterEpoch
-        and attempt.Root == root then
-
-        if not attempt.Done then
-            if attempt.Started
-                and (root.Position - attempt.Entrance).Magnitude <= INTERNAL.FastTPArrivalTolerance then
-
-                finish(attempt, "arrived", "Entrance position reached; checking combat before hopping")
-            elseif os.clock() >= attempt.Deadline then
-                local message = attempt.Started
-                    and "Entrance arrival timed out; checking combat before hopping"
-                    or "Entrance request timed out while queued; checking combat before hopping"
-                finish(attempt, "timeout", message)
-            end
-        end
-
-        return attempt.Done == true
+    if not isFiniteVector3(root.Position) then
+        stopEmptyHopMovement()
+        restoreLocalCollision()
+        return false
     end
 
-    -- One bounded attempt per empty episode/character/root, independent of combat's value/type.
-    attempt = {
-        EmptySince = emptySince,
-        CharacterEpoch = characterEpoch,
-        Root = root,
-        Deadline = os.clock() + INTERNAL.EmptyHopEntranceTimeout,
-        Started = false,
-        Done = false,
-    }
-    Runtime.EmptyCombatEntranceAttempt = attempt
-    Runtime.Mode = "HOP_WAIT"
-    stopSeaHeightMovement()
+    local movement = Runtime.EmptyHopMovement
+    if not movement or movement.Root ~= root
+        or movement.CharacterEpoch ~= Runtime.CharacterEpoch then
 
-    if Runtime.ActiveTween then
-        Runtime.ActiveTween:Cancel()
-        Runtime.ActiveTween = nil
+        stopEmptyHopMovement()
+        stopSeaHeightMovement()
+        if Runtime.ActiveTween then
+            Runtime.ActiveTween:Cancel()
+            Runtime.ActiveTween = nil
+        end
+        movement = {Root = root, CharacterEpoch = Runtime.CharacterEpoch, Anchor = root.CFrame}
+        Runtime.EmptyHopMovement = movement
     end
 
-    restoreLocalCollision()
-    attempt.Entrance = nearestEntrance(root.Position)
+    -- Aim one second of travel above the current height on every update.
+    -- Refreshing this goal keeps ascent continuous instead of stopping at SafeModeY.
+    local goalY = root.Position.Y + TweenSpeed
+    local anchor = movement.Anchor
+    local goal = isFiniteNumber(goalY) and clampCFrameAboveSea(
+        CFrame.new(anchor.Position.X, goalY, anchor.Position.Z) * anchor.Rotation)
+    if not goal then
+        stopEmptyHopMovement()
+        restoreLocalCollision()
+        return false
+    end
+    movement.Goal = goal
 
-    if not attempt.Entrance then
-        finish(attempt, "unavailable", "No entrance available; checking combat before hopping")
-        return true
+    -- Keep this separate from the root-bound tween: returning candidates, health
+    -- recovery and respawn must not reopen target selection or cancel this hop.
+    if not Runtime.EmptyHopCommitted then
+        Runtime.EmptyHopCommitted = true
+        Runtime.TargetRecoveryState = nil
+        setStatus("No eligible players; rising continuously; target selection locked")
     end
 
-    local rawCombat = character:GetAttribute("InCombat")
-    print(string.format(
-        "[AutoBounty][HopEntrance] Preparing | Entrance=%s | InCombat=%s | Type=%s",
-        tostring(attempt.Entrance), tostring(rawCombat), typeof(rawCombat)
-    ))
-    setStatus("No eligible targets; preparing entrance before server hop")
-
-    local function stillValid()
-        return not attempt.Done
-            and os.clock() < attempt.Deadline
-            and Runtime.EmptyCombatEntranceAttempt == attempt
-            and contextStillValid()
-    end
-
-    task.spawn(function()
-        local success = invokeEntrance(attempt.Entrance, "EmptyCombat", nil, stillValid, function()
-            attempt.Started = true
-            print("[AutoBounty][HopEntrance] requestEntrance dispatched | Entrance=" .. tostring(attempt.Entrance))
-        end)
-
-        if attempt.Done or Runtime.EmptyCombatEntranceAttempt ~= attempt then
-            return
-        end
-
-        if not contextStillValid() then
-            attempt.Done = true
-            attempt.State = "cancelled"
-
-            -- A cancelled queued operation has not used this episode's entrance request.
-            if not attempt.Started then
-                Runtime.EmptyCombatEntranceAttempt = nil
-            end
-
-            return
-        end
-
-        attempt.Returned = true
-        attempt.Success = success
-
-        if os.clock() >= attempt.Deadline then
-            finish(attempt, "timeout", "Entrance request timed out; checking combat before hopping")
-        elseif not success then
-            finish(attempt, "failed", "Entrance request failed; checking combat before hopping")
-        else
-            print("[AutoBounty][HopEntrance] Request returned; waiting for entrance position")
-        end
-    end)
-
-    return attempt.Done == true
+    applyLocalNoClip()
+    AutoTween(movement.Goal, deltaTime, false)
+    movement.Tween = Runtime.ActiveTween
+    return true
 end
 
 local function faceCameraTowardTarget()
@@ -5684,15 +5756,23 @@ enterSafeMode = function()
     Runtime.SafeMode = true
     Runtime.SafeEpoch = Runtime.SafeEpoch + 1
     Runtime.SafeModeAtAltitude = false
-    local goalY = getSafeModeGoalY()
+    stopSafeModeMovement()
+    local goalY = SafeModeType == "Above" and getSafeModeGoalY() or nil
 
     if cancelFollowTimeoutHop then
         cancelFollowTimeoutHop("SafeMode reset PlayerFollowTime")
     end
 
     suspendTargetForRecovery()
+    if SafeModeType == "Entrance" then
+        clearTarget(nil, false)
+    end
     applyLocalNoClip()
     Runtime.Mode = "SAFE_MODE"
+    if SafeModeType == "Entrance" then
+        setStatus("SafeMode: preparing nearest entrance; waiting until MaxHealth")
+        return
+    end
     setStatus(string.format(
         SafeModePanicEnabled
             and "SafeMode: panic movement toward Y %.1f"
@@ -5711,14 +5791,26 @@ exitSafeMode = function()
     Runtime.SafeModeAtAltitude = false
     stopSafeModeMovement()
     restoreLocalCollision()
-    Runtime.Mode = Runtime.HopPending and "HOP_WAIT"
-        or (Runtime.TargetRecoveryState and "RECOVER_TARGET" or "SCAN")
+    if SafeModeType == "Entrance" then
+        Runtime.TargetRecoveryState = nil
+        Runtime.Mode = Runtime.WinEntranceAttempt and "WIN_ENTRANCE"
+            or (Runtime.HopPending and "HOP_WAIT" or "SCAN")
+    else
+        Runtime.Mode = Runtime.HopPending and "HOP_WAIT"
+            or (Runtime.TargetRecoveryState and "RECOVER_TARGET" or "SCAN")
+    end
 
     if not Runtime.HopPending then
         Runtime.EmptySince = nil
     end
 
-    setStatus(Runtime.HopPending and "Recovered; resuming server hop" or "Recovered; returning to combat")
+    if SafeModeType == "Entrance" then
+        setStatus(Runtime.WinEntranceAttempt and "Recovered; completing win entrance"
+            or (Runtime.HopPending and "Recovered; resuming server hop"
+                or "Recovered; selecting nearest eligible target"))
+    else
+        setStatus(Runtime.HopPending and "Recovered; resuming server hop" or "Recovered; returning to combat")
+    end
     ensureCombatAttributes()
     startPvPEnable()
 end
@@ -5925,6 +6017,7 @@ local function startMovementWorker()
 
         if Runtime.LocalDead then
             stopSeaHeightMovement()
+            stopEmptyHopMovement()
             return
         end
 
@@ -5939,6 +6032,17 @@ local function startMovementWorker()
 
         if not humanoid or not humanoid.Parent or humanoid.Health <= 0 then
             handleLocalDeath(Runtime.CharacterEpoch)
+            return
+        end
+
+        if Runtime.EmptyHopCommitted then
+            -- Recovery still gates hopping, but this committed exit owns movement.
+            if Runtime.SafeMode then
+                handleHealthChanged(humanoid.Health, Runtime.CharacterEpoch)
+            elseif humanoid.Health <= (Runtime.EffectiveLowHealth or LowHealth) then
+                enterSafeMode()
+            end
+            updateEmptyHopMovement(deltaTime)
             return
         end
 
@@ -6471,6 +6575,10 @@ determineHopReason = function()
         return "saved-account", savedAccount.Name .. " (" .. tostring(savedAccount.UserId) .. ")"
     end
 
+    if Runtime.EmptyHopCommitted then
+        return "empty", "Upward escape started; continuing server hop"
+    end
+
     if ServerTimeout.Pending and ServerTimeout.IsDue() then
         return "server-timeout", "5-minute server timeout"
     end
@@ -6514,7 +6622,9 @@ local function stopHopPending(message)
     Runtime.HopAttemptEpoch = Runtime.HopAttemptEpoch + 1
     Runtime.Teleporting = false
     Runtime.HopPending = false
-    Runtime.EmptyCombatEntranceAttempt = nil
+    Runtime.EmptyHopCommitted = false
+    stopEmptyHopMovement()
+    restoreLocalCollision()
     Runtime.HopReason = nil
     Runtime.HopDetail = nil
     Runtime.FollowTimeoutHopDetail = nil
@@ -6596,7 +6706,7 @@ function PublicHop.Validate(context)
     if not reason
         or not inCombatKnown
         or inCombat ~= false
-        or not emptyHopEntranceFinished()
+        or (isEmptyListHopReady() and not Runtime.EmptyHopCommitted)
         or not PublicHop.ContextMatches(context) then
 
         return false
@@ -7021,11 +7131,19 @@ local function runHopWorker()
 
             Runtime.HopReason = reason
             Runtime.HopDetail = detail
-            local entranceReady = not isEmptyListHopReady() or updateEmptyCombatEntrance()
-            if not entranceReady or not inCombatKnown or inCombat ~= false then
+            local movementReady = true
+            if Runtime.EmptyHopCommitted or isEmptyListHopReady() then
+                movementReady = updateEmptyHopMovement(0)
+            end
+            if not movementReady or not inCombatKnown or inCombat ~= false then
                 PublicHop.CancelSearch()
                 Runtime.Mode = "HOP_WAIT"
-                if entranceReady then
+                if not movementReady then
+                    setStatus("Waiting for a valid character position to rise before server hop")
+                elseif Runtime.EmptyHopCommitted then
+                    setStatus(inCombatKnown and "Rising continuously; waiting for InCombat to turn off before server hop"
+                        or "Rising continuously; waiting for a boolean Character.InCombat before server hop")
+                else
                     setStatus(inCombatKnown and "Waiting for InCombat to turn off before server hop"
                         or "Waiting for a boolean Character.InCombat before server hop")
                 end
@@ -7059,7 +7177,8 @@ requestHop = function(reason, detail)
     end
 
     if not Runtime.HopPending then
-        Runtime.EmptyCombatEntranceAttempt = nil
+        Runtime.EmptyHopCommitted = false
+        stopEmptyHopMovement()
     end
 
     Runtime.HopPending = true
@@ -7220,7 +7339,8 @@ local function startTargetWorker()
                     Runtime.EmptySince = os.clock()
                 end
 
-                if not Runtime.LocalDead and not Runtime.SafeMode and not Runtime.HopPending then
+                if not Runtime.LocalDead and not Runtime.SafeMode and not Runtime.HopPending
+                    and not Runtime.EmptyHopCommitted then
                     if not Runtime.FriendAuditComplete then
                         setStatus("Checking players for friends")
                     elseif not Runtime.SafeZonesFolder or not Runtime.SafeZonesReady then
@@ -7270,7 +7390,8 @@ function Runtime:Stop(reason)
     end
 
     self.HopPending = false
-    self.EmptyCombatEntranceAttempt = nil
+    self.EmptyHopCommitted = false
+    stopEmptyHopMovement()
 
     if self.ActiveTween then
         self.ActiveTween:Cancel()
