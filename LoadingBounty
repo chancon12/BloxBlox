@@ -209,6 +209,7 @@ Combo = {
         Region = "", -- "" = any region
         ServerHopMode = "Random",
         DefaultSkillPressTime = 0,
+        SafeModeTweenSpeed = 300,
 
         Hitbox = {
             Enabled = true,
