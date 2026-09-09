@@ -8,6 +8,7 @@
 -- Settings.FPSBoost defaults to true; false skips startup graphics changes and their 5-second wait.
 -- Settings.Region = "Singapore, America" accepts either reported region (case-insensitive substring).
 -- Region = "" or omitted allows any region. Filtered hops use __ServerBrowser region listings.
+-- Settings.ServerHopMode = "Populated" (default) or "Random", applied to eligible servers per page.
 -- Settings.TargetWeaponFilter = {Enabled=true, Ignore={"Portal-Portal"}}; false disables it.
 -- Filters visible Tool names and equipped/unequipped weapon model WeaponName attributes.
 -- Low-health recovery keeps the selected target and freezes its no-damage countdown.
@@ -77,7 +78,7 @@
 -- With FastTP enabled, new targets also use a closer entrance before chasing when over 300 studs away.
 -- Optional shortcuts are checked once per acquisition; failed shortcuts fall back to direct chasing.
 -- Empty-target hops rise continuously, lock target selection, and wait for known InCombat=false.
--- AutoHop sorts each fetched server page by population, excluding full/current/attempted JobIds.
+-- AutoHop orders each fetched page by ServerHopMode, excluding full/current/attempted JobIds.
 -- Region-filtered browser buckets use the existing 1-second page spacing; join retries remain 0.1s.
 -- Joining uses ReplicatedStorage.__ServerBrowser:InvokeServer("teleport", JobId).
 -- There is no minimum player count. Retry another unused JobId every 0.1 seconds while still here.
@@ -120,6 +121,9 @@ assert(
 local Settings = type(Config.Settings) == "table" and Config.Settings or {}
 assert(Settings.Region == nil or type(Settings.Region) == "string",
     '[AutoBounty] Settings.Region must be a comma-separated string, or "" for any region')
+assert(Settings.ServerHopMode == nil or Settings.ServerHopMode == "Populated"
+    or Settings.ServerHopMode == "Random",
+    '[AutoBounty] Settings.ServerHopMode must be "Populated" or "Random"')
 local WeaponConfig = type(Config.Weapon) == "table" and Config.Weapon or {}
 local HitboxConfig = type(Settings.Hitbox) == "table" and Settings.Hitbox or {}
 local TweenHitboxConfig = type(Settings.TweenHitbox) == "table" and Settings.TweenHitbox or {}
@@ -6614,6 +6618,7 @@ local HOP_PRIORITY = {
 local PublicHop = {
     PlaceId = game.PlaceId,
     SourceJobId = game.JobId,
+    SelectionMode = Settings.ServerHopMode or "Populated",
     Servers = {},
     Cursor = nil,
     SeenCursors = {},
@@ -7004,12 +7009,20 @@ function PublicHop.AcceptPage(search)
             })
         end
     end
-    table.sort(servers, function(a, b)
-        if a.Playing == b.Playing then
-            return a.JobId < b.JobId
+    if PublicHop.SelectionMode == "Random" then
+        -- Shuffle only the filtered page; retries consume this order without repeating JobIds.
+        for index = #servers, 2, -1 do
+            local other = math.random(1, index)
+            servers[index], servers[other] = servers[other], servers[index]
         end
-        return a.Playing > b.Playing
-    end)
+    else
+        table.sort(servers, function(a, b)
+            if a.Playing == b.Playing then
+                return a.JobId < b.JobId
+            end
+            return a.Playing > b.Playing
+        end)
+    end
 
     Runtime.HopSearch = nil
     PublicHop.Servers = servers
