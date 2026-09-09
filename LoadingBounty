@@ -207,6 +207,7 @@ Combo = {
         SafeModeType = "Above",
         FPSBoost = false, -- true = enabled, false = disabled
         Region = "Singapore", -- "" = any region
+        ServerHopMode = "Random",
 
         Hitbox = {
             Enabled = true,
