@@ -266,6 +266,10 @@ Combo = {
         ServerHopMode = "Random",
         DefaultSkillPressTime = 0,
         SafeModeTweenSpeed = 300,
+        SafeModeInitialLift = {
+        Enabled = true,
+        Height = 500,
+        },
 
         Hitbox = {
             Enabled = true,
