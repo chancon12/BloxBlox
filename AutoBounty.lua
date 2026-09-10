@@ -32,6 +32,11 @@
 -- OrbitEnabled defaults to true; set false to follow the target directly without circling.
 -- ClickAttack defaults to true; normal attacks fill gaps when no enabled skill can be attempted.
 -- ClickAttack also pauses while the local player's health is below 20% of MaxHealth.
+-- Settings.BladeBeforeDefaultSkill = true adds one normal blade attack before each default skill press.
+-- It includes default combo follow-ups, requires ClickAttack, and bypasses the usual 0.25-second blade interval.
+-- An enabled Melee/Sword is equipped for the blade, then the intended skill weapon is restored.
+-- Low health, blade range, or unavailable blade tools/remotes skip the blade without blocking skills.
+-- False/omitted retains the existing cooldown-based blade fallback; custom combo steps keep their timing.
 -- HitboxOffset defaults to Vector3.new(0, 0, 0), relative to the target's CFrame:
 -- +X right, +Y up, -Z front, +Z behind. Positions stay inside the hitbox and above sea level.
 -- Empty-target hop: rise continuously at TweenSpeed with fixed X/Z until the server hop.
@@ -5307,7 +5312,7 @@ function CombatActions.GetAttackRemotes()
     return attack, hit
 end
 
-function CombatActions.NormalAttack(targetEpoch)
+function CombatActions.NormalAttack(targetEpoch, bypassInterval)
     if not ClickAttackEnabled or not canAttack(targetEpoch) or Runtime.AttackBusy or Runtime.AimActive then
         return false
     end
@@ -5322,7 +5327,7 @@ function CombatActions.NormalAttack(targetEpoch)
 
     local now = os.clock()
 
-    if now < CombatActions.NextNormalAttackAt then
+    if bypassInterval ~= true and now < CombatActions.NextNormalAttackAt then
         return false
     end
 
@@ -5369,6 +5374,87 @@ function CombatActions.NormalAttack(targetEpoch)
     end
 
     return success
+end
+
+function CombatActions.BladeBeforeDefault(entry, weaponOrder, targetEpoch, characterEpoch, stillValid)
+    local function stillCurrent()
+        return Runtime.CharacterEpoch == characterEpoch
+            and canAttack(targetEpoch)
+            and CombatActions.DefaultEntryValid(entry)
+            and (not stillValid or stillValid())
+    end
+
+    local function clickAllowed()
+        if Settings.BladeBeforeDefaultSkill ~= true or not ClickAttackEnabled
+            or Runtime.AttackBusy or Runtime.AimActive then
+            return false
+        end
+        local humanoid = Runtime.Humanoid
+        local info = Runtime.CurrentTargetInfo
+        local targetRoot = info and info.Root
+        local localRoot = Runtime.Root
+        return humanoid ~= nil and humanoid.MaxHealth > 0
+            and humanoid.Health >= humanoid.MaxHealth * 0.20
+            and info ~= nil and info.Player == Runtime.CurrentTarget
+            and targetRoot ~= nil and targetRoot.Parent ~= nil
+            and localRoot ~= nil and localRoot.Parent ~= nil
+            and isFiniteVector3(targetRoot.Position) and isFiniteVector3(localRoot.Position)
+            and (localRoot.Position - targetRoot.Position).Magnitude < 60
+    end
+
+    if not stillCurrent() then
+        return false
+    end
+    if not clickAllowed() then
+        return true
+    end
+    local blade = CombatActions.GetNormalTool(weaponOrder)
+    if not blade then
+        warnOnce("normal-attack:before-default-tool",
+            "BladeBeforeDefaultSkill needs an enabled Melee or Sword tool; continuing default skills.")
+        return true
+    end
+    local attack, hit = CombatActions.GetAttackRemotes()
+    if not attack or not hit then
+        return true
+    end
+
+    if not stillCurrent() then
+        return false
+    end
+    if not clickAllowed() then
+        return true
+    end
+
+    -- Equip and attack immediately; only the subsequent skill's configured hold adds a wait.
+    local character = Runtime.Character
+    if blade.Parent ~= character then
+        local ok, err = pcall(function()
+            Runtime.Humanoid:UnequipTools()
+            Runtime.Humanoid:EquipTool(blade)
+        end)
+        if not ok then
+            warnOnce("normal-attack:before-default-equip:" .. blade.Name,
+                "BladeBeforeDefaultSkill equip failed: " .. tostring(err))
+            return false
+        end
+    end
+
+    if not stillCurrent() or Runtime.Character ~= character or blade.Parent ~= character then
+        return false
+    end
+    Runtime.CurrentTool = blade
+    if CombatActions.GetNormalTool(weaponOrder) ~= blade then
+        return false
+    end
+
+    if clickAllowed() then
+        CombatActions.NormalAttack(targetEpoch, true)
+    end
+    if not stillCurrent() then
+        return false
+    end
+    return CombatActions.EquipDefaultTool(entry, targetEpoch, characterEpoch)
 end
 
 function CombatActions.GunOpener(tool, targetEpoch, characterEpoch)
@@ -5728,8 +5814,14 @@ local function startWeaponWorker()
                                 comboEntries = nil
                                 skillCursor = 1
                             else
-                                -- Keep blade clicks available without a separate yielding weapon switch.
-                                if ClickAttackEnabled and (entry.Category == "Melee" or entry.Category == "Sword")
+                                local readyForSkill = true
+                                if Settings.BladeBeforeDefaultSkill == true then
+                                    readyForSkill = CombatActions.BladeBeforeDefault(
+                                        entry, combatWeaponOrder, targetEpoch, comboCharacterEpoch, function()
+                                            return customCombo == CombatActions.GetActiveComboConfig()
+                                                and selectedCombo() == nil
+                                        end)
+                                elseif ClickAttackEnabled and (entry.Category == "Melee" or entry.Category == "Sword")
                                     and os.clock() >= CombatActions.NextNormalAttackAt
                                     and CombatActions.NoAttemptableSkills(CombatActions.GetClickSkills(combatWeaponOrder)) then
 
@@ -5737,7 +5829,9 @@ local function startWeaponWorker()
                                 end
 
                                 if customCombo == CombatActions.GetActiveComboConfig() and selectedCombo() == nil then
-                                    castCompleted = CombatActions.CastDefaultSkill(entry, targetEpoch, comboCharacterEpoch)
+                                    if readyForSkill then
+                                        castCompleted = CombatActions.CastDefaultSkill(entry, targetEpoch, comboCharacterEpoch)
+                                    end
                                 else
                                     comboEntries = nil
                                     skillCursor = 1
