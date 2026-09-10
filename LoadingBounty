@@ -126,7 +126,13 @@ Combo = {
 },
 
     Weapon = {
-        -- This is the exact switch order used by the one weapon worker.
+
+        Moveset = {
+    ["Yeti-Yeti"] = {
+        V = false, -- skip Yeti's V
+    },
+},
+
         Order = {"Melee", "Blox Fruit", "Sword", "Gun"},
 
         Melee = {
