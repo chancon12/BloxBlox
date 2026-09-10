@@ -183,7 +183,8 @@ Combo = {
     },
 
     Settings = {
-        ClickAttack = false,
+        ClickAttack = true,
+        BladeBeforeDefaultSkill = false,
         Attack = true, -- master switch for automatic weapon switching and skill casting
         FastTP = true,
         ESPPlayer = false,
