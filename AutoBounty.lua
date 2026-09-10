@@ -32,6 +32,9 @@
 -- OrbitEnabled defaults to true; set false to follow the target directly without circling.
 -- ClickAttack defaults to true; normal attacks fill gaps when no enabled skill can be attempted.
 -- ClickAttack also pauses while the local player's health is below 20% of MaxHealth.
+-- Settings.ClickAttackMinTargetHealth = 3000 pauses all blade attacks below that target HP (raw Health).
+-- Zero/omitted/invalid disables this cutoff; equality is allowed, and healing can resume blade attacks.
+-- The cutoff covers gap attacks and BladeBeforeDefaultSkill; skill inputs continue normally.
 -- Settings.BladeBeforeDefaultSkill = true adds one normal blade attack before each default skill press.
 -- It includes default combo follow-ups, requires ClickAttack, and bypasses the usual 0.25-second blade interval.
 -- An enabled Melee/Sword is equipped for the blade, then the intended skill weapon is restored.
@@ -5373,6 +5376,19 @@ function CombatActions.GetAttackRemotes()
     return attack, hit
 end
 
+function CombatActions.IsBladeTargetHealthAllowed(info)
+    local minimumHealth = tonumber(Settings.ClickAttackMinTargetHealth)
+    if not isFiniteNumber(minimumHealth) or minimumHealth <= 0 then
+        return true
+    end
+
+    local humanoid = info and info.Humanoid
+    return humanoid ~= nil and info.Character ~= nil
+        and humanoid.Parent == info.Character
+        and isFiniteNumber(humanoid.Health)
+        and humanoid.Health >= minimumHealth
+end
+
 function CombatActions.NormalAttack(targetEpoch, bypassInterval)
     if not ClickAttackEnabled or not canAttack(targetEpoch) or Runtime.AttackBusy or Runtime.AimActive then
         return false
@@ -5398,6 +5414,7 @@ function CombatActions.NormalAttack(targetEpoch, bypassInterval)
     local tool = Runtime.CurrentTool
 
     if not info or info.Player ~= Runtime.CurrentTarget
+        or not CombatActions.IsBladeTargetHealthAllowed(info)
         or not targetRoot or not targetRoot.Parent
         or not localRoot or not localRoot.Parent
         or not tool or tool.Parent ~= Runtime.Character
@@ -5410,7 +5427,7 @@ function CombatActions.NormalAttack(targetEpoch, bypassInterval)
 
     local attack, hit = CombatActions.GetAttackRemotes()
 
-    if not attack or not hit then
+    if not attack or not hit or not CombatActions.IsBladeTargetHealthAllowed(info) then
         return false
     end
 
@@ -5457,6 +5474,7 @@ function CombatActions.BladeBeforeDefault(entry, weaponOrder, targetEpoch, chara
         return humanoid ~= nil and humanoid.MaxHealth > 0
             and humanoid.Health >= humanoid.MaxHealth * 0.20
             and info ~= nil and info.Player == Runtime.CurrentTarget
+            and CombatActions.IsBladeTargetHealthAllowed(info)
             and targetRoot ~= nil and targetRoot.Parent ~= nil
             and localRoot ~= nil and localRoot.Parent ~= nil
             and isFiniteVector3(targetRoot.Position) and isFiniteVector3(localRoot.Position)
@@ -5883,6 +5901,7 @@ local function startWeaponWorker()
                                                 and selectedCombo() == nil
                                         end)
                                 elseif ClickAttackEnabled and (entry.Category == "Melee" or entry.Category == "Sword")
+                                    and CombatActions.IsBladeTargetHealthAllowed(Runtime.CurrentTargetInfo)
                                     and os.clock() >= CombatActions.NextNormalAttackAt
                                     and CombatActions.NoAttemptableSkills(CombatActions.GetClickSkills(combatWeaponOrder)) then
 
@@ -5952,7 +5971,9 @@ local function startWeaponWorker()
                     comboEntries = nil
                     local latestEntries = CombatActions.GetClickSkills(combatWeaponOrder)
 
-                    if not defaultPass and ClickAttackEnabled and CombatActions.NoAttemptableSkills(latestEntries)
+                    if not defaultPass and ClickAttackEnabled
+                        and CombatActions.IsBladeTargetHealthAllowed(Runtime.CurrentTargetInfo)
+                        and CombatActions.NoAttemptableSkills(latestEntries)
                         and os.clock() >= CombatActions.NextNormalAttackAt then
 
                         local tool = CombatActions.GetNormalTool(combatWeaponOrder)
