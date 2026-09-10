@@ -70,6 +70,7 @@ Combo = {
             },
             Steps = {
                 {Weapon = "Soul Guitar", Key = "X", Hold = 0.1},
+                {Weapon = "Magma-Magma", Key = "Z", Hold = 3},
                 {Weapon = "Magma-Magma", Key = "V", Hold = 0.1},
                 {Weapon = "Magma-Magma", Key = "C", Hold = 0.1},
                 {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.1},
