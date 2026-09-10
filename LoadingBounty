@@ -131,6 +131,9 @@ Combo = {
     ["Yeti-Yeti"] = {
         V = false, -- skip Yeti's V
         },
+    ["T-Rex-T-Rex"] = {
+        V = false, -- skip Yeti's V
+        },
     },
 
         Order = {"Melee", "Blox Fruit", "Sword", "Gun"},
