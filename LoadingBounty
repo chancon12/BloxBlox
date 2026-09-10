@@ -235,7 +235,7 @@ Combo = {
 
     Settings = {
         ClickAttack = true,
-        BladeBeforeDefaultSkill = false,
+        BladeBeforeDefaultSkill = true,
         Attack = true, -- master switch for automatic weapon switching and skill casting
         FastTP = true,
         ESPPlayer = false,
