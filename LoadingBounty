@@ -39,15 +39,12 @@ Environment.AutoBountyConfig = {
 
 Combo = {
     Enabled = true,
+
     Profiles = {
         {
-            Name = "Godhuman + Blizzard + Cursed Dual Katana",
+            Name = "Blizzard + Cursed Dual Katana",
             Enabled = true,
-            RequiredWeapons = {
-                "Blizzard-Blizzard",
-                "Cursed Dual Katana",
-                "Godhuman",
-            },
+            RequiredWeapons = {"Blizzard-Blizzard", "Cursed Dual Katana", "Godhuman"},
             Steps = {
                 {Weapon = "Blizzard-Blizzard", Key = "V", Hold = 0.1},
                 {Weapon = "Blizzard-Blizzard", Key = "C", Hold = 0.1},
@@ -60,21 +57,14 @@ Combo = {
         },
 
         {
-            Name = "Soul Guitar + Magma + Cursed Dual Katana + Godhuman",
+            Name = "Blizzard + Shark Anchor",
             Enabled = true,
-            RequiredWeapons = {
-                "Soul Guitar",
-                "Magma-Magma",
-                "Cursed Dual Katana",
-                "Godhuman",
-            },
+            RequiredWeapons = {"Blizzard-Blizzard", "Shark Anchor", "Godhuman"},
             Steps = {
-                {Weapon = "Soul Guitar", Key = "X", Hold = 0.1},
-                {Weapon = "Magma-Magma", Key = "Z", Hold = 3},
-                {Weapon = "Magma-Magma", Key = "V", Hold = 0.1},
-                {Weapon = "Magma-Magma", Key = "C", Hold = 0.1},
-                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.1},
-                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.3},
+                {Weapon = "Blizzard-Blizzard", Key = "V", Hold = 0.1},
+                {Weapon = "Blizzard-Blizzard", Key = "C", Hold = 0.1},
+                {Weapon = "Shark Anchor", Key = "X", Hold = 0.1},
+                {Weapon = "Shark Anchor", Key = "Z", Hold = 0.5},
                 {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
                 {Weapon = "Godhuman", Key = "C", Hold = 0.1},
                 {Weapon = "Godhuman", Key = "X", Hold = 0.1},
@@ -82,44 +72,96 @@ Combo = {
         },
 
         {
-            Name = "Ice + Soul Guitar + Godhuman + Cursed Dual Katana",
+            Name = "Magma + Soul Guitar + Cursed Dual Katana + Godhuman",
             Enabled = true,
-            RequiredWeapons = {
-                "Ice-Ice",
-                "Soul Guitar",
-                "Godhuman",
-                "Cursed Dual Katana",
+            RequiredWeapons = {"Magma-Magma", "Soul Guitar", "Cursed Dual Katana", "Godhuman"},
+            Steps = {
+                {Weapon = "Soul Guitar", Key = "X", Hold = 0.1},
+                {Weapon = "Magma-Magma", Key = "V", Hold = 0.1},
+                {Weapon = "Magma-Magma", Key = "C", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.5},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
             },
+        },
+
+        {
+            Name = "Ice + Soul Guitar + Cursed Dual Katana + Godhuman",
+            Enabled = true,
+            RequiredWeapons = {"Ice-Ice", "Soul Guitar", "Cursed Dual Katana", "Godhuman"},
             Steps = {
                 {Weapon = "Ice-Ice", Key = "V", Hold = 0.1},
                 {Weapon = "Ice-Ice", Key = "C", Hold = 0.1},
                 {Weapon = "Soul Guitar", Key = "Z", Hold = 0.1},
                 {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
-                {Weapon = "Godhuman", Key = "C", Hold = 0.3},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.5},
                 {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
-                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.3},
+                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.5},
             },
         },
 
         {
-            Name = "Soul Guitar + Dough + Shark Anchor + Godhuman",
+            Name = "Dough + Soul Guitar + Shark Anchor + Godhuman",
             Enabled = true,
-            RequiredWeapons = {
-                "Soul Guitar",
-                "Dough-Dough",
-                "Shark Anchor",
-                "Godhuman",
-            },
+            RequiredWeapons = {"Dough-Dough", "Soul Guitar", "Shark Anchor", "Godhuman"},
             Steps = {
                 {Weapon = "Soul Guitar", Key = "X", Hold = 0.1},
-                {Weapon = "Dough-Dough", Key = "V", Hold = 2},
+                {Weapon = "Dough-Dough", Key = "V", Hold = 0.1},
                 {Weapon = "Dough-Dough", Key = "X", Hold = 0.1},
                 {Weapon = "Shark Anchor", Key = "Z", Hold = 0.1},
                 {Weapon = "Shark Anchor", Key = "X", Hold = 0.1},
                 {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
-                {Weapon = "Godhuman", Key = "C", Hold = 0.3},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.5},
                 {Weapon = "Godhuman", Key = "X", Hold = 0.1},
                 {Weapon = "Dough-Dough", Key = "C", Hold = 0.1},
+            },
+        },
+
+        {
+            Name = "T-Rex + Soul Guitar + Cursed Dual Katana + Godhuman",
+            Enabled = true,
+            RequiredWeapons = {"T-Rex-T-Rex", "Soul Guitar", "Cursed Dual Katana", "Godhuman"},
+            Steps = {
+                {Weapon = "Soul Guitar", Key = "X", Hold = 0.1},
+                {Weapon = "T-Rex-T-Rex", Key = "C", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.5},
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
+                {Weapon = "T-Rex-T-Rex", Key = "X", Hold = 0.1},
+            },
+        },
+
+        {
+            Name = "Kitsune + Soul Guitar + Cursed Dual Katana + Godhuman",
+            Enabled = true,
+            RequiredWeapons = {"Kitsune-Kitsune", "Soul Guitar", "Cursed Dual Katana", "Godhuman"},
+            Steps = {
+                {Weapon = "Soul Guitar", Key = "X", Hold = 0.1},
+                {Weapon = "Kitsune-Kitsune", Key = "C", Hold = 0.1},
+                {Weapon = "Kitsune-Kitsune", Key = "X", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.5},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.5},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Kitsune-Kitsune", Key = "Z", Hold = 0.1},
+            },
+        },
+
+        {
+            Name = "Yeti + Soul Guitar + Shark Anchor + Godhuman",
+            Enabled = true,
+            RequiredWeapons = {"Yeti-Yeti", "Soul Guitar", "Shark Anchor", "Godhuman"},
+            Steps = {
+                {Weapon = "Soul Guitar", Key = "X", Hold = 0.1},
+                {Weapon = "Shark Anchor", Key = "Z", Hold = 0.5},
+                {Weapon = "Shark Anchor", Key = "X", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.5},
+                {Weapon = "Yeti-Yeti", Key = "F", Hold = 0.1},
+                {Weapon = "Yeti-Yeti", Key = "X", Hold = 0.1},
+                {Weapon = "Yeti-Yeti", Key = "C", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
             },
         },
     },
