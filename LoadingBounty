@@ -186,7 +186,7 @@ Combo = {
         ClickAttack = false,
         Attack = true, -- master switch for automatic weapon switching and skill casting
         FastTP = true,
-        ESPPlayer = true,
+        ESPPlayer = false,
         AutoHop = true, -- false keeps hunting in the current server and never loads the hop script
         NoClip = true, -- disables collision for every Character BasePart and adds BodyClip while moving
         PlayerFollowTime = 120, -- Switch after 120 seconds without combat
@@ -197,7 +197,7 @@ Combo = {
         MaxHealth = 10000,
         RaceV3 = true,
         RaceV4 = true,
-        OrbitEnabled = false,
+        OrbitEnabled = true,
         HitboxOffset = Vector3.new(0, 0, -1), -- 5 studs above, 6 behind
         SafeZoneRadius = 500,
         SeaHeightFirst = false,
@@ -206,7 +206,7 @@ Combo = {
         GunOpenerEnabled = false,
         MaxTargetDistance = 10000,
         SafeModeType = "Above",
-        FPSBoost = false, -- true = enabled, false = disabled
+        FPSBoost = true, -- true = enabled, false = disabled
         Region = "", -- "" = any region
         ServerHopMode = "Random",
         DefaultSkillPressTime = 0,
