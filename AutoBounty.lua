@@ -56,6 +56,9 @@
 -- SafeModeY is the height above the target, refreshed every Heartbeat during recovery.
 -- If the target is lost, hold the last height; without a target, rise above your entry height.
 -- Combo order follows Weapon.Order and each weapon's SkillOrder (default Z, X, C, V, F).
+-- Config.Weapon.Moveset = {["Yeti-Yeti"] = {V=false}} skips that exact Tool's V in default/custom skills.
+-- Tool names and key names are case-sensitive. Only false blocks a move; omitted keys keep normal settings.
+-- A true override does not enable a disabled weapon category or skill. Blocked moves are skipped in sequence.
 -- Default passes (including custom-combo follow-ups) cycle skills even on cooldown.
 -- Default Hold=0 uses Settings.DefaultSkillPressTime (default 0.1 seconds; 0 = one Heartbeat).
 -- Positive Hold/ComboHold lasts its configured duration; invalid/negative press times use 0.1.
@@ -4512,6 +4515,12 @@ local function getComboNumberSetting(name, fallback)
     return fallback
 end
 
+local function isWeaponSkillAllowed(tool, keyName)
+    local movesets = WeaponConfig.Moveset
+    local overrides = type(movesets) == "table" and tool and movesets[tool.Name]
+    return type(overrides) ~= "table" or overrides[keyName] ~= false
+end
+
 local function collectTools()
     local tools = {}
     local character = Runtime.Character
@@ -4632,7 +4641,8 @@ local function equipTool(tool, targetEpoch, attackMode)
 end
 
 local function castSkill(keyName, skillConfig, targetEpoch, attackMode, holdOverride)
-    if not canAttack(targetEpoch, attackMode) then
+    if not canAttack(targetEpoch, attackMode)
+        or not isWeaponSkillAllowed(Runtime.CurrentTool, keyName) then
         Runtime.AttackBusy = false
         Runtime.AimActive = false
         Runtime.GunAimActive = false
@@ -4767,6 +4777,7 @@ end
 function CombatActions.CanAttempt(entry)
     if entry.CategoryConfig.Enabled ~= true
         or entry.Config.Enabled ~= true
+        or not isWeaponSkillAllowed(entry.Tool, entry.Key)
         or not CombatActions.IsOwnedTool(entry.Tool) then
 
         return false
@@ -4791,6 +4802,7 @@ function CombatActions.DefaultEntryValid(entry)
         and type(entry.CategoryConfig.Skills) == "table"
         and entry.CategoryConfig.Skills[entry.Key] == entry.Config
         and entry.Config.Enabled == true
+        and isWeaponSkillAllowed(entry.Tool, entry.Key)
         and CombatActions.IsOwnedTool(entry.Tool)
         and resolveTool(entry.Category, entry.CategoryConfig) == entry.Tool
 end
@@ -5101,7 +5113,8 @@ function CombatActions.GetCustomSkills(combo)
             local skillConfig = type(skills) == "table" and skills[key]
 
             if type(categoryConfig) == "table" and categoryConfig.Enabled == true
-                and type(skillConfig) == "table" and skillConfig.Enabled == true then
+                and type(skillConfig) == "table" and skillConfig.Enabled == true
+                and isWeaponSkillAllowed(tool, key) then
 
                 local holdOverride = step.Hold ~= nil and tonumber(step.Hold) or nil
 
@@ -5144,7 +5157,8 @@ function CombatActions.CustomEntryValid(entry)
         or entry.CategoryConfig.Enabled ~= true
         or type(entry.CategoryConfig.Skills) ~= "table"
         or entry.CategoryConfig.Skills[entry.Key] ~= entry.Config
-        or entry.Config.Enabled ~= true then
+        or entry.Config.Enabled ~= true
+        or not isWeaponSkillAllowed(entry.Tool, entry.Key) then
 
         return false
     end
@@ -5182,7 +5196,8 @@ function CombatActions.GetSkills(weaponOrder, forceDefault)
                 for _, keyName in ipairs(getSkillOrder(categoryConfig)) do
                     local skillConfig = skills[keyName]
 
-                    if type(skillConfig) == "table" and skillConfig.Enabled == true then
+                    if type(skillConfig) == "table" and skillConfig.Enabled == true
+                        and isWeaponSkillAllowed(tool, keyName) then
                         local cooling = CombatActions.ReadCooldown(tool, keyName)
                         CombatActions.ObserveCooldown(tool, keyName, cooling)
                         table.insert(entries, {
