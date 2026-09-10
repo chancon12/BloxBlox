@@ -276,7 +276,7 @@ Combo = {
         TweenHitbox = {
         Enabled = true,
         Size = Vector3.new(500, 500, 500),
-        TimeMultiplier = 1,
+        TimeMultiplier = 0.7,
         },
 
         Aimbot = {
