@@ -48,6 +48,10 @@
 -- Settings.SafeModeType = "Above" (default) or "Entrance".
 -- Settings.SafeModeTweenSpeed sets recovery tween speed in studs per second, including Above X/Z panic movement.
 -- It defaults to TweenSpeed; invalid/nonpositive values also fall back to TweenSpeed.
+-- Settings.SafeModeInitialLift = {Enabled=true, Height=500} optionally CFrames upward once per Above recovery.
+-- It defaults to disabled; Height defaults to 500 studs and is capped at the remaining climb.
+-- The original safe-height goal is retained, then normal SafeMode tween/panic movement continues.
+-- Entrance recovery and committed server-hop ascent do not use this lift.
 -- Entrance: arrive at the nearest entrance, then rise at SafeModeTweenSpeed until InCombat is known false.
 -- This ascent keeps the entrance X/Z and has no SafeModeY cap; unknown combat state continues the ascent.
 -- After combat clears, hold the attained position until configured MaxHealth, then select the nearest target afresh.
@@ -358,6 +362,7 @@ local INTERNAL = {
     WinEntranceTimeout = 5,
     SafeModeEntranceTimeout = 5,
     SafeModeEntranceRetryDelay = 5,
+    SafeModeInitialLift = {Enabled = false, Height = 500},
     ServerRetryDelay = 0.1,
     PublicServerRetryDelay = 5,
     PublicServerPageDelay = 1,
@@ -366,6 +371,21 @@ local INTERNAL = {
     FPSBoostWait = 5,
     ServerTimeout = 300,
 }
+
+do
+    local configuredLift = Settings.SafeModeInitialLift
+    local lift = INTERNAL.SafeModeInitialLift
+    if type(configuredLift) == "table" then
+        lift.Enabled = configuredLift.Enabled == true
+        if configuredLift.Height ~= nil then
+            lift.Height = tonumber(configuredLift.Height)
+        end
+    end
+    if not isFiniteNumber(lift.Height) or lift.Height <= 0 then
+        warn("[AutoBounty] SafeModeInitialLift.Height must be a finite number above 0; using 500 studs.")
+        lift.Height = 500
+    end
+end
 
 local function isFiniteVector3(value)
     return typeof(value) == "Vector3"
@@ -724,6 +744,7 @@ local Runtime = {
     SafeModeAtAltitude = false,
     SafeModeMovement = nil,
     SafeModeReference = nil,
+    SafeModeInitialLiftEpoch = nil,
     SafeModeEntrance = nil,
     LocalDead = true,
     Teleporting = false,
@@ -3994,6 +4015,31 @@ local function updateSafeModeMovement(deltaTime)
     end
 
     local safeGoal = getSafeModeMovementGoal(root)
+
+    if INTERNAL.SafeModeInitialLift.Enabled and not Runtime.EmptyHopCommitted
+        and Runtime.SafeModeInitialLiftEpoch ~= Runtime.SafeEpoch then
+
+        -- Resolve the goal BEFORE moving so targetless recovery keeps its original height.
+        -- Track the SafeEpoch, not the waypoint, to avoid repeating after movement resets.
+        Runtime.SafeModeInitialLiftEpoch = Runtime.SafeEpoch
+        local lift = math.min(INTERNAL.SafeModeInitialLift.Height,
+            math.max(safeGoal.Position.Y - root.Position.Y, 0))
+
+        if lift > 0 then
+            local position = root.Position
+            local liftedCFrame = clampCFrameAboveSea(
+                CFrame.new(position.X, position.Y + lift, position.Z) * root.CFrame.Rotation
+            )
+
+            if liftedCFrame then
+                if Runtime.ActiveTween then
+                    Runtime.ActiveTween:Cancel()
+                    Runtime.ActiveTween = nil
+                end
+                root.CFrame = liftedCFrame
+            end
+        end
+    end
 
     AutoTween(safeGoal, deltaTime, false, nil, SafeModeTweenSpeed)
     Runtime.SafeModeMovement.Tween = Runtime.ActiveTween
