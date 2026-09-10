@@ -164,6 +164,21 @@ Combo = {
                 {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
             },
         },
+
+        {
+            Name = "Gravity Blade + Sanguine Art + Ice",
+            Enabled = true,
+            RequiredWeapons = {"Gravity Blade", "Sanguine Art", "Ice-Ice"},
+            Steps = {
+                {Weapon = "Gravity Blade", Key = "Z", Hold = 0.1},
+                {Weapon = "Sanguine Art", Key = "Z", Hold = 0.1},
+                {Weapon = "Ice-Ice", Key = "C", Hold = 0.1},
+                {Weapon = "Ice-Ice", Key = "Z", Hold = 0.1},
+                {Weapon = "Sanguine Art", Key = "X", Hold = 0.1},
+                {Weapon = "Ice-Ice", Key = "V", Hold = 0.1},
+                {Weapon = "Sanguine Art", Key = "C", Hold = 0.1},
+            },
+        },
     },
 },
 
