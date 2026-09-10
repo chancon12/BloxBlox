@@ -205,7 +205,7 @@ Combo = {
         ComboHold = 0, -- Release each key after the minimum input wait
         GunOpenerEnabled = false,
         MaxTargetDistance = 10000,
-        SafeModeType = "Above",
+        SafeModeType = "Entrance",
         FPSBoost = true, -- true = enabled, false = disabled
         Region = "", -- "" = any region
         ServerHopMode = "Random",
