@@ -205,7 +205,7 @@ Combo = {
         ComboHold = 0, -- Release each key after the minimum input wait
         GunOpenerEnabled = false,
         MaxTargetDistance = 10000,
-        SafeModeType = "Entrance",
+        SafeModeType = "Above",
         FPSBoost = true, -- true = enabled, false = disabled
         Region = "", -- "" = any region
         ServerHopMode = "Random",
@@ -214,7 +214,7 @@ Combo = {
 
         Hitbox = {
             Enabled = true,
-            Size = Vector3.new(100, 100, 100),
+            Size = Vector3.new(50, 50, 50),
             Transparency = 0.5, -- 0 = visible, 1 = invisible
         },
 
