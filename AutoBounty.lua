@@ -92,6 +92,10 @@
 -- SeaHeightStallTimeout defaults to 3 seconds without vertical progress: retry once, then switch.
 -- SeaHeightFirst defaults to false for direct chasing; set true to restore the sea-level stage.
 -- TweenHitbox defaults: Enabled=true, Size=Vector3.new(100,100,100), TimeMultiplier=0.2.
+-- Settings.TweenHitbox.Mode = "Tween" (default) or "CFrame"; only applies inside the enabled TweenHitbox.
+-- CFrame cancels the active tween and applies the hitbox offset/orbit goal every movement update.
+-- TimeMultiplier applies only to Tween; outside the box movement uses the normal tween.
+-- CFrame entry skips optional sea-height staging. SafeMode/entrance/hop movement keeps its own behavior.
 -- This separate target-relative box multiplies chase/orbit tween duration, including the existing hitbox slowdown.
 -- Any finite multiplier above 0 is accepted: 0.2 gives one-fifth duration (5x speed).
 -- GunOpenerEnabled defaults to true; send one aimed gun click within GunEngageDistance (100 studs).
@@ -351,6 +355,7 @@ local INTERNAL = {
     PvPRetryDelay = 0.75,
     PvPMaxAttempts = 5,
     InHitboxSpeedMultiplier = 2 / 7,
+    TweenHitboxMode = TweenHitboxConfig.Mode == nil and "Tween" or TweenHitboxConfig.Mode,
     MinimumTweenY = 0,
     VerticalChaseDistance = 1000,
     ChaseMoveDuration = 1,
@@ -374,6 +379,11 @@ local INTERNAL = {
     FPSBoostWait = 5,
     ServerTimeout = 300,
 }
+
+if INTERNAL.TweenHitboxMode ~= "Tween" and INTERNAL.TweenHitboxMode ~= "CFrame" then
+    warn('[AutoBounty] Settings.TweenHitbox.Mode must be "Tween" or "CFrame"; using "Tween".')
+    INTERNAL.TweenHitboxMode = "Tween"
+end
 
 do
     local configuredLift = Settings.SafeModeInitialLift
@@ -727,6 +737,7 @@ local Runtime = {
     InsideHitbox = false,
     ChaseMoveCycle = nil,
     ChaseTweenTimeMultiplier = nil,
+    ChaseMovementMode = nil,
     SeaHeightMove = nil,
     ActiveTween = nil,
     FollowNoCombatSince = nil,
@@ -2539,6 +2550,7 @@ local function resetTargetTimers()
     stopSeaHeightMovement()
     Runtime.ChaseMoveCycle = nil
     Runtime.ChaseTweenTimeMultiplier = nil
+    Runtime.ChaseMovementMode = nil
     Runtime.FollowNoCombatSince = nil
     Runtime.FollowTimerEpoch = nil
     Runtime.FollowTimerCharacterEpoch = nil
@@ -3611,7 +3623,7 @@ local function getTargetTweenTimeMultiplier(localRoot, targetRoot)
         or not isFiniteVector3(localRoot.Position)
         or not isFiniteVector3(targetRoot.Position) then
 
-        return 1
+        return 1, false
     end
 
     local offset = targetRoot.CFrame:PointToObjectSpace(localRoot.Position)
@@ -3621,10 +3633,10 @@ local function getTargetTweenTimeMultiplier(localRoot, targetRoot)
         and math.abs(offset.Y) <= halfSize.Y
         and math.abs(offset.Z) <= halfSize.Z then
 
-        return TweenHitboxTimeMultiplier
+        return TweenHitboxTimeMultiplier, true
     end
 
-    return 1
+    return 1, false
 end
 
 local function AutoTween(goalCFrame, deltaTime, insideHitbox, timeMultiplier, speedOverride)
@@ -3661,6 +3673,29 @@ local function AutoTween(goalCFrame, deltaTime, insideHitbox, timeMultiplier, sp
         { CFrame = safeGoalCFrame }
     )
     Runtime.ActiveTween:Play()
+end
+
+function Runtime.MoveToTargetGoal(goalCFrame, deltaTime, insideHitbox, timeMultiplier, useCFrame)
+    if not useCFrame then
+        AutoTween(goalCFrame, deltaTime, insideHitbox, timeMultiplier)
+        return
+    end
+
+    local root = Runtime.Root
+    if not root or not root.Parent or not isFiniteVector3(root.Position) then
+        return
+    end
+    local safeGoal = clampCFrameAboveSea(goalCFrame)
+    if not safeGoal then
+        return
+    end
+
+    stopSeaHeightMovement()
+    if Runtime.ActiveTween then
+        Runtime.ActiveTween:Cancel()
+        Runtime.ActiveTween = nil
+    end
+    root.CFrame = safeGoal
 end
 
 function SafeEntrance.UpdateRecovery(attempt, deltaTime)
@@ -6700,7 +6735,12 @@ local function startMovementWorker()
             setStatus("Chasing " .. player.Name)
         end
             
-        local chaseTimeMultiplier = getTargetTweenTimeMultiplier(localRoot, targetRoot)
+        local chaseTimeMultiplier, insideTweenHitbox = getTargetTweenTimeMultiplier(localRoot, targetRoot)
+        local useCFrame = insideTweenHitbox and INTERNAL.TweenHitboxMode == "CFrame"
+        local chaseMovementMode = useCFrame and "CFrame" or "Tween"
+        if useCFrame then
+            chaseTimeMultiplier = 1
+        end
 
         if insideHitbox and OrbitEnabled then
     local center = getHitboxMovementCFrame(
@@ -6733,14 +6773,16 @@ local function startMovementWorker()
         math.sin(angle) * radius
     )
 
-    AutoTween(getHitboxMovementCFrame(localRoot, targetRoot, orbitPosition), deltaTime, true, chaseTimeMultiplier)
+    Runtime.MoveToTargetGoal(getHitboxMovementCFrame(localRoot, targetRoot, orbitPosition),
+        deltaTime, true, chaseTimeMultiplier, useCFrame)
     Runtime.ChaseTweenTimeMultiplier = chaseTimeMultiplier
+    Runtime.ChaseMovementMode = chaseMovementMode
     faceRootTowardTarget(localRoot, targetRoot)
 else
     local chaseGoal
     local movingToSeaHeight = false
 
-    if insideHitbox then
+    if insideHitbox or useCFrame then
         chaseGoal = getHitboxMovementCFrame(
             localRoot,
             targetRoot,
@@ -6766,10 +6808,12 @@ else
                 localRoot
             )
 
-            -- Entering/leaving the movement box must also retime an active tween during a pause.
-            if shouldAdvance or Runtime.ChaseTweenTimeMultiplier ~= chaseTimeMultiplier then
-                AutoTween(chaseGoal, deltaTime, insideHitbox, chaseTimeMultiplier)
+            -- CFrame tracks each update; switching modes must resume movement even during a pause.
+            if useCFrame or shouldAdvance or Runtime.ChaseMovementMode ~= chaseMovementMode
+                or Runtime.ChaseTweenTimeMultiplier ~= chaseTimeMultiplier then
+                Runtime.MoveToTargetGoal(chaseGoal, deltaTime, insideHitbox, chaseTimeMultiplier, useCFrame)
                 Runtime.ChaseTweenTimeMultiplier = chaseTimeMultiplier
+                Runtime.ChaseMovementMode = chaseMovementMode
             end
         end
     end
