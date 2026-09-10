@@ -41,10 +41,13 @@
 -- For a zone inside a Model, use the nearest ancestor Model's valid PrimaryPart when available.
 -- SafeModePanicEnabled defaults to true; SafeModePanicRadius defaults to 200 studs.
 -- Settings.SafeModeType = "Above" (default) or "Entrance".
--- Settings.SafeModeTweenSpeed sets Above recovery movement speed in studs per second, including X/Z panic movement.
+-- Settings.SafeModeTweenSpeed sets recovery tween speed in studs per second, including Above X/Z panic movement.
 -- It defaults to TweenSpeed; invalid/nonpositive values also fall back to TweenSpeed.
--- Entrance: request the nearest local entrance, hold the landing point until configured MaxHealth,
--- then select the nearest eligible target afresh. Low health does not mark the old target previous.
+-- Entrance: arrive at the nearest entrance, then rise at SafeModeTweenSpeed until InCombat is known false.
+-- This ascent keeps the entrance X/Z and has no SafeModeY cap; unknown combat state continues the ascent.
+-- After combat clears, hold the attained position until configured MaxHealth, then select the nearest target afresh.
+-- Reaching MaxHealth during the post-entrance ascent does not end it before combat clears.
+-- Low health does not mark the old target previous.
 -- SafeModeY is the height above the target, refreshed every Heartbeat during recovery.
 -- If the target is lost, hold the last height; without a target, rise above your entry height.
 -- Combo order follows Weapon.Order and each weapon's SkillOrder (default Z, X, C, V, F).
@@ -2461,6 +2464,13 @@ local function stopSafeModeMovement()
         if entrance.Request then
             entrance.Request.Cancelled = true
         end
+        if entrance.Tween then
+            entrance.Tween:Cancel()
+            if Runtime.ActiveTween == entrance.Tween then
+                Runtime.ActiveTween = nil
+            end
+            entrance.Tween = nil
+        end
     end
 
     local movement = Runtime.SafeModeMovement
@@ -2835,16 +2845,17 @@ function SafeEntrance.Hold(attempt)
     root.CFrame = attempt.HoldCFrame
     root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
     root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
-    local status = attempt.Entrance
-        and "SafeMode: holding at entrance until MaxHealth"
-        or "SafeMode: no entrance available; holding here until MaxHealth"
+    local status = attempt.CombatCleared
+        and "SafeMode: combat cleared; holding position until MaxHealth"
+        or (attempt.Entrance and "SafeMode: holding at entrance until MaxHealth"
+            or "SafeMode: no entrance available; holding here until MaxHealth")
     if Runtime.Status ~= status then
         setStatus(status)
     end
     return true
 end
 
-function SafeEntrance.Update(root)
+function SafeEntrance.Update(root, deltaTime)
     local attempt = Runtime.SafeModeEntrance
     if not attempt or not SafeEntrance.IsCurrent(attempt) then
         if attempt then
@@ -2869,6 +2880,9 @@ function SafeEntrance.Update(root)
     end
 
     if attempt.HoldCFrame then
+        if attempt.Arrived then
+            return SafeEntrance.UpdateRecovery(attempt, deltaTime)
+        end
         return SafeEntrance.Hold(attempt)
     end
     if not attempt.Entrance then
@@ -2885,8 +2899,9 @@ function SafeEntrance.Update(root)
 
             attempt.HoldCFrame = clampCFrameAboveSea(root.CFrame)
             if attempt.HoldCFrame then
+                attempt.Arrived = true
                 request.Cancelled = true
-                return SafeEntrance.Hold(attempt)
+                return SafeEntrance.UpdateRecovery(attempt, deltaTime)
             end
         end
 
@@ -3616,6 +3631,53 @@ local function AutoTween(goalCFrame, deltaTime, insideHitbox, timeMultiplier, sp
     Runtime.ActiveTween:Play()
 end
 
+function SafeEntrance.UpdateRecovery(attempt, deltaTime)
+    if not SafeEntrance.IsCurrent(attempt) or not attempt.Arrived or not attempt.HoldCFrame then
+        return false
+    end
+
+    local root = attempt.Root
+    if not attempt.CombatCleared then
+        local inCombat, inCombatKnown = readLocalInCombat()
+        if inCombatKnown and inCombat == false then
+            -- Hold where combat ended, rather than returning to the entrance landing point.
+            if attempt.Tween then
+                attempt.Tween:Cancel()
+                if Runtime.ActiveTween == attempt.Tween then
+                    Runtime.ActiveTween = nil
+                end
+                attempt.Tween = nil
+            end
+            local holdCFrame = clampCFrameAboveSea(root.CFrame)
+            if not holdCFrame then
+                return false
+            end
+            attempt.HoldCFrame = holdCFrame
+            attempt.CombatCleared = true
+        else
+            local landing = attempt.HoldCFrame
+            local goalY = root.Position.Y + SafeModeTweenSpeed
+            local goal = isFiniteNumber(goalY) and clampCFrameAboveSea(
+                CFrame.new(landing.Position.X, goalY, landing.Position.Z) * landing.Rotation)
+            if not goal then
+                return false
+            end
+
+            AutoTween(goal, deltaTime, false, nil, SafeModeTweenSpeed)
+            attempt.Tween = Runtime.ActiveTween
+            local status = inCombatKnown
+                and "SafeMode: rising above entrance until InCombat turns off"
+                or "SafeMode: rising above entrance; waiting for a known InCombat state"
+            if Runtime.Status ~= status then
+                setStatus(status)
+            end
+            return true
+        end
+    end
+
+    return SafeEntrance.Hold(attempt)
+end
+
 local function updateSeaHeightMovement(goalCFrame, now, targetEpoch, characterEpoch, localRoot)
     if not Runtime.Running
         or Runtime.SafeMode
@@ -3920,7 +3982,7 @@ local function updateSafeModeMovement(deltaTime)
     applyLocalNoClip()
 
     if SafeModeType == "Entrance" then
-        return SafeEntrance.Update(root)
+        return SafeEntrance.Update(root, deltaTime)
     end
 
     local safeGoal = getSafeModeMovementGoal(root)
@@ -5935,7 +5997,7 @@ enterSafeMode = function()
     applyLocalNoClip()
     Runtime.Mode = "SAFE_MODE"
     if SafeModeType == "Entrance" then
-        setStatus("SafeMode: preparing nearest entrance; waiting until MaxHealth")
+        setStatus("SafeMode: preparing nearest entrance; then rising until combat clears")
         return
     end
     setStatus(string.format(
@@ -5949,6 +6011,17 @@ end
 exitSafeMode = function()
     if not Runtime.SafeMode or Runtime.LocalDead then
         return
+    end
+
+    local entrance = Runtime.SafeModeEntrance
+    if SafeModeType == "Entrance" and not Runtime.EmptyHopCommitted
+        and entrance and entrance.Arrived and not entrance.CombatCleared
+        and SafeEntrance.IsCurrent(entrance) then
+
+        local inCombat, inCombatKnown = readLocalInCombat()
+        if not inCombatKnown or inCombat ~= false then
+            return
+        end
     end
 
     Runtime.SafeMode = false
