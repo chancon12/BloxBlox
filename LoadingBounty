@@ -179,6 +179,23 @@ Combo = {
                 {Weapon = "Sanguine Art", Key = "C", Hold = 0.1},
             },
         },
+
+        {
+            Name = "Godhuman + Cursed Dual Katana + Yeti",
+            Enabled = true,
+            RequiredWeapons = {"Godhuman", "Cursed Dual Katana", "Yeti-Yeti"},
+            Steps = {
+                {Weapon = "Godhuman", Key = "C", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.1},
+                {Weapon = "Yeti-Yeti", Key = "F", Hold = 0.1},
+                {Weapon = "Yeti-Yeti", Key = "X", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Yeti-Yeti", Key = "Z", Hold = 0.1},
+                {Weapon = "Yeti-Yeti", Key = "C", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+            },
+        },
     },
 },
 
