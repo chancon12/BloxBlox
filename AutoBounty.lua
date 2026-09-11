@@ -6,6 +6,11 @@
 -- SeaHeightFirst, SeaHeightStallTimeout, GunOpenerEnabled, GunEngageDistance, MaxTargetDistance,
 -- Aimbot, TargetWeaponFilter, optional Config.Combo, and optional ReadSkillCooldown.
 -- Settings.FPSBoost defaults to true; false skips startup graphics changes and their 5-second wait.
+-- FPSBoostLive defaults to true: batch newly added effects and suppress later visual reactivation.
+-- FPSBoostEffectFolders defaults to {"Effects", "VFX", "VisualEffects"}; matches ancestor names exactly.
+-- Parts under these folders/models are hidden. FPSBoostHideMeshes=true also hides meshes elsewhere,
+-- including character/map meshes; false/omitted preserves those meshes. Nothing is destroyed or anchored.
+-- Stopping/reloading disconnects FPS watchers; already-applied graphics changes are not restored.
 -- Settings.Region = "Singapore, America" accepts either reported region (case-insensitive substring).
 -- Region = "" or omitted allows any region. Filtered hops use __ServerBrowser region listings.
 -- Settings.ServerHopMode = "Populated" (default) or "Random", applied to eligible servers per page.
@@ -134,6 +139,11 @@ local Config = Environment.AutoBountyConfig
 local LoaderToken = Environment.__AutoBountyLoaderToken
 local BootstrapToken = {}
 
+-- A boost may still own listeners during startup, before its Runtime exists.
+if type(Environment.__AutoBountyFPSBoost) == "table"
+    and type(Environment.__AutoBountyFPSBoost.Stop) == "function" then
+    pcall(Environment.__AutoBountyFPSBoost.Stop, Environment.__AutoBountyFPSBoost)
+end
 Environment.__AutoBountyBootstrapToken = BootstrapToken
 
 local function bootstrapStillCurrent()
@@ -472,7 +482,6 @@ if not bootstrapStillCurrent() then
 end
 
 assert(LocalPlayer, "[AutoBounty] LocalPlayer is unavailable")
-print("[AutoBounty] Module started for " .. LocalPlayer.Name)
 
 local Remotes = ReplicatedStorage:WaitForChild("Remotes", 30)
 assert(Remotes, "[AutoBounty] ReplicatedStorage.Remotes was not found within 30 seconds")
@@ -498,13 +507,11 @@ end
 
 -- Select the team first. In the current client, DataLoaded's presence is the
 -- usable marker; its BoolValue.Value can remain false after gameplay is ready.
-print("[AutoBounty] Selecting team: " .. Config.Team)
 local TeamRequestOk, TeamRequestResult = pcall(function()
     return CommF:InvokeServer("SetTeam", Config.Team)
 end)
 
 if not bootstrapStillCurrent() then
-    print("[AutoBounty] Startup superseded after team request")
     return
 end
 
@@ -533,12 +540,196 @@ assert(
 )
 
 -- The startup delay is measured from the start of the FPS boost, not its completion.
-local StartupFPSBoost = {Cancelled = false}
+local StartupFPSBoost = {
+    Cancelled = false,
+    Queue = {}, Queued = {}, Head = 1, Tail = 0,
+    Watched = {}, Connections = {}, WorkerScheduled = false,
+}
+do
+    local live = Settings.FPSBoostLive ~= false
+    local hideMeshes = Settings.FPSBoostHideMeshes == true
+    local effectFolders = {}
+    local configuredFolders = type(Settings.FPSBoostEffectFolders) == "table"
+        and Settings.FPSBoostEffectFolders or {"Effects", "VFX", "VisualEffects"}
+    for _, name in ipairs(configuredFolders) do
+        if type(name) == "string" and name ~= "" then
+            effectFolders[name] = true
+        end
+    end
+
+    local zeroRange = NumberRange.new(0)
+    local invisible = NumberSequence.new(1)
+    local partProperties = {Material = Enum.Material.Plastic, Reflectance = 0}
+    local hiddenPartProperties = {
+        Material = Enum.Material.Plastic, Reflectance = 0,
+        Transparency = 1, LocalTransparencyModifier = 1, CastShadow = false,
+    }
+    local disabledProperties = {Enabled = false}
+    local rules = {
+        ParticleEmitter = {Enabled = false, Rate = 0, Lifetime = zeroRange,
+            Speed = zeroRange, Transparency = invisible},
+        Trail = {Enabled = false, Lifetime = 0, Transparency = invisible},
+        Beam = {Enabled = false, Transparency = invisible},
+        Explosion = {Visible = false, BlastPressure = 1, BlastRadius = 1},
+        Fire = disabledProperties, Smoke = disabledProperties, Sparkles = disabledProperties,
+    }
+    local decalProperties = {Transparency = 1}
+
+    local function sameValue(current, desired)
+        local kind = typeof(desired)
+        if kind == "NumberRange" then
+            return typeof(current) == kind and current.Min == desired.Min and current.Max == desired.Max
+        elseif kind == "NumberSequence" then
+            if typeof(current) ~= kind then return false end
+            for _, point in ipairs(current.Keypoints) do
+                if point.Value ~= 1 or point.Envelope ~= 0 then return false end
+            end
+            return true
+        end
+        return current == desired
+    end
+
+    function StartupFPSBoost:Forget(instance)
+        local record = self.Watched[instance]
+        if record and record.Connection then record.Connection:Disconnect() end
+        self.Watched[instance] = nil
+    end
+
+    function StartupFPSBoost:Stop()
+        self.Cancelled = true
+        for _, connection in ipairs(self.Connections) do connection:Disconnect() end
+        table.clear(self.Connections)
+        for _, record in pairs(self.Watched) do
+            if record.Connection then record.Connection:Disconnect() end
+        end
+        table.clear(self.Watched)
+        table.clear(self.Queue)
+        table.clear(self.Queued)
+        self.Head, self.Tail = 1, 0
+        if Environment.__AutoBountyFPSBoost == self then Environment.__AutoBountyFPSBoost = nil end
+    end
+
+    function StartupFPSBoost:IsCurrent()
+        if self.Cancelled or not bootstrapStillCurrent() or Settings.FPSBoost == false then
+            self:Stop()
+            return false
+        end
+        return true
+    end
+
+    function StartupFPSBoost:IsEffectPart(instance)
+        local ancestor = instance.Parent
+        while ancestor and ancestor ~= game do
+            if effectFolders[ancestor.Name]
+                and (ancestor:IsA("Folder") or ancestor:IsA("Model")) then
+                return true
+            end
+            ancestor = ancestor.Parent
+        end
+        return false
+    end
+
+    function StartupFPSBoost:Enqueue(instance)
+        if not self:IsCurrent() or self.Queued[instance] then return end
+        self.Tail = self.Tail + 1
+        self.Queue[self.Tail] = instance
+        self.Queued[instance] = true
+        if self.WorkerScheduled then return end
+        self.WorkerScheduled = true
+        task.defer(function()
+            while self:IsCurrent() and self.Head <= self.Tail do
+                local processed, started = 0, os.clock()
+                repeat
+                    local item = self.Queue[self.Head]
+                    self.Queue[self.Head] = nil
+                    self.Head = self.Head + 1
+                    if item then
+                        self.Queued[item] = nil
+                        pcall(self.Apply, self, item)
+                    end
+                    processed = processed + 1
+                until self.Head > self.Tail or processed >= 128 or os.clock() - started >= 0.002
+                if self.Head <= self.Tail then task.wait() end
+            end
+            self.WorkerScheduled = false
+            self.Head, self.Tail = 1, 0
+        end)
+    end
+
+    function StartupFPSBoost:Apply(instance)
+        if not self:IsCurrent() or not instance.Parent or not instance:IsDescendantOf(game) then
+            return false
+        end
+        local properties = rules[instance.ClassName]
+        if instance:IsA("BasePart") and not instance:IsA("Terrain") then
+            local hide = self:IsEffectPart(instance)
+                or (hideMeshes and (instance:IsA("MeshPart")
+                    or instance:FindFirstChildWhichIsA("DataModelMesh") ~= nil))
+            properties = hide and hiddenPartProperties or partProperties
+        elseif instance:IsA("DataModelMesh") then
+            -- A SpecialMesh can be inserted after its parent Part was already processed.
+            if instance.Parent:IsA("BasePart") then self:Apply(instance.Parent) end
+            return true
+        elseif instance:IsA("Decal") or instance:IsA("Texture") then
+            properties = decalProperties
+        elseif instance:IsA("Light") or instance:IsA("PostEffect") then
+            properties = disabledProperties
+        end
+        if not properties then return false end
+
+        local record = self.Watched[instance]
+        if record then record.Applying = true; record.Properties = properties end
+        local ok = pcall(function()
+            for property, desired in pairs(properties) do
+                if not sameValue(instance[property], desired) then instance[property] = desired end
+            end
+            if instance:IsA("ParticleEmitter") or instance:IsA("Trail") then instance:Clear() end
+        end)
+        if record then record.Applying = false end
+        if not ok then return false end
+
+        -- Ordinary map/character parts receive one graphics pass, not per-frame property watchers.
+        if live and properties ~= partProperties and not record then
+            record = {Properties = properties, Applying = false}
+            self.Watched[instance] = record
+            local function changed(property)
+                local desired = record.Properties[property]
+                if desired == nil or record.Applying or self.Cancelled then return end
+                local readOK, matches = pcall(function() return sameValue(instance[property], desired) end)
+                if readOK and not matches then self:Enqueue(instance) end
+            end
+            if properties == hiddenPartProperties then
+                -- Local invisibility survives Transparency/CFrame tweens without fighting every frame.
+                record.Connection = instance:GetPropertyChangedSignal("LocalTransparencyModifier"):Connect(function()
+                    changed("LocalTransparencyModifier")
+                end)
+            else
+                record.Connection = instance.Changed:Connect(changed)
+            end
+        end
+        return true
+    end
+
+    function StartupFPSBoost:StartLive()
+        if not live or not self:IsCurrent() then return end
+        self.Connections[#self.Connections + 1] = game.DescendantAdded:Connect(function(instance)
+            self:Enqueue(instance)
+        end)
+        self.Connections[#self.Connections + 1] = game.DescendantRemoving:Connect(function(instance)
+            self:Forget(instance)
+        end)
+        -- Also clean up superseded startup listeners when no new objects arrive.
+        task.spawn(function()
+            while self:IsCurrent() do task.wait(1) end
+        end)
+    end
+end
 if Settings.FPSBoost ~= false then
+    Environment.__AutoBountyFPSBoost = StartupFPSBoost
     local resumeAt = os.clock() + INTERNAL.FPSBoostWait
-    print("[AutoBounty][FPSBoost] Team confirmed; applying FPS boost")
+    StartupFPSBoost:StartLive()
     task.spawn(function()
-        if StartupFPSBoost.Cancelled or not bootstrapStillCurrent() then
+        if not StartupFPSBoost:IsCurrent() then
             return
         end
         local qualityOK, qualityError = pcall(function()
@@ -548,50 +739,21 @@ if Settings.FPSBoost ~= false then
             warn("[AutoBounty][FPSBoost] Could not set rendering quality: " .. tostring(qualityError))
         end
 
-        local decalsyeeted = true
-        local changed, skipped = 0, 0
         for index, instance in ipairs(game:GetDescendants()) do
-            if StartupFPSBoost.Cancelled or not bootstrapStillCurrent() then
+            if not StartupFPSBoost:IsCurrent() then
                 return
             end
 
-            local ok, applied = pcall(function()
-                if instance:IsA("BasePart") and not instance:IsA("Terrain") then
-                    instance.Material = Enum.Material.Plastic
-                    instance.Reflectance = 0
-                elseif (instance:IsA("Decal") or instance:IsA("Texture")) and decalsyeeted then
-                    instance.Transparency = 1
-                elseif instance:IsA("ParticleEmitter") then
-                    instance.Lifetime = NumberRange.new(0)
-                elseif instance:IsA("Trail") then
-                    instance.Lifetime = 0
-                elseif instance:IsA("Explosion") then
-                    instance.BlastPressure = 1
-                    instance.BlastRadius = 1
-                elseif instance:IsA("Fire") or instance:IsA("SpotLight") or instance:IsA("Smoke") then
-                    instance.Enabled = false
-                else
-                    return false
-                end
-                return true
-            end)
-
-            if not ok then
-                skipped = skipped + 1
-            elseif applied then
-                changed = changed + 1
-            end
+            pcall(StartupFPSBoost.Apply, StartupFPSBoost, instance)
 
             if index % 250 == 0 then
                 task.wait()
             end
         end
 
-        if StartupFPSBoost.Cancelled or not bootstrapStillCurrent() then
+        if not StartupFPSBoost:IsCurrent() then
             return
         end
-        print(string.format("[AutoBounty][FPSBoost] Complete; applied to %d objects; skipped %d",
-            changed, skipped))
     end)
 
     local remaining = resumeAt - os.clock()
@@ -599,20 +761,16 @@ if Settings.FPSBoost ~= false then
         task.wait(remaining)
     end
     if not bootstrapStillCurrent() then
+        StartupFPSBoost:Stop()
         return
     end
-    print("[AutoBounty][FPSBoost] Startup delay finished; continuing startup")
-else
-    print("[AutoBounty][FPSBoost] Disabled; continuing startup")
 end
 
-print("[AutoBounty] Waiting for DataLoaded marker and Data.Level")
 
 local DataLoadedDeadline = os.clock() + 60
 local DataLoaded
 local LoadedData
 local LoadedLevelObject
-local LoadedLevel
 local StableDataLoaded
 local StableData
 local StableLevelObject
@@ -632,6 +790,7 @@ while bootstrapStillCurrent() and os.clock() < DataLoadedDeadline do
         and tonumber(levelObject.Value)
 
     if current and not current:IsA("BoolValue") then
+        StartupFPSBoost:Stop()
         error("[AutoBounty] LocalPlayer.DataLoaded must be a BoolValue")
     end
 
@@ -657,7 +816,6 @@ while bootstrapStillCurrent() and os.clock() < DataLoadedDeadline do
                 DataLoaded = current
                 LoadedData = data
                 LoadedLevelObject = levelObject
-                LoadedLevel = level
                 break
             end
         else
@@ -677,6 +835,7 @@ while bootstrapStillCurrent() and os.clock() < DataLoadedDeadline do
 end
 
 if not bootstrapStillCurrent() then
+    StartupFPSBoost:Stop()
     return
 end
 
@@ -697,6 +856,7 @@ local readinessStillValid = LocalPlayer.Team
     and finalLevel >= 1
 
 if not readinessStillValid then
+    StartupFPSBoost:Stop()
     error(
         "[AutoBounty] Readiness timed out or changed: team="
             .. LastTeamName
@@ -707,15 +867,8 @@ if not readinessStillValid then
     )
 end
 
-LoadedLevel = finalLevel
-print(
-    "[AutoBounty] Readiness confirmed; DataLoaded.Value="
-        .. tostring(DataLoaded.Value)
-        .. ", Level="
-        .. tostring(LoadedLevel)
-)
-
 if not bootstrapStillCurrent() then
+    StartupFPSBoost:Stop()
     return
 end
 
@@ -1150,18 +1303,13 @@ function SavedAccountCheck.Initialize()
     end
 
     local folder = SavedAccountCheck.Folder
-    local ownPath = folder .. "/" .. ownId .. ".txt"
     SavedBounty.Attach(ownId, folderExists, createFolder, fileExists, saveFile, readFile)
 
     if not SavedAccountCheck.StillCurrent() or not SavedAccountCheck.Enabled then
         return
     end
 
-    if SavedBounty.Record and SavedBounty.Record.Registered then
-        print("[AutoBounty][SavedAccounts] Local UserId=" .. ownId .. " | File=" .. ownPath)
-    end
     local matchedIds = {}
-    local matchCount = 0
 
     -- Snapshot only the other accounts present at startup; no filesystem polling.
     for _, player in ipairs(Players:GetPlayers()) do
@@ -1176,7 +1324,6 @@ function SavedAccountCheck.Initialize()
                     warnOnce("saved-account:scan", "Could not check saved account files: " .. tostring(exists))
                 elseif exists == true and player.Parent == Players then
                     matchedIds[player.UserId] = true
-                    matchCount = matchCount + 1
                 end
             end
         end
@@ -1184,7 +1331,6 @@ function SavedAccountCheck.Initialize()
 
     SavedAccountCheck.MatchedIds = matchedIds
     SavedAccountCheck.Ready = true
-    print("[AutoBounty][SavedAccounts] Startup scan | Other saved accounts=" .. tostring(matchCount))
 end
 
 function SavedAccountCheck.FindPresent()
@@ -3008,7 +3154,6 @@ function WinEntrance.Finish(attempt, state, message)
     if not Runtime.Running or Environment.__AutoBountyRuntime ~= Runtime then
         return
     end
-    print("[AutoBounty][WinEntrance] " .. message)
     if Runtime.SafeMode then
         Runtime.Mode = "SAFE_MODE"
     elseif Runtime.LocalDead then
@@ -3060,8 +3205,6 @@ function WinEntrance.OnIncrease(before, after)
     -- The reward may arrive after target death has already cleared CurrentTarget.
     -- Preserve any current selection without attributing the reward to that player.
     suspendTargetForRecovery()
-    print(string.format("[AutoBounty][WinEntrance] Bounty/Honor increased by %s (%s -> %s); entrance queued",
-        tostring(attempt.Gain), tostring(before), tostring(after)))
     if not Runtime.SafeMode then
         Runtime.Mode = "WIN_ENTRANCE"
         setStatus("Bounty/Honor increased; preparing nearest entrance")
@@ -3106,7 +3249,6 @@ function WinEntrance.Update()
                     and os.clock() < attempt.Deadline
             end, function()
                 attempt.Started = true
-                print("[AutoBounty][WinEntrance] requestEntrance dispatched | Entrance=" .. tostring(attempt.Entrance))
             end)
 
             -- A timed-out, stopped or replaced attempt cannot affect the next one.
@@ -4759,13 +4901,6 @@ local function castSkill(keyName, skillConfig, targetEpoch, attackMode, holdOver
         return false
     end
 
-    print(string.format(
-        "[AutoBounty][Combo] KeyDown | Weapon=%s | Key=%s | Hold=%.2fs | Target=%s",
-        tostring(Runtime.CurrentTool and Runtime.CurrentTool.Name or "Unknown"),
-        tostring(keyName),
-        holdTime,
-        tostring(Runtime.CurrentTarget and Runtime.CurrentTarget.Name or "None")
-    ))
 
     local waitOk, completed = pcall(waitWhileAttackable, holdTime, targetEpoch, attackMode)
     releaseKey(keyName)
@@ -4951,10 +5086,6 @@ function CombatActions.CastDefaultSkill(entry, targetEpoch, characterEpoch)
         Runtime.AimActive = false
         return false
     end
-    print(string.format(
-        "[AutoBounty][Combo] KeyDown | Mode=DefaultSpam | Weapon=%s | Key=%s | Hold=%s | Target=%s",
-        entry.Tool.Name, entry.Key, holdTime == 0 and "1 Heartbeat" or string.format("%.2fs", holdTime),
-        tostring(Runtime.CurrentTarget and Runtime.CurrentTarget.Name or "None")))
 
     -- A single worker owns the key for one Heartbeat or the resolved duration.
     local ok, err = pcall(function()
@@ -5478,12 +5609,6 @@ function CombatActions.NormalAttack(targetEpoch, bypassInterval)
 
     if not success then
         warnOnce("normal-attack:fire", "NormalAttack failed: " .. tostring(result))
-    else
-        print(string.format(
-            "[AutoBounty][ClickAttack] Blade attack sent | Weapon=%s | Target=%s",
-            tostring(tool.Name),
-            tostring(info.Player.Name)
-        ))
     end
 
     return success
@@ -5703,10 +5828,6 @@ function CombatActions.GunOpener(tool, targetEpoch, characterEpoch)
         request.Started = true
         Runtime.GunMouseHeld = request
         VirtualInputManager:SendMouseButtonEvent(request.X, request.Y, 0, true, game, 0)
-        print(string.format(
-            "[AutoBounty][GunClick] MouseButton1 sent | Weapon=%s | Target=%s | Screen=(%d,%d)",
-            tostring(tool.Name), tostring(targetInfo.Player.Name), request.X, request.Y
-        ))
 
         local releaseAt = os.clock() + 0.05
         while os.clock() < releaseAt and stillValid() do
@@ -5714,18 +5835,6 @@ function CombatActions.GunOpener(tool, targetEpoch, characterEpoch)
         end
         Runtime.ReleaseGunClick(request)
 
-        local shotsAfter = tool:GetAttribute("LocalTotalShots")
-        if isFiniteNumber(shotsBefore) and isFiniteNumber(shotsAfter) and shotsAfter > shotsBefore then
-            print(string.format(
-                "[AutoBounty][Gun] Controller shot counter advanced | Weapon=%s | Before=%s | After=%s",
-                tostring(tool.Name), tostring(shotsBefore), tostring(shotsAfter)
-            ))
-        else
-            print(string.format(
-                "[AutoBounty][Gun] Click sent; no controller shot-count increase observed | Weapon=%s | Target=%s",
-                tostring(tool.Name), tostring(targetInfo.Player.Name)
-            ))
-        end
         return true
     end)
 
@@ -5826,33 +5935,14 @@ local function startWeaponWorker()
                     gunPreparationAttempts = gunPreparationAttempts + 1
                     local gunConfig = WeaponConfig.Gun
                     local tool = resolveTool("Gun", gunConfig)
-                    local targetName = tostring(Runtime.CurrentTarget and Runtime.CurrentTarget.Name or "None")
                     local requestStarted = false
-                    local failureReason
 
-                    if not tool then
-                        failureReason = "No matching gun for Name=" .. tostring(gunConfig.Name or "Auto")
-                            .. "; Auto requires a Tool with ToolTip=Gun"
-                    else
-                        print(string.format(
-                            "[AutoBounty][Gun] Equipping | Weapon=%s | Target=%s | Attempt=%d/3",
-                            tostring(tool.Name), targetName, gunPreparationAttempts
-                        ))
-
-                        if not equipTool(tool, targetEpoch, "GunApproach") then
-                            failureReason = "Equip failed or the target left the gun approach phase"
-                        elseif Runtime.CharacterEpoch ~= comboCharacterEpoch then
-                            failureReason = "Local character changed during equip"
-                        else
-                            print(string.format(
-                                "[AutoBounty][Gun] Equipped | Weapon=%s | Target=%s",
-                                tostring(tool.Name), targetName
-                            ))
-                            local clicked
-                            clicked, requestStarted, failureReason = CombatActions.GunOpener(
-                                tool, targetEpoch, comboCharacterEpoch
-                            )
-                        end
+                    if tool and equipTool(tool, targetEpoch, "GunApproach")
+                        and Runtime.CharacterEpoch == comboCharacterEpoch then
+                        local clicked
+                        clicked, requestStarted = CombatActions.GunOpener(
+                            tool, targetEpoch, comboCharacterEpoch
+                        )
                     end
 
                     if Runtime.TargetEpoch == targetEpoch
@@ -5861,13 +5951,6 @@ local function startWeaponWorker()
                         gunPassFinished = requestStarted or gunPreparationAttempts >= 3
                         nextGunPreparationAt = os.clock() + 0.25
 
-                        if not requestStarted then
-                            print(string.format(
-                                "[AutoBounty][Gun] %s | Target=%s | Attempt=%d/3 | Reason=%s",
-                                gunPassFinished and "Preparation stopped" or "Preparation will retry if still in approach range",
-                                targetName, gunPreparationAttempts, tostring(failureReason or "Gun click was not sent")
-                            ))
-                        end
                     end
 
                     Runtime.ReleaseGunClick()
@@ -7006,7 +7089,6 @@ function ServerTimeout.StartWorker()
                 local inCombat, inCombatKnown = readLocalInCombat()
                 if inCombatKnown and inCombat == false then
                     ServerTimeout.Pending = true
-                    print("[AutoBounty][ServerHop] 5-minute server timeout; InCombat=false")
                     if not requestHop("server-timeout", "5-minute server timeout") then
                         ServerTimeout.Pending = false
                     end
@@ -7285,8 +7367,6 @@ function PublicHop.Initialize()
         warn("[AutoBounty][ServerHop] Teleport failed: " .. tostring(result) .. " | " .. tostring(message))
     end)
 
-    print(string.format("[AutoBounty][ServerHop] Current PlaceId=%s | JobId=%s",
-        tostring(PublicHop.PlaceId), tostring(PublicHop.SourceJobId)))
 end
 
 function PublicHop.BeginPage(context)
@@ -7545,9 +7625,6 @@ function PublicHop.Dispatch(server, context)
         state.NextAttemptAt = attempt.StartedAt + INTERNAL.ServerRetryDelay
         Runtime.Teleporting = true
         Runtime.Mode = "HOPPING"
-        print(string.format("[AutoBounty][ServerHop] Trying via __ServerBrowser | PlaceId=%s | JobId=%s | Players=%d/%d | Region=%s",
-            tostring(PublicHop.PlaceId), attempt.JobId, server.Playing, server.MaxPlayers,
-            tostring(server.Region or "Any")))
         setStatus(string.format("Joining server (%d/%d); retry in 0.1 seconds if still here",
             server.Playing, server.MaxPlayers))
 
@@ -7940,7 +8017,7 @@ function Runtime:Stop(reason)
     self.Running = false
 
     table.clear(SavedTargetFilter.Entries)
-    StartupFPSBoost.Cancelled = true
+    StartupFPSBoost:Stop()
     ServerTimeout.Pending = false
     PublicHop.CancelSearch()
     if self.HopAttempt then
@@ -8015,9 +8092,6 @@ function Runtime:Stop(reason)
         Environment.__AutoBountyRuntime = nil
     end
 
-    if reason ~= "reload" then
-        print("[AutoBounty] Stopped: " .. tostring(reason or "requested"))
-    end
 end
 
 SavedTargetFilter.Initialize()
@@ -8040,7 +8114,6 @@ do
     if savedAccount then
         local detail = savedAccount.Name .. " (" .. tostring(savedAccount.UserId) .. ")"
         if AutoHopEnabled then
-            print("[AutoBounty][SavedAccounts] Found " .. detail .. "; queuing server hop")
             requestHop("saved-account", detail)
         else
             warnOnce("saved-account:hop-disabled", "Saved account " .. detail .. " is present, but AutoHop is disabled.")
