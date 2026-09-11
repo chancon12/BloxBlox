@@ -39,7 +39,6 @@ Environment.AutoBountyConfig = {
 
 Combo = {
     Enabled = true,
-
     Profiles = {
         {
             Name = "Blizzard + Cursed Dual Katana",
@@ -55,7 +54,6 @@ Combo = {
                 {Weapon = "Godhuman", Key = "X", Hold = 0.1},
             },
         },
-
         {
             Name = "Blizzard + Shark Anchor",
             Enabled = true,
@@ -70,7 +68,6 @@ Combo = {
                 {Weapon = "Godhuman", Key = "X", Hold = 0.1},
             },
         },
-
         {
             Name = "Magma + Soul Guitar + Cursed Dual Katana + Godhuman",
             Enabled = true,
@@ -86,7 +83,6 @@ Combo = {
                 {Weapon = "Godhuman", Key = "X", Hold = 0.1},
             },
         },
-
         {
             Name = "Ice + Soul Guitar + Cursed Dual Katana + Godhuman",
             Enabled = true,
@@ -101,7 +97,6 @@ Combo = {
                 {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.5},
             },
         },
-
         {
             Name = "Dough + Soul Guitar + Shark Anchor + Godhuman",
             Enabled = true,
@@ -118,7 +113,6 @@ Combo = {
                 {Weapon = "Dough-Dough", Key = "C", Hold = 0.1},
             },
         },
-
         {
             Name = "T-Rex + Soul Guitar + Cursed Dual Katana + Godhuman",
             Enabled = true,
@@ -132,7 +126,6 @@ Combo = {
                 {Weapon = "T-Rex-T-Rex", Key = "X", Hold = 0.1},
             },
         },
-
         {
             Name = "Kitsune + Soul Guitar + Cursed Dual Katana + Godhuman",
             Enabled = true,
@@ -148,7 +141,6 @@ Combo = {
                 {Weapon = "Kitsune-Kitsune", Key = "Z", Hold = 0.1},
             },
         },
-
         {
             Name = "Yeti + Soul Guitar + Shark Anchor + Godhuman",
             Enabled = true,
@@ -164,7 +156,6 @@ Combo = {
                 {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
             },
         },
-
         {
             Name = "Gravity Blade + Sanguine Art + Ice",
             Enabled = true,
@@ -179,7 +170,6 @@ Combo = {
                 {Weapon = "Sanguine Art", Key = "C", Hold = 0.1},
             },
         },
-
         {
             Name = "Godhuman + Cursed Dual Katana + Yeti",
             Enabled = true,
@@ -196,7 +186,6 @@ Combo = {
                 {Weapon = "Godhuman", Key = "X", Hold = 0.1},
             },
         },
-
         {
             Name = "Godhuman + Dough + Cursed Dual Katana + Kabucha",
             Enabled = true,
@@ -212,6 +201,22 @@ Combo = {
                 {Weapon = "Godhuman", Key = "X", Hold = 0.1},
                 {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
                 {Weapon = "Godhuman", Key = "C", Hold = 0.1},
+            },
+        },
+        {
+            Name = "Dragon + Dragonstorm + Dragonheart + Dragon Talon",
+            Enabled = true,
+            RequiredWeapons = {"Dragon-Dragon", "Dragonstorm", "Dragonheart", "Dragon Talon"},
+            Steps = {
+                {Weapon = "Dragon-Dragon", Key = "C", Hold = 0.5},
+                {Weapon = "Dragon-Dragon", Key = "X", Hold = 0.1},
+                {Weapon = "Dragonstorm", Key = "Z", Hold = 0.1}, -- Air version depends on character state
+                {Weapon = "Dragonstorm", Key = "X", Hold = 0.1},
+                {Weapon = "Dragonheart", Key = "Z", Hold = 0.5},
+                {Weapon = "Dragon Talon", Key = "Z", Hold = 0.1},
+                {Weapon = "Dragon Talon", Key = "X", Hold = 0.1},
+                {Weapon = "Dragonheart", Key = "X", Hold = 0.5}, -- Adjustable hold, not a verified maximum
+                {Weapon = "Dragon-Dragon", Key = "Z", Hold = 0.1},
             },
         },
     },
