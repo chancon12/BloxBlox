@@ -196,6 +196,24 @@ Combo = {
                 {Weapon = "Godhuman", Key = "X", Hold = 0.1},
             },
         },
+
+        {
+            Name = "Godhuman + Dough + Cursed Dual Katana + Kabucha",
+            Enabled = true,
+            RequiredWeapons = {"Godhuman", "Dough-Dough", "Cursed Dual Katana", "Kabucha"},
+            Steps = {
+                {Weapon = "Godhuman", Key = "C", Hold = 0.5},
+                {Weapon = "Dough-Dough", Key = "X", Hold = 0.1}, -- Air version depends on character state
+                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 1.0}, -- Adjustable hold
+                {Weapon = "Kabucha", Key = "X", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
+                {Weapon = "Dough-Dough", Key = "V", Hold = 0.1},
+                {Weapon = "Dough-Dough", Key = "X", Hold = 0.1}, -- Ground version depends on character state
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.1},
+            },
+        },
     },
 },
 
