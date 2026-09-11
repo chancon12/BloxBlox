@@ -336,9 +336,9 @@ Combo = {
         FPSBoost = true, -- true = enabled, false = disabled
         FPSBoostLive = true,
         -- true hides ALL meshes, including map and character meshes.
-        FPSBoostHideMeshes = true,
+        FPSBoostHideMeshes = false,
         -- Hide effect parts under folders/models with these names.
-        FPSBoostEffectFolders = {"Effects", "VFX", "VisualEffects"},
+        FPSBoostEffectFolders = {"_WorldOrigin"},
 
         Region = "", -- "" = any region
         ServerHopMode = "Random",
