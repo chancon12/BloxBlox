@@ -31,6 +31,7 @@
 -- Players with AutoBountyAccounts/<UserId>.txt are excluded from targeting, independent of hop settings.
 -- Exact filenames are checked at startup and every second; unchecked accounts wait until verified.
 -- WinEntrance defaults to true: a positive Bounty/Honor change queues the nearest local entrance.
+-- A Bounty/Honor decrease queues a server hop when AutoHop is enabled.
 -- Initial/rebound stats establish a baseline; gains during one pending exit are combined.
 -- Attacks/chasing/hop execution resume after arrival or a bounded 5-second entrance attempt.
 -- Race flags belong in Config.Settings and require an explicit true.
@@ -926,6 +927,7 @@ local Runtime = {
     EmptyHopMovement = nil,
     HopReason = nil,
     FollowTimeoutHopDetail = nil,
+    BountyLossHopDetail = nil,
     HopWorkerRunning = false,
     HopAttemptEpoch = 0,
     HopSearch = nil,
@@ -1753,6 +1755,7 @@ local function startBountyValueBinder()
                             WinEntrance.OnIncrease(before, value)
                         elseif before and value < before then
                             SavedBounty.AddLoss(before - value)
+                            Runtime.OnBountyLoss(before - value)
                         end
                     end
 
@@ -3390,6 +3393,7 @@ function WinEntrance.OnIncrease(before, after)
     if not WinEntrance.Enabled or not Runtime.Running or not bootstrapStillCurrent()
         or Environment.__AutoBountyRuntime ~= Runtime
         or Runtime.EmptyHopCommitted
+        or Runtime.BountyLossHopDetail
         or Runtime.LocalDead or not isFiniteNumber(before) or not isFiniteNumber(after)
         or after <= before then
 
@@ -7457,6 +7461,11 @@ determineHopReason = function()
         return nil
     end
 
+    -- A loss remains a hop reason through combat, recovery, and respawn.
+    if Runtime.BountyLossHopDetail then
+        return "bounty-loss", Runtime.BountyLossHopDetail
+    end
+
     local friend = findFriendInServer()
 
     if friend then
@@ -7493,6 +7502,7 @@ local HOP_PRIORITY = {
     ["server-timeout"] = 1,
     ["saved-account"] = 2,
     friend = 3,
+    ["bounty-loss"] = 4,
 }
 
 local PublicHop = {
@@ -7560,6 +7570,7 @@ local function stopHopPending(message)
     Runtime.HopReason = nil
     Runtime.HopDetail = nil
     Runtime.FollowTimeoutHopDetail = nil
+    Runtime.BountyLossHopDetail = nil
 
     if Runtime.Running and not Runtime.SafeMode and not Runtime.LocalDead then
         Runtime.Mode = "SCAN"
@@ -8163,6 +8174,8 @@ requestHop = function(reason, detail)
 
     if reason == "follow-timeout" then
         Runtime.FollowTimeoutHopDetail = detail or "PlayerFollowTime expired"
+    elseif reason == "bounty-loss" then
+        Runtime.BountyLossHopDetail = detail or "Bounty/Honor decreased"
     end
 
     if not Runtime.HopPending then
@@ -8173,6 +8186,9 @@ requestHop = function(reason, detail)
     Runtime.HopPending = true
     Runtime.HopReason = reason
     Runtime.HopDetail = detail
+    if reason == "bounty-loss" and Runtime.WinEntranceAttempt then
+        WinEntrance.Finish(Runtime.WinEntranceAttempt, "cancelled", "Bounty loss; server hop queued")
+    end
     if not Runtime.WinEntranceAttempt then
         clearTarget()
     end
@@ -8193,6 +8209,21 @@ requestHop = function(reason, detail)
 
     runHopWorker()
     return true
+end
+
+function Runtime.OnBountyLoss(amount)
+    if not Runtime.Running or not AutoHopEnabled or not bootstrapStillCurrent()
+        or Environment.__AutoBountyRuntime ~= Runtime
+        or not isFiniteNumber(amount) or amount <= 0 then
+        return false
+    end
+
+    -- Additional losses still count in SavedBounty, without restarting the hop.
+    if Runtime.BountyLossHopDetail then
+        return true
+    end
+
+    return requestHop("bounty-loss", "Lost " .. formatNumber(amount) .. " Bounty/Honor")
 end
 
 local function startFriendWorker()
@@ -8392,6 +8423,7 @@ function Runtime:Stop(reason)
     end
 
     self.FollowTimeoutHopDetail = nil
+    self.BountyLossHopDetail = nil
     self.HopAttemptEpoch = self.HopAttemptEpoch + 1
     self.Teleporting = false
     self.TargetEpoch = self.TargetEpoch + 1
