@@ -433,7 +433,7 @@ _G["HoHo Hub Auto Bounty V67"] = {
         ["Max Time Target Player"] = 120,
     },
     ["Abilities"] = {
-        ["Auto Click"] = false,
+        ["Auto Click"] = true,
         ["Melee"] = {
             Z = {Enabled = true, Hold = 0.05, WaitNextSkill = 0.6},
             X = {Enabled = true, Hold = 0.05, WaitNextSkill = 0.6},
