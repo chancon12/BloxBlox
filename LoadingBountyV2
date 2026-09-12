@@ -458,7 +458,7 @@ _G["HoHo Hub Auto Bounty V67"] = {
     ["Supper Fix Lag"] = true,
     ["Auto Gacha & Store Fruit"] = true,
     ["Use Portal Teleport"] = true,
-    ["Esp"] = true,
+    ["Esp"] = false,
     ["Fast Attack"] = false,
     ["Instant Teleport"] = false,
 }
