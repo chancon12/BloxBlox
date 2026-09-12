@@ -426,7 +426,7 @@ _G["HoHo Hub Auto Bounty V67"] = {
     },
     ["SafeZone"] = {
         Enabled = true,
-        ["Health Left (%)"] = 60,
+        ["Health Left (%)"] = 40,
         ["Wait Until Heal (%)"] = 80,
     },
     ["Time Control"] = {
