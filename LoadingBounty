@@ -372,7 +372,7 @@ Combo = {
         -- Hide effect parts under folders/models with these names.
         FPSBoostEffectFolders = {""},
 
-        Region = "", -- "" = any region
+        Region = "Singapore", -- "" = any region
         ServerHopMode = "Random",
         DefaultSkillPressTime = 0,
         SafeModeTweenSpeed = 300,
