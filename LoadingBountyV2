@@ -1,1 +1,467 @@
+local Config = {
+    Enabled = true,
+    SavedAccountHop = true, -- Check saved IDs once at startup
+    FriendHop = true, -- Check existing players and later joins
+    RegisterAccount = true, -- Create your own file only if missing
+    Folder = "AutoBountyAccounts",
+    Region = "", -- Any region, or e.g. "Singapore, America"
+    ServerHopMode = "Populated", -- "Populated" or "Random", per page
+    RetryDelay = 0.1, -- Never overlap unfinished teleport requests
+}
 
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local player = Players.LocalPlayer
+assert(player, "Run this script on the client.")
+assert(Config.ServerHopMode == "Populated" or Config.ServerHopMode == "Random", "Invalid ServerHopMode")
+assert(type(Config.Region) == "string", "Region must be a string")
+assert(type(Config.RetryDelay) == "number" and Config.RetryDelay >= 0.1, "RetryDelay must be at least 0.1")
+
+local env = getgenv and getgenv() or _G
+if env.AccountFriendHop and env.AccountFriendHop.Stop then env.AccountFriendHop:Stop() end
+local controller = {Running = Config.Enabled, Status = "Starting", Connections = {}}
+env.AccountFriendHop = controller
+
+function controller:Stop()
+    self.Running = false
+    self.Status = "Stopped"
+    for _, connection in ipairs(self.Connections) do connection:Disconnect() end
+    self.Connections = {}
+end
+
+if not Config.Enabled then return end
+
+local placeId, sourceJobId = game.PlaceId, game.JobId
+local state = env.__AccountFriendHopState
+
+if type(state) ~= "table" or state.PlaceId ~= placeId or state.JobId ~= sourceJobId then
+    state = {
+        PlaceId = placeId,
+        JobId = sourceJobId,
+        Used = {},
+        NextQuery = 0,
+        NextAttempt = 0,
+    }
+    env.__AccountFriendHopState = state
+end
+
+state.Used[sourceJobId] = true
+
+local saved, friends, warned, regions = {}, {}, {}, {}
+
+for token in Config.Region:gmatch("[^,]+") do
+    local name = token:match("^%s*(.-)%s*$"):lower()
+    if name ~= "" then table.insert(regions, name) end
+end
+
+local function active()
+    return controller.Running and env.AccountFriendHop == controller
+        and game.PlaceId == placeId and game.JobId == sourceJobId
+end
+
+local function warnOnce(key, message)
+    if warned[key] then return end
+    warned[key] = true
+    warn("[AccountFriendHop] " .. message)
+end
+
+local function filePath(id)
+    return Config.Folder .. "/" .. string.format("%.0f", id) .. ".txt"
+end
+
+local fileExists = isfile or env.isfile
+
+local function prepareAccounts()
+    if Config.RegisterAccount then
+        local folderExists = isfolder or env.isfolder
+        local createFolder = makefolder or env.makefolder
+        local saveFile = writefile or env.writefile
+
+        local ok, err = pcall(function()
+            assert(
+                type(fileExists) == "function"
+                    and type(folderExists) == "function"
+                    and type(createFolder) == "function"
+                    and type(saveFile) == "function",
+                "File functions unavailable"
+            )
+
+            if not folderExists(Config.Folder) then
+                createFolder(Config.Folder)
+            end
+
+            local path = filePath(player.UserId)
+
+            if not fileExists(path) then
+                saveFile(path, "UserId=" .. tostring(player.UserId) .. "\nGained=0\n")
+            end -- Existing saved gains are preserved.
+        end)
+
+        if not ok then
+            warnOnce("register", "Could not register account: " .. tostring(err))
+        end
+    end
+
+    if not Config.SavedAccountHop then return end
+
+    if type(fileExists) ~= "function" then
+        warnOnce("files", "isfile is unavailable; saved-ID checks are skipped. Friend checks still run.")
+        return
+    end
+
+    for _, other in ipairs(Players:GetPlayers()) do
+        if other ~= player and other.UserId ~= player.UserId then
+            local ok, exists = pcall(fileExists, filePath(other.UserId))
+
+            if not active() then return end
+
+            if ok and exists == true then
+                saved[other.UserId] = true
+            elseif not ok then
+                warnOnce("files", "Could not check saved account files: " .. tostring(exists))
+            end
+        end
+    end
+end
+
+local function checkFriend(other)
+    if not Config.FriendHop or other == player or other.Parent ~= Players then
+        return
+    end
+
+    local record = friends[other]
+
+    if record and (record.Busy or record.Value == true or os.clock() < record.NextCheck) then
+        return
+    end
+
+    record = {Busy = true, NextCheck = 0}
+    friends[other] = record
+
+    task.spawn(function()
+        local resolved
+
+        for attempt = 1, 3 do
+            if not active() or other.Parent ~= Players then break end
+
+            local ok, value = pcall(function()
+                return player:IsFriendsWithAsync(other.UserId)
+            end)
+
+            if not ok then
+                ok, value = pcall(function()
+                    return player:IsFriendsWith(other.UserId)
+                end)
+            end
+
+            if ok and type(value) == "boolean" then
+                resolved = value
+                break
+            end
+
+            task.wait(attempt * 0.5)
+        end
+
+        if not active() or friends[other] ~= record then return end
+
+        record.Busy, record.Value = false, resolved
+        record.NextCheck = os.clock() + (resolved == nil and 5 or 300)
+
+        if resolved == nil then
+            warnOnce(
+                "friend:" .. other.UserId,
+                "Friend lookup failed for " .. other.Name .. "; retrying."
+            )
+        end
+    end)
+end
+
+local function reason()
+    for _, other in ipairs(Players:GetPlayers()) do
+        if other ~= player and other.Parent == Players then
+            if Config.FriendHop and friends[other] and friends[other].Value == true then
+                return "Friend: " .. other.Name
+            end
+
+            if Config.SavedAccountHop and saved[other.UserId] then
+                return "Saved account: " .. other.Name
+            end
+        end
+    end
+end
+
+local function ready(character)
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+    return active() and reason() ~= nil and character == player.Character
+        and character ~= nil and character.Parent ~= nil and humanoid ~= nil
+        and humanoid.Health > 0 and character:GetAttribute("InCombat") == false
+end
+
+local function regionMatches(region)
+    if #regions == 0 then return true end
+    if type(region) ~= "string" then return false end
+
+    for _, wanted in ipairs(regions) do
+        if region:lower():find(wanted, 1, true) then return true end
+    end
+
+    return false
+end
+
+local function browser()
+    local remote = ReplicatedStorage:FindFirstChild("__ServerBrowser")
+
+    if remote and remote:IsA("RemoteFunction") then
+        return remote
+    end
+
+    controller.Status = "Waiting for __ServerBrowser"
+    warnOnce("browser", "__ServerBrowser is unavailable; waiting.")
+end
+
+-- One shared call lock survives reruns until the actual yielding call returns.
+local function call(fn)
+    local token = {}
+    state.Call = token
+
+    local ok, result = pcall(fn)
+
+    if state.Call == token then state.Call = nil end
+
+    return ok, result
+end
+
+local function integer(value)
+    return type(value) == "number" and value == value and value > -math.huge
+        and value < math.huge and value % 1 == 0
+end
+
+local queue, cursor, page, seenCursors, finished = {}, nil, 1, {}, false
+
+local function resetPages()
+    queue, cursor, page, seenCursors, finished = {}, nil, 1, {}, false
+end
+
+local function fetchPage(character)
+    local remote = #regions > 0 and browser() or nil
+
+    if #regions > 0 and not remote then return end
+
+    local started = os.clock()
+    state.NextQuery = started + 1
+    controller.Status = "Looking for servers"
+
+    local ok, result = call(function()
+        if remote then return remote:InvokeServer(page) end
+
+        local url = "https://games.roblox.com/v1/games/" .. tostring(placeId)
+            .. "/servers/Public?sortOrder=Desc&excludeFullGames=true&limit=100"
+
+        if cursor then
+            url = url .. "&cursor=" .. HttpService:UrlEncode(cursor)
+        end
+
+        return HttpService:JSONDecode(game:HttpGet(url))
+    end)
+
+    if not ready(character) then
+        resetPages()
+        return
+    end
+
+    if not ok or os.clock() - started >= 15 or type(result) ~= "table" then
+        resetPages()
+        state.NextQuery = os.clock() + 5
+        warnOnce("lookup", "Server lookup failed or exceeded 15 seconds; retrying.")
+        return
+    end
+
+    local records, nextCursor = {}, nil
+
+    if remote then
+        for id, server in pairs(result) do
+            if type(server) == "table" then
+                table.insert(records, {
+                    id = id,
+                    playing = tonumber(server.Count),
+                    maxPlayers = Players.MaxPlayers,
+                    region = server.Region,
+                })
+            end
+        end
+
+        finished, page = page >= 100, page + 1
+    else
+        nextCursor = result.nextPageCursor
+        if nextCursor == "" then nextCursor = nil end
+
+        if type(result.data) ~= "table" or (nextCursor ~= nil and
+            (type(nextCursor) ~= "string" or nextCursor == cursor or seenCursors[nextCursor])) then
+
+            resetPages()
+            state.NextQuery = os.clock() + 5
+            warnOnce("page", "Invalid server page/cursor; retrying.")
+            return
+        end
+
+        records, cursor, finished = result.data, nextCursor, nextCursor == nil
+
+        if nextCursor then seenCursors[nextCursor] = true end
+    end
+
+    local seen = {}
+
+    for _, server in ipairs(records) do
+        if type(server) == "table" and type(server.id) == "string" and server.id ~= ""
+            and not state.Used[server.id] and not seen[server.id] and regionMatches(server.region)
+            and integer(server.playing) and integer(server.maxPlayers)
+            and server.playing >= 0 and server.playing < server.maxPlayers then
+
+            seen[server.id] = true
+            table.insert(queue, server)
+        end
+    end
+
+    if Config.ServerHopMode == "Random" then
+        for i = #queue, 2, -1 do
+            local j = math.random(i)
+            queue[i], queue[j] = queue[j], queue[i]
+        end
+    else
+        table.sort(queue, function(a, b)
+            if a.playing == b.playing then return a.id < b.id end
+            return a.playing > b.playing
+        end)
+    end
+
+    if finished then
+        state.NextQuery = math.max(state.NextQuery, os.clock() + 5)
+    end
+end
+
+prepareAccounts()
+if not active() then return end
+
+table.insert(controller.Connections, Players.PlayerAdded:Connect(checkFriend))
+
+table.insert(controller.Connections, Players.PlayerRemoving:Connect(function(other)
+    friends[other] = nil
+end))
+
+task.spawn(function()
+    while active() do
+        for _, other in ipairs(Players:GetPlayers()) do
+            checkFriend(other)
+        end
+        task.wait(2)
+    end
+end)
+
+task.spawn(function()
+    while active() do
+        local why, character = reason(), player.Character
+
+        if not why then
+            resetPages()
+            controller.Status = "No saved account or friend found"
+
+        elseif not ready(character) then
+            resetPages()
+            controller.Status = "Waiting for a living character with InCombat = false"
+
+        elseif state.Call then
+            controller.Status = "Waiting for the previous request to return"
+
+        elseif os.clock() >= state.NextAttempt then
+            if #queue > 0 then
+                local remote = browser()
+
+                if remote and ready(character) then
+                    local server = table.remove(queue, 1)
+
+                    if not state.Used[server.id] then
+                        state.Used[server.id] = true
+                        state.NextAttempt = os.clock() + Config.RetryDelay
+                        controller.Status = why .. "; joining " .. server.id
+
+                        local ok, err = call(function()
+                            return remote:InvokeServer("teleport", server.id)
+                        end)
+
+                        if active() and not ok then
+                            warnOnce("join", "Teleport request failed: " .. tostring(err))
+                        end
+                    end
+                end
+
+            elseif os.clock() >= state.NextQuery then
+                if finished then resetPages() end
+                fetchPage(character)
+            end
+        end
+
+        task.wait(0.1)
+    end
+end)
+
+_G["HoHo Hub Auto Bounty V67"] = {
+    ["Avatar"] = "http://www.roblox.com/asset/?id=15523218608",
+    ["Farm Method"] = "Normal",
+    ["Select Team"] = "Pirate",
+    ["Discord Webhook"] = "",
+    ["Bypass Teleport"] = false,
+    ["Max Level Distance"] = 612,
+    ["Don't attack friends"] = true,
+    ["Don't attack player have cup"] = true,
+    ["Distance Attack Y"] = 6,
+    ["Chat After Kill"] = {
+        ["Active"] = true,
+        ["List Chat"] = {"i have a good gaming chair","No skill? Use Hoho hub","How to play this game","im new","your bad"},
+    },
+    ["Yourself"] = {
+        ["Invisible From Ken"] = true,
+        ["No Stun"] = true,
+    },
+    ["SafeZone"] = {
+        Enabled = true,
+        ["Health Left (%)"] = 60,
+        ["Wait Until Heal (%)"] = 80,
+    },
+    ["Time Control"] = {
+        ["Max Time Target Player"] = 120,
+    },
+    ["Abilities"] = {
+        ["Auto Click"] = true,
+        ["Melee"] = {
+            Z = {Enabled = true, Hold = 0.05, WaitNextSkill = 0.6},
+            X = {Enabled = true, Hold = 0.05, WaitNextSkill = 0.6},
+            C = {Enabled = true, Hold = 0.05, WaitNextSkill = 0.6},
+        },
+        ["Sword"] = {
+            Z = {Enabled = true, Hold = 0.05, WaitNextSkill = 0.6},
+            X = {Enabled = true, Hold = 0.05, WaitNextSkill = 0.6},
+        },
+        ["Gun"] = {
+            Z = {Enabled = true, Hold = 0.05, WaitNextSkill = 0.6},
+            X = {Enabled = true, Hold = 0.05, WaitNextSkill = 0.6},
+        },
+        ["Fruit"] = {
+            Z = {Enabled = true, Hold = 0.05, WaitNextSkill = 0.6},
+            X = {Enabled = true, Hold = 0.05, WaitNextSkill = 0.6},
+            C = {Enabled = true, Hold = 0.05, WaitNextSkill = 0.6},
+            V = {Enabled = false, Hold = 0.05, WaitNextSkill = 0.6},
+            F = {Enabled = true, Hold = 0.05, WaitNextSkill = 0.6},
+        },
+    },
+    ["Supper Fix Lag"] = true,
+    ["Auto Gacha & Store Fruit"] = true,
+    ["Use Portal Teleport"] = true,
+    ["Esp"] = true,
+    ["Fast Attack"] = false,
+    ["Instant Teleport"] = false,
+}
+
+_G.loadCustomId = "QBCuQaWJKMSfVhtJaZObmnEkrEpzbTxK"
+loadstring(game:HttpGet("https://raw.githubusercontent.com/acsu123/HOHO_H/main/Loading_UI"))()
