@@ -6519,7 +6519,6 @@ local function startRaceWorker()
 
         if not Runtime.Running
             or Environment.__AutoBountyRuntime ~= Runtime
-            or Runtime.SafeMode
             or Runtime.LocalDead
             or Runtime.HopPending
             or Runtime.Teleporting
@@ -6568,7 +6567,8 @@ local function startRaceWorker()
             return
         end
 
-        if Settings.RaceV3 == true then
+        -- V4 may transform during recovery; V3 keeps its safe-mode pause.
+        if Settings.RaceV3 == true and not Runtime.SafeMode then
             local commE = Remotes:FindFirstChild("CommE")
 
             if commE and commE:IsA("RemoteEvent") then
