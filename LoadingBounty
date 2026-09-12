@@ -263,6 +263,10 @@ Combo = {
     ["Kitsune-Kitsune"] = {
         V = false, -- skip Yeti's V
         },
+    ["Portal-Portal",] = {
+        C = false, -- skip Yeti's V
+        V = false, -- skip Yeti's V
+        },
     },
 
         Order = {"Melee", "Blox Fruit", "Sword", "Gun"},
