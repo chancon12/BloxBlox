@@ -69,11 +69,11 @@ Combo = {
             },
         },
         {
-            Name = "Magma + Skull Guitar + Cursed Dual Katana + Godhuman",
+            Name = "Magma + Cursed Dual Katana + Godhuman",
             Enabled = true,
-            RequiredWeapons = {"Magma-Magma", "Skull Guitar", "Cursed Dual Katana", "Godhuman"},
+            RequiredWeapons = {"Magma-Magma", "Cursed Dual Katana", "Godhuman"},
             Steps = {
-                {Weapon = "Skull Guitar", Key = "X", Hold = 0.1},
+                {Weapon = "Magma-Magma", Key = "Z", Hold = 3},
                 {Weapon = "Magma-Magma", Key = "V", Hold = 0.1},
                 {Weapon = "Magma-Magma", Key = "C", Hold = 0.1},
                 {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.1},
