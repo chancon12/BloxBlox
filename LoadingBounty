@@ -389,7 +389,7 @@ Combo = {
 
         TweenHitbox = {
         Enabled = true,
-        Mode = "CFrame", -- "Tween" or "CFrame"
+        Mode = "CFrame", -- "CFrame" or "CFrame"
         Size = Vector3.new(200, 200, 200),
         TimeMultiplier = 0.9,
         },
