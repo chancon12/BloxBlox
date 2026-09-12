@@ -417,7 +417,7 @@ _G["HoHo Hub Auto Bounty V67"] = {
     ["Don't attack player have cup"] = true,
     ["Distance Attack Y"] = 6,
     ["Chat After Kill"] = {
-        ["Active"] = true,
+        ["Active"] = false,
         ["List Chat"] = {"i have a good gaming chair","No skill? Use Hoho hub","How to play this game","im new","your bad"},
     },
     ["Yourself"] = {
