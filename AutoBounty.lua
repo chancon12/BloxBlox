@@ -1,4 +1,7 @@
 -- GitHub-side Auto Bounty module.
+-- Engage lookups cache owned weapons, matching combo profiles, and allowed target weapons.
+-- Inventory events and config edits refresh caches; a 0.1-second fallback covers deferred signals.
+-- Skill timing, attack order, movement, and aiming are unchanged by the cache optimization.
 -- External options are intentionally limited to Team, Weapon, Attack, FastTP,
 -- AutoHop, ESP, NoClip, TweenSpeed, SafeModeY, health thresholds, hitbox settings,
 -- PlayerFollowTime, NoDamageTimeout, SkipPreviousTargets, OrbitEnabled, RaceV3, RaceV4,
@@ -18,8 +21,9 @@
 -- Filters visible Tool names and equipped/unequipped weapon model WeaponName attributes.
 -- Low-health recovery keeps the selected target and freezes its no-damage countdown.
 -- Selected targets entering safe zones are released only when local InCombat is known false.
--- AutoBountyAccounts/<UserId>.txt stores UserId and cumulative positive Bounty/Honor gains.
--- ID-only files migrate with Gained=0; existing totals survive reloads and server hops.
+-- AutoBountyAccounts/<UserId>.txt stores UserId and cumulative Bounty/Honor Gained/Lost.
+-- ID-only and gain-only files migrate without resetting gains; historical losses start at zero.
+-- GUI shows current bounty, total gained, total lost, and net change (gained minus lost).
 -- Initial/rebound stats and losses add nothing. GUI Total gained uses saved total plus pending gains.
 -- Saved gains need host isfolder/makefolder/isfile/writefile/readfile functions.
 -- SavedAccountHop defaults to true: at startup, hop if another player has a saved ID file.
@@ -1076,21 +1080,31 @@ function SavedBounty.Decode(contents, ownId)
 
     -- Older versions stored only the ID. It is not a bounty gain amount.
     if trimmed == ownId then
-        return 0, true
+        return 0, true, 0
     end
 
-    local storedId, amount = trimmed:match("^UserId=(%d+)\r?\nGained=([^\r\n]+)$")
+    local storedId, amount, lostAmount = trimmed:match("^UserId=(%d+)\r?\nGained=([^\r\n]+)\r?\nLost=([^\r\n]+)$")
+    local legacy = false
+    if not storedId then
+        storedId, amount = trimmed:match("^UserId=(%d+)\r?\nGained=([^\r\n]+)$")
+        lostAmount = "0"
+        legacy = true
+    end
     local total = tonumber(amount)
+    local lost = tonumber(lostAmount)
 
-    if storedId ~= ownId or not isFiniteNumber(total) or total < 0 then
-        return nil, "Account file has invalid UserId/Gained data; existing contents were preserved"
+    if storedId ~= ownId or not isFiniteNumber(total) or total < 0
+        or not isFiniteNumber(lost) or lost < 0 then
+
+        return nil, "Account file has invalid UserId/Gained/Lost data; existing contents were preserved"
     end
 
-    return total, false
+    return total, legacy, lost
 end
 
-function SavedBounty.Encode(ownId, total)
-    return "UserId=" .. ownId .. "\nGained=" .. string.format("%.17g", total) .. "\n"
+function SavedBounty.Encode(ownId, total, lost)
+    return "UserId=" .. ownId .. "\nGained=" .. string.format("%.17g", total)
+        .. "\nLost=" .. string.format("%.17g", lost or 0) .. "\n"
 end
 
 function SavedBounty.Attach(ownId, folderExists, createFolder, fileExists, saveFile, readFile)
@@ -1104,23 +1118,41 @@ function SavedBounty.Attach(ownId, folderExists, createFolder, fileExists, saveF
     end
 
     local record = records[path]
-    if type(record) ~= "table" or record.Format ~= 1 then
-        record = {Format = 1, OwnId = ownId, Path = path, Ready = false,
-            Busy = false, SavedTotal = 0, Pending = 0, NextRetryAt = 0}
+    if type(record) ~= "table" then
+        record = {Format = 2, OwnId = ownId, Path = path, Ready = false,
+            Busy = false, SavedTotal = 0, Pending = 0, SavedLost = 0,
+            PendingLost = 0, NextRetryAt = 0}
         records[path] = record
     end
 
-    -- Shared across reloads: a yielding old write must finish before a new write.
-    -- Pending gains also survive a reload in the same runner environment.
+    -- Reuse the exact record, including a format-1 writer's lock and pending
+    -- gains. Loss fields do not interfere with its in-flight bookkeeping.
     SavedBounty.Record = record
-    SavedBounty.RetryAttach = nil
-    record.WriteFile = saveFile
+    record.SavedLost = record.SavedLost or 0
+    record.PendingLost = record.PendingLost or 0
+    SavedBounty.RetryAttach = function()
+        SavedBounty.Attach(ownId, folderExists, createFolder, fileExists, saveFile, readFile)
+    end
 
-    if record.Ready then
+    if record.Format ~= 1 and record.Format ~= 2 then
+        record.Error = "Account record has an unsupported format; existing data was preserved"
+        record.NextRetryAt = os.clock() + 1
+        warnOnce("saved-bounty:format", record.Error)
         SavedBounty.UpdateGUI()
         return
     end
 
+    -- A current-format cache already owns its baseline, even when its writer
+    -- yields. Reading that file again could count the same pending delta twice.
+    if record.Format == 2 and record.Ready then
+        record.WriteFile = saveFile
+        SavedBounty.RetryAttach = nil
+        SavedBounty.UpdateGUI()
+        return
+    end
+
+    -- A format-1 writer may still overwrite Lost with its old two-line schema.
+    -- Wait for it to finish before reading, migrating, or promoting the record.
     local deadline = os.clock() + 5
     while record.Busy and SavedAccountCheck.StillCurrent() and os.clock() < deadline do
         task.wait(0.05)
@@ -1130,18 +1162,20 @@ function SavedBounty.Attach(ownId, folderExists, createFolder, fileExists, saveF
         return
     end
     if record.Busy then
-        SavedBounty.RetryAttach = function()
-            SavedBounty.Attach(ownId, folderExists, createFolder, fileExists, saveFile, readFile)
-        end
-        warnOnce("saved-gain:busy", "Saved gain file is still busy; its active write was left intact.")
+        record.NextRetryAt = os.clock() + 1
+        warnOnce("saved-bounty:busy", "Saved bounty file is still busy; its active write was left intact.")
+        SavedBounty.UpdateGUI()
         return
     end
-    if record.Ready then
+    if record.Format == 2 and record.Ready then
+        record.WriteFile = saveFile
+        SavedBounty.RetryAttach = nil
         SavedBounty.UpdateGUI()
         return
     end
 
     record.Busy = true
+    record.WriteFile = saveFile
     local initialized, initializeError = pcall(function()
         local exists = folderExists(folder)
         if not SavedAccountCheck.StillCurrent() then return end
@@ -1159,7 +1193,8 @@ function SavedBounty.Attach(ownId, folderExists, createFolder, fileExists, saveF
         local existsFile = fileExists(path)
         if not SavedAccountCheck.StillCurrent() then return end
         if existsFile ~= true then
-            local written = saveFile(path, SavedBounty.Encode(ownId, 0))
+            local written = saveFile(path, SavedBounty.Encode(ownId,
+                record.Ready and record.SavedTotal or 0, record.Ready and record.SavedLost or 0))
             if written == false then error("Account file write failed") end
             if not SavedAccountCheck.StillCurrent() then return end
             local nowExists = fileExists(path)
@@ -1169,57 +1204,85 @@ function SavedBounty.Attach(ownId, folderExists, createFolder, fileExists, saveF
         record.Registered = true
 
         if type(readFile) ~= "function" then
-            error("Saved gain tracking needs readfile; existing account contents were preserved")
+            error("Saved bounty tracking needs readfile; existing account contents were preserved")
         end
 
         local contents = readFile(path)
         if not SavedAccountCheck.StillCurrent() then return end
-        local total, legacy = SavedBounty.Decode(contents, ownId)
+        local total, legacy, lost = SavedBounty.Decode(contents, ownId)
         if total == nil then error(legacy) end
 
+        -- A legacy write may have changed the file before reporting failure.
+        -- Its ready cache still separates the baseline from pending gains;
+        -- adding those gains to the file's tentative value would count twice.
+        if record.Format == 1 and record.Ready and total ~= record.SavedTotal then
+            total = record.SavedTotal
+            legacy = true
+        end
+
         if legacy then
-            local written = saveFile(path, SavedBounty.Encode(ownId, total))
+            local written = saveFile(path, SavedBounty.Encode(ownId, total, lost))
             if written == false then error("Account file migration failed") end
         end
 
+        -- Migration writes only the saved baseline. Deltas observed while its
+        -- filesystem calls yield remain pending and are committed by Flush.
         record.SavedTotal = total
+        record.SavedLost = lost
+        record.Format = 2
         record.Ready = true
         record.Error = nil
+        record.NextRetryAt = 0
     end)
     record.Busy = false
 
     if not initialized then
         record.Error = tostring(initializeError)
-        warnOnce("saved-gain:load", "Could not load saved bounty/honor gains: " .. record.Error)
+        record.NextRetryAt = os.clock() + 1
+        warnOnce("saved-bounty:load", "Could not load saved bounty/honor totals: " .. record.Error)
+    elseif record.Format == 2 and record.Ready then
+        SavedBounty.RetryAttach = nil
     end
     SavedBounty.UpdateGUI()
 end
 
 function SavedBounty.Flush()
     local record = SavedBounty.Record
-    if not SavedAccountCheck.StillCurrent() or not record or not record.Ready
-        or record.Busy or record.Pending <= 0 or os.clock() < record.NextRetryAt then
+    if not SavedAccountCheck.StillCurrent() or not record or record.Format ~= 2 or not record.Ready
+        or record.Busy or (record.Pending <= 0 and record.PendingLost <= 0)
+        or os.clock() < record.NextRetryAt then
 
         return
     end
 
     record.Busy = true
-    while SavedAccountCheck.StillCurrent() and record.Pending > 0 do
+    while SavedAccountCheck.StillCurrent() and (record.Pending > 0 or record.PendingLost > 0) do
         local amount = record.Pending
+        local lostAmount = record.PendingLost
         local total = record.SavedTotal + amount
-        local saved, saveError = pcall(record.WriteFile, record.Path, SavedBounty.Encode(record.OwnId, total))
+        local lost = record.SavedLost + lostAmount
+        if not isFiniteNumber(total) or not isFiniteNumber(lost) then
+            record.Error = "Bounty/honor total was too large to save"
+            record.NextRetryAt = os.clock() + 1
+            warnOnce("saved-bounty:overflow", record.Error)
+            break
+        end
+        local saved, saveError = pcall(record.WriteFile, record.Path,
+            SavedBounty.Encode(record.OwnId, total, lost))
 
         if not saved or saveError == false then
             record.Error = saved and "Account file write returned false" or tostring(saveError)
             record.NextRetryAt = os.clock() + 1
-            warnOnce("saved-gain:write", "Could not save bounty/honor gains; pending gains will retry: " .. record.Error)
+            warnOnce("saved-bounty:write", "Could not save bounty/honor totals; pending changes will retry: " .. record.Error)
             break
         end
 
         -- Finish bookkeeping even if a reload occurred during writefile. The new
-        -- runtime shares this record and must not add the same pending gain twice.
+        -- runtime shares this record and must not add either pending delta twice.
         record.SavedTotal = total
+        record.SavedLost = lost
         record.Pending = math.max(0, record.Pending - amount)
+        record.PendingLost = math.max(0, record.PendingLost - lostAmount)
         record.Error = nil
         record.NextRetryAt = 0
     end
@@ -1249,11 +1312,35 @@ function SavedBounty.AddGain(amount)
     end
 end
 
+function SavedBounty.AddLoss(amount)
+    local record = SavedBounty.Record
+    if not SavedAccountCheck.StillCurrent() or not record
+        or not isFiniteNumber(amount) or amount <= 0 then
+
+        return
+    end
+
+    if not isFiniteNumber(record.SavedLost + record.PendingLost + amount) then
+        warnOnce("saved-loss:overflow", "Bounty/honor loss total was too large to save")
+        return
+    end
+
+    -- Losses are positive cumulative amounts, separate from gains and the
+    -- current stat. They also survive load failures and yielding writes.
+    record.PendingLost = record.PendingLost + amount
+    SavedBounty.UpdateGUI()
+    if not record.Busy and os.clock() >= record.NextRetryAt then
+        task.spawn(SavedBounty.Flush)
+    end
+end
+
 function SavedBounty.StartWorker()
     task.spawn(function()
         while SavedAccountCheck.StillCurrent() do
             local record = SavedBounty.Record
-            if SavedBounty.RetryAttach and record and not record.Busy then
+            if SavedBounty.RetryAttach and record and not record.Busy
+                and os.clock() >= record.NextRetryAt then
+
                 local retry = SavedBounty.RetryAttach
                 SavedBounty.RetryAttach = nil
                 retry()
@@ -1471,30 +1558,37 @@ local function formatNumber(value)
 end
 
 function SavedBounty.UpdateGUI()
-    local label = Runtime.Labels and Runtime.Labels.Gained
-    if not SavedAccountCheck.StillCurrent() or not label or not label.Parent then
-        return
-    end
+    local labels = Runtime.Labels
+    if not SavedAccountCheck.StillCurrent() or not labels then return end
 
     local record = SavedBounty.Record
-    local text = "Total gained: Unavailable"
-    if record and record.Ready then
-        text = "Total gained: " .. formatNumber(record.SavedTotal + record.Pending)
+    local gainedText, lostText, netText = "Total gained: Unavailable", "Total lost: Unavailable", "Net change: Unavailable"
+    if record and record.Ready and record.Format == 2 then
+        local gained = record.SavedTotal + record.Pending
+        local lost = (record.SavedLost or 0) + (record.PendingLost or 0)
+        gainedText = "Total gained: " .. formatNumber(gained)
+        lostText = "Total lost: " .. formatNumber(lost)
+        netText = "Net change: " .. formatNumber(gained - lost)
         if record.Pending > 0 then
-            text = text .. (record.Error and " (save pending)" or " (saving)")
+            gainedText = gainedText .. (record.Error and " (save pending)" or " (saving)")
+        end
+        if (record.PendingLost or 0) > 0 then
+            lostText = lostText .. (record.Error and " (save pending)" or " (saving)")
         end
     elseif record then
-        if record.Busy or SavedBounty.RetryAttach then
-            text = "Total gained: Loading..."
+        if record.Busy or (SavedBounty.RetryAttach and not record.Error) then
+            gainedText, lostText, netText = "Total gained: Loading...", "Total lost: Loading...", "Net change: Loading..."
         end
-        if record.Pending > 0 then
-            text = text .. "\nPending gain: " .. formatNumber(record.Pending)
-        end
+        if record.Pending > 0 then gainedText = gainedText .. "\nPending gain: " .. formatNumber(record.Pending) end
+        if (record.PendingLost or 0) > 0 then lostText = lostText .. "\nPending loss: " .. formatNumber(record.PendingLost) end
     end
-
-    if label.Text ~= text then
-        label.Text = text
+    local function update(name, text)
+        local label = labels[name]
+        if label and label.Parent and label.Text ~= text then label.Text = text end
     end
+    update("Gained", gainedText)
+    update("Lost", lostText)
+    update("Net", netText)
 end
 
 local function createTextLabel(parent, name, position, size, text, textSize)
@@ -1532,7 +1626,7 @@ local function createGUI()
     frame.Parent = screenGui
     frame.AnchorPoint = Vector2.new(1, 0)
     frame.Position = UDim2.new(1, -18, 0, 18)
-    frame.Size = UDim2.fromOffset(310, 238)
+    frame.Size = UDim2.fromOffset(310, 302)
     frame.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
     frame.BackgroundTransparency = 0.12
     frame.BorderSizePixel = 0
@@ -1560,14 +1654,21 @@ local function createGUI()
     Runtime.Labels.Gained.TextWrapped = true
     Runtime.Labels.Gained.TextTruncate = Enum.TextTruncate.AtEnd
     Runtime.Labels.Gained.TextYAlignment = Enum.TextYAlignment.Top
-    Runtime.Labels.Team = createTextLabel(frame, "Team", UDim2.fromOffset(12, 102), UDim2.new(1, -24, 0, 20), "Team: " .. Config.Team, 14)
-    Runtime.Labels.Target = createTextLabel(frame, "Target", UDim2.fromOffset(12, 124), UDim2.new(1, -24, 0, 20), "Target: None", 14)
-    Runtime.Labels.Candidates = createTextLabel(frame, "Candidates", UDim2.fromOffset(12, 146), UDim2.new(1, -24, 0, 20), "Eligible players: 0", 14)
-    Runtime.Labels.Combo = createTextLabel(frame, "Combo", UDim2.fromOffset(12, 168), UDim2.new(1, -24, 0, 40), "Combo: Initializing", 13)
+    Runtime.Labels.Gained.TextColor3 = Color3.fromRGB(135, 225, 160)
+    Runtime.Labels.Lost = createTextLabel(frame, "Lost", UDim2.fromOffset(12, 100), UDim2.new(1, -24, 0, 40), "Total lost: Loading...", 14)
+    Runtime.Labels.Lost.TextWrapped = true
+    Runtime.Labels.Lost.TextTruncate = Enum.TextTruncate.AtEnd
+    Runtime.Labels.Lost.TextYAlignment = Enum.TextYAlignment.Top
+    Runtime.Labels.Lost.TextColor3 = Color3.fromRGB(245, 145, 145)
+    Runtime.Labels.Net = createTextLabel(frame, "Net", UDim2.fromOffset(12, 142), UDim2.new(1, -24, 0, 20), "Net change: Loading...", 14)
+    Runtime.Labels.Team = createTextLabel(frame, "Team", UDim2.fromOffset(12, 166), UDim2.new(1, -24, 0, 20), "Team: " .. Config.Team, 14)
+    Runtime.Labels.Target = createTextLabel(frame, "Target", UDim2.fromOffset(12, 188), UDim2.new(1, -24, 0, 20), "Target: None", 14)
+    Runtime.Labels.Candidates = createTextLabel(frame, "Candidates", UDim2.fromOffset(12, 210), UDim2.new(1, -24, 0, 20), "Eligible players: 0", 14)
+    Runtime.Labels.Combo = createTextLabel(frame, "Combo", UDim2.fromOffset(12, 232), UDim2.new(1, -24, 0, 40), "Combo: Initializing", 13)
     Runtime.Labels.Combo.TextWrapped = true
     Runtime.Labels.Combo.TextTruncate = Enum.TextTruncate.AtEnd
     Runtime.Labels.Combo.TextYAlignment = Enum.TextYAlignment.Top
-    Runtime.Labels.Status = createTextLabel(frame, "Status", UDim2.fromOffset(12, 212), UDim2.new(1, -24, 0, 20), "Status: Initializing", 13)
+    Runtime.Labels.Status = createTextLabel(frame, "Status", UDim2.fromOffset(12, 276), UDim2.new(1, -24, 0, 20), "Status: Initializing", 13)
     Runtime.Labels.Status.TextColor3 = Color3.fromRGB(130, 200, 255)
 
     Runtime.GUI = screenGui
@@ -1650,6 +1751,8 @@ local function startBountyValueBinder()
                         if before and value > before then
                             SavedBounty.AddGain(value - before)
                             WinEntrance.OnIncrease(before, value)
+                        elseif before and value < before then
+                            SavedBounty.AddLoss(before - value)
                         end
                     end
 
@@ -2308,103 +2411,219 @@ local function getTargetRoute(player, info, preferEntrance)
     return nil, hasFailedRoute and "entrance-route-failed" or "target-out-of-range"
 end
 
-local TargetWeaponFilter = {Enabled = false, Names = {}}
-
-function TargetWeaponFilter.NormalizeName(value)
-    if type(value) ~= "string" then
-        return nil
-    end
-
-    local name = string.lower(value):gsub("[%s%p]", "")
-    return name ~= "" and name or nil
-end
+local TargetWeaponFilter = {Enabled = false, Names = {}, Records = {}, Stopped = false}
 
 do
-    local config = type(Settings.TargetWeaponFilter) == "table" and Settings.TargetWeaponFilter or {}
-    TargetWeaponFilter.Enabled = Settings.TargetWeaponFilter ~= false and config.Enabled ~= false
-    local names = config.Ignore
+    local defaultNames = {"Portal-Portal"}
+    local emptyConfig = {}
+    local namesSnapshot = {}
+    local snapshotCount = -1
+    -- Signals can be deferred. Never trust an allowed result for longer than this.
+    local negativeLifetime = 0.1
 
-    if names == nil then
-        names = {"Portal-Portal"}
-    elseif type(names) ~= "table" then
-        warnOnce("target-weapon-filter:ignore", "TargetWeaponFilter.Ignore must be a list of weapon names; using Portal-Portal.")
-        names = {"Portal-Portal"}
-    end
-
-    for _, name in ipairs(names) do
-        local normalized = TargetWeaponFilter.NormalizeName(name)
-
-        if normalized then
-            TargetWeaponFilter.Names[normalized] = name
+    local function disconnectAll(connections)
+        for _, connection in ipairs(connections) do
+            connection.Disconnect(connection)
         end
     end
-end
 
-function TargetWeaponFilter.MatchInstance(instance, allowModel)
-    local name
-
-    -- Direct method calls also make this safe inside the aim hook's validation.
-    if instance.IsA(instance, "Tool") then
-        name = instance.Name
-    elseif allowModel
-        and (instance.Name == "EquippedWeapon" or instance.Name == "UnequippedWeapon")
-        and (instance.IsA(instance, "Model") or instance.IsA(instance, "BasePart")) then
-
-        name = instance.GetAttribute(instance, "WeaponName")
+    local function dropRecord(player)
+        local record = TargetWeaponFilter.Records[player]
+        if not record then return end
+        TargetWeaponFilter.Records[player] = nil
+        disconnectAll(record.Connections)
+        for _, childRecord in pairs(record.Children) do
+            disconnectAll(childRecord.Connections)
+        end
     end
 
-    local normalized = TargetWeaponFilter.NormalizeName(name)
-    return normalized and TargetWeaponFilter.Names[normalized] or nil
-end
-
-function TargetWeaponFilter.FindIgnored(player)
-    if not TargetWeaponFilter.Enabled or next(TargetWeaponFilter.Names) == nil
-        or not player or player == LocalPlayer or player.Parent ~= Players then
-
-        return nil
-    end
-
-    local character = player.Character
-    local cached = Runtime.IgnoredTargetWeapons[player]
-
-    if cached and cached.Character ~= character then
+    function TargetWeaponFilter.Forget(player)
+        dropRecord(player)
         Runtime.IgnoredTargetWeapons[player] = nil
-        cached = nil
     end
 
-    if not character or not character.Parent then
-        return nil
+    function TargetWeaponFilter.Stop()
+        TargetWeaponFilter.Stopped = true
+        for player in pairs(TargetWeaponFilter.Records) do
+            dropRecord(player)
+        end
+        table.clear(Runtime.IgnoredTargetWeapons)
     end
 
-    if cached then
-        return cached.Weapon
+    function TargetWeaponFilter.NormalizeName(value)
+        if type(value) ~= "string" then return nil end
+        local name = string.lower(value):gsub("[%s%p]", "")
+        return name ~= "" and name or nil
     end
 
-    for _, child in ipairs(character.GetChildren(character)) do
-        local matched = TargetWeaponFilter.MatchInstance(child, true)
+    function TargetWeaponFilter.RefreshConfig()
+        local settings = type(Config.Settings) == "table" and Config.Settings or emptyConfig
+        local value = settings.TargetWeaponFilter
+        local config = type(value) == "table" and value or emptyConfig
+        local enabled = value ~= false and config.Enabled ~= false
+        local names = config.Ignore
+        if names == nil then
+            names = defaultNames
+        elseif type(names) ~= "table" then
+            warnOnce("target-weapon-filter:ignore", "TargetWeaponFilter.Ignore must be a list of weapon names; using Portal-Portal.")
+            names = defaultNames
+        end
 
-        if matched then
-            Runtime.IgnoredTargetWeapons[player] = {Character = character, Weapon = matched}
-            return matched
+        local changed = enabled ~= TargetWeaponFilter.Enabled
+        local count = 0
+        for index, name in ipairs(names) do
+            count = index
+            if namesSnapshot[index] ~= name then changed = true end
+        end
+        if not changed and count == snapshotCount then return end
+
+        for player in pairs(TargetWeaponFilter.Records) do dropRecord(player) end
+        table.clear(Runtime.IgnoredTargetWeapons)
+        table.clear(TargetWeaponFilter.Names)
+        table.clear(namesSnapshot)
+        snapshotCount = count
+        TargetWeaponFilter.Enabled = enabled
+        for index, name in ipairs(names) do
+            namesSnapshot[index] = name
+            local normalized = TargetWeaponFilter.NormalizeName(name)
+            if normalized then TargetWeaponFilter.Names[normalized] = name end
         end
     end
 
-    -- A remote player's full inventory may not be visible. Inspect only Tools
-    -- actually available to this client, without waiting for missing containers.
-    local backpack = player.FindFirstChildOfClass(player, "Backpack")
+    function TargetWeaponFilter.MatchInstance(instance, allowModel)
+        local name
+        -- Every Instance/signal method in this filter is invoked directly: this
+        -- path also runs inside the aim hook and must preserve namecall forwarding.
+        if instance.IsA(instance, "Tool") then
+            name = instance.Name
+        elseif allowModel
+            and (instance.Name == "EquippedWeapon" or instance.Name == "UnequippedWeapon")
+            and (instance.IsA(instance, "Model") or instance.IsA(instance, "BasePart")) then
+            name = instance.GetAttribute(instance, "WeaponName")
+        end
+        local normalized = TargetWeaponFilter.NormalizeName(name)
+        return normalized and TargetWeaponFilter.Names[normalized] or nil
+    end
 
-    if backpack then
-        for _, child in ipairs(backpack.GetChildren(backpack)) do
-            local matched = TargetWeaponFilter.MatchInstance(child, false)
-
-            if matched then
-                Runtime.IgnoredTargetWeapons[player] = {Character = character, Weapon = matched}
-                return matched
+    local function watchChild(record, child, container, allowModel)
+        local isTool = child.IsA(child, "Tool")
+        if not isTool and not (allowModel
+            and (child.IsA(child, "Model") or child.IsA(child, "BasePart"))) then return end
+        local watched = record.Children[child]
+        if watched and watched.Container ~= container then
+            disconnectAll(watched.Connections)
+            record.Children[child] = nil
+            watched = nil
+        end
+        if not watched then
+            watched = {Container = container, Connections = {}}
+            record.Children[child] = watched
+            local signal = child.GetPropertyChangedSignal(child, "Name")
+            watched.Connections[1] = signal.Connect(signal, record.Invalidate)
+            if not isTool then
+                signal = child.GetAttributeChangedSignal(child, "WeaponName")
+                watched.Connections[2] = signal.Connect(signal, record.Invalidate)
             end
         end
+        watched.Scan = record.Scan
     end
 
-    return nil
+    local function newRecord(player, character, backpack)
+        local record = {Character = character, Backpack = backpack, Connections = {},
+            Children = {}, Dirty = true, NegativeUntil = 0, Scan = 0}
+        TargetWeaponFilter.Records[player] = record
+        record.Invalidate = function()
+            if TargetWeaponFilter.Records[player] == record then record.Dirty = true end
+        end
+        local function watch(signal, callback)
+            record.Connections[#record.Connections + 1] = signal.Connect(signal, callback)
+        end
+        local function watchContainer(container, allowModel)
+            if not container then return end
+            watch(container.ChildAdded, function(child)
+                if TargetWeaponFilter.Records[player] ~= record then return end
+                record.Dirty = true
+                watchChild(record, child, container, allowModel)
+            end)
+            watch(container.ChildRemoved, function(child)
+                if TargetWeaponFilter.Records[player] ~= record then return end
+                record.Dirty = true
+                local watched = record.Children[child]
+                -- A deferred removal may follow a move into the other container.
+                if watched and watched.Container == container then
+                    disconnectAll(watched.Connections)
+                    record.Children[child] = nil
+                end
+            end)
+        end
+        watch(player.GetPropertyChangedSignal(player, "Character"), record.Invalidate)
+        local function backpackChanged(child)
+            if child.IsA(child, "Backpack") then record.Invalidate() end
+        end
+        watch(player.ChildAdded, backpackChanged)
+        watch(player.ChildRemoved, backpackChanged)
+        watchContainer(character, true)
+        watchContainer(backpack, false)
+        return record
+    end
+
+    function TargetWeaponFilter.FindIgnored(player)
+        if TargetWeaponFilter.Stopped then return nil end
+        TargetWeaponFilter.RefreshConfig()
+        if not TargetWeaponFilter.Enabled or next(TargetWeaponFilter.Names) == nil
+            or not player or player == LocalPlayer or player.Parent ~= Players then return nil end
+
+        local character = player.Character
+        local cached = Runtime.IgnoredTargetWeapons[player]
+        if cached and cached.Character ~= character then
+            Runtime.IgnoredTargetWeapons[player] = nil
+            cached = nil
+        end
+        if not character or not character.Parent then
+            dropRecord(player)
+            return nil
+        end
+        -- Blocked matches remain sticky for this character, as before.
+        if cached then return cached.Weapon end
+
+        -- The full remote inventory may not replicate; only inspect visible Tools.
+        local backpack = player.FindFirstChildOfClass(player, "Backpack")
+        local record = TargetWeaponFilter.Records[player]
+        if record and (record.Character ~= character or record.Backpack ~= backpack) then
+            dropRecord(player)
+            record = nil
+        end
+        if not record then record = newRecord(player, character, backpack) end
+        local now = os.clock()
+        if not record.Dirty and now < record.NegativeUntil then return nil end
+        record.Dirty = false
+        record.Scan = record.Scan + 1
+
+        local function scan(container, allowModel)
+            if not container then return nil end
+            for _, child in ipairs(container.GetChildren(container)) do
+                watchChild(record, child, container, allowModel)
+                local matched = TargetWeaponFilter.MatchInstance(child, allowModel)
+                if matched then return matched end
+            end
+        end
+        local matched = scan(character, true) or scan(backpack, false)
+        if matched then
+            Runtime.IgnoredTargetWeapons[player] = {Character = character, Weapon = matched}
+            dropRecord(player)
+            return matched
+        end
+        for child, watched in pairs(record.Children) do
+            if watched.Scan ~= record.Scan then
+                disconnectAll(watched.Connections)
+                record.Children[child] = nil
+            end
+        end
+        record.NegativeUntil = now + negativeLifetime
+        return nil
+    end
+
+    TargetWeaponFilter.RefreshConfig()
 end
 
 local function keepSelectedTargetInSafeZone(player)
@@ -4747,44 +4966,134 @@ local function isWeaponSkillAllowed(tool, keyName)
     return type(overrides) ~= "table" or overrides[keyName] ~= false
 end
 
-local function collectTools()
-    local tools = {}
-    local character = Runtime.Character
-    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
+-- Owned weapons are shared across all default/custom validation calls.
+do
+    local cache = {Tools = {}, Records = {}, Connections = {}, Dirty = true,
+        ByName = {}, ByCategory = {}, ByNormalized = {}, DuplicateNames = {}, Version = 0, NextRefresh = 0}
+    Runtime.ToolCache = cache
 
-    local function addFrom(container)
-        if not container then
-            return
-        end
-
-        for _, child in ipairs(container:GetChildren()) do
-            if child:IsA("Tool") then
-                table.insert(tools, child)
-            end
-        end
+    local function disconnectAll(connections)
+        for _, connection in ipairs(connections) do connection:Disconnect() end
+        table.clear(connections)
     end
 
-    addFrom(character)
-    addFrom(backpack)
+    function cache:Reset()
+        disconnectAll(self.Connections)
+        for _, record in pairs(self.Records) do disconnectAll(record.Connections) end
+        self.Tools, self.Records = {}, {}
+        self.ByName, self.ByCategory, self.ByNormalized, self.DuplicateNames = {}, {}, {}, {}
+        self.Character, self.Backpack = nil, nil
+        self.Dirty, self.NextRefresh = true, 0
+        self.Version = self.Version + 1
+    end
 
-    table.sort(tools, function(left, right)
-        return left.Name < right.Name
-    end)
+    function cache:Stop()
+        self:Reset()
+        self.Stopped = true
+    end
 
-    return tools
+    local function owned(tool)
+        return tool.Parent ~= nil and (tool.Parent == cache.Character or tool.Parent == cache.Backpack)
+    end
+
+    local function watchContainer(container)
+        if not container then return end
+        local function changed(child)
+            if cache.Stopped or not child:IsA("Tool") then return end
+            -- Unique-name equip moves retain ownership; equal-name tie order can change.
+            if not cache.Records[child] or not owned(child) or cache.DuplicateNames[child.Name] then
+                cache.Dirty = true
+            end
+        end
+        cache.Connections[#cache.Connections + 1] = container.ChildAdded:Connect(changed)
+        cache.Connections[#cache.Connections + 1] = container.ChildRemoved:Connect(changed)
+    end
+
+    function cache:Get()
+        if self.Stopped then return self end
+        local character = Runtime.Character
+        local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
+        if self.Character ~= character or self.Backpack ~= backpack then
+            self:Reset()
+            self.Character, self.Backpack = character, backpack
+            watchContainer(character)
+            watchContainer(backpack)
+        end
+
+        -- Immediate validation of cached references also covers deferred signals.
+        for _, tool in ipairs(self.Tools) do
+            local record = self.Records[tool]
+            if not owned(tool) or tool.Name ~= record.Name or tool.ToolTip ~= record.Category
+                or (self.DuplicateNames[record.Name] and tool.Parent ~= record.Parent) then
+                self.Dirty = true
+                break
+            end
+        end
+        local now = os.clock()
+        if not self.Dirty and now < self.NextRefresh then return self end
+        self.Dirty, self.NextRefresh = false, now + 0.1
+
+        local tools = {}
+        local function addFrom(container)
+            if not container then return end
+            for _, child in ipairs(container:GetChildren()) do
+                if child:IsA("Tool") then tools[#tools + 1] = child end
+            end
+        end
+        addFrom(character)
+        addFrom(backpack)
+        table.sort(tools, function(left, right) return left.Name < right.Name end)
+
+        local changed = #tools ~= #self.Tools
+        local present = {}
+        for index, tool in ipairs(tools) do
+            present[tool] = true
+            local record = self.Records[tool]
+            if not record then
+                record = {Connections = {}}
+                self.Records[tool] = record
+                local function invalidate() if not self.Stopped then self.Dirty = true end end
+                record.Connections[1] = tool:GetPropertyChangedSignal("Name"):Connect(invalidate)
+                record.Connections[2] = tool:GetPropertyChangedSignal("ToolTip"):Connect(invalidate)
+            end
+            if self.Tools[index] ~= tool or record.Name ~= tool.Name or record.Category ~= tool.ToolTip then
+                changed = true
+            end
+            record.Name, record.Category, record.Parent = tool.Name, tool.ToolTip, tool.Parent
+        end
+        for tool, record in pairs(self.Records) do
+            if not present[tool] then
+                disconnectAll(record.Connections)
+                self.Records[tool] = nil
+            end
+        end
+        if changed then
+            self.Tools = tools
+            self.ByName, self.ByCategory, self.ByNormalized, self.DuplicateNames = {}, {}, {}, {}
+            for _, tool in ipairs(tools) do
+                if self.ByName[tool.Name] then self.DuplicateNames[tool.Name] = true end
+                self.ByName[tool.Name] = self.ByName[tool.Name] or tool
+                self.ByCategory[tool.ToolTip] = self.ByCategory[tool.ToolTip] or tool
+                local name = string.lower(tool.Name):gsub("[%s%p]", "")
+                if name ~= "" then self.ByNormalized[name] = self.ByNormalized[name] or tool end
+            end
+            self.Version = self.Version + 1
+        end
+        return self
+    end
+end
+
+local function collectTools()
+    return Runtime.ToolCache:Get().Tools
 end
 
 local function resolveTool(category, categoryConfig)
-    local tools = collectTools()
+    local inventory = Runtime.ToolCache:Get()
     local requestedName = tostring(categoryConfig.Name or "Auto")
 
     if requestedName ~= "" and string.lower(requestedName) ~= "auto" then
-        for _, tool in ipairs(tools) do
-            if tool.Name == requestedName then
-                return tool
-            end
-        end
-
+        local tool = inventory.ByName[requestedName]
+        if tool then return tool end
         warnOnce(
             "weapon:missing-exact:" .. tostring(Runtime.CharacterEpoch) .. ":" .. category .. ":" .. requestedName,
             "Configured " .. category .. " tool " .. requestedName .. " was not found; that category is skipped."
@@ -4792,12 +5101,8 @@ local function resolveTool(category, categoryConfig)
         return nil
     end
 
-    for _, tool in ipairs(tools) do
-        if tool.ToolTip == category then
-            return tool
-        end
-    end
-
+    local tool = inventory.ByCategory[category]
+    if tool then return tool end
     warnOnce(
         "weapon:missing:" .. tostring(Runtime.CharacterEpoch) .. ":" .. category,
         "No " .. category .. " tool matched weapon config Name=" .. requestedName .. "."
@@ -4924,6 +5229,7 @@ end
 local CombatActions = {
     NextNormalAttackAt = 0,
     NextRemoteLookupAt = 0,
+    RequirementCache = setmetatable({}, {__mode = "k"}),
     SkillAttempts = setmetatable({}, {__mode = "k"}),
 }
 
@@ -5023,7 +5329,11 @@ function CombatActions.DefaultEntryValid(entry)
         and entry.Config.Enabled == true
         and isWeaponSkillAllowed(entry.Tool, entry.Key)
         and CombatActions.IsOwnedTool(entry.Tool)
-        and resolveTool(entry.Category, entry.CategoryConfig) == entry.Tool
+        and ((entry.DefaultGodhumanOpener == true
+                and entry.Category == "Melee" and entry.Key == "Z"
+                and Runtime.ToolCache:Get().ByNormalized.godhuman == entry.Tool)
+            or (entry.DefaultGodhumanOpener ~= true
+                and resolveTool(entry.Category, entry.CategoryConfig) == entry.Tool))
 end
 
 function CombatActions.EquipDefaultTool(entry, targetEpoch, characterEpoch)
@@ -5174,102 +5484,119 @@ function CombatActions.IsOwnedTool(tool)
     return tool.Parent == Runtime.Character or (backpack ~= nil and tool.Parent == backpack)
 end
 
-function CombatActions.ComboRequirementsMet(combo)
-    if type(combo.RequiredWeapons) ~= "table" or #combo.RequiredWeapons == 0 then
-        return false, "RequiredWeapons must contain at least one Tool name"
-    end
-
-    local found = {}
-
-    for _, tool in ipairs(collectTools()) do
-        local name = CombatActions.NormalizeToolName(tool.Name)
-
-        if name then
-            found[name] = true
+function CombatActions.GetRequirementRecord(combo)
+    local requirements = combo.RequiredWeapons
+    local record = CombatActions.RequirementCache[combo]
+    local length = type(requirements) == "table" and #requirements or 0
+    local unchanged = record and record.Source == requirements and record.Length == length
+    if unchanged and type(requirements) == "table" then
+        for index = 1, length do
+            if record.Items[index] ~= requirements[index] then unchanged = false; break end
         end
     end
+    if unchanged then return record end
 
-    local missing = {}
-
-    for _, value in ipairs(combo.RequiredWeapons) do
+    record = {Source = requirements, Length = length, Items = {}, Names = {}}
+    CombatActions.RequirementCache[combo] = record
+    if type(requirements) ~= "table" or length == 0 then
+        record.Error = "RequiredWeapons must contain at least one Tool name"
+        return record
+    end
+    for index = 1, length do record.Items[index] = requirements[index] end
+    for index, value in ipairs(requirements) do
         local name = CombatActions.NormalizeToolName(value)
-
         if not name then
-            return false, "RequiredWeapons entries must be nonempty Tool-name strings"
+            record.Error = "RequiredWeapons entries must be nonempty Tool-name strings"
+            break
         end
+        record.Names[index] = name
+    end
+    return record
+end
 
-        if not found[name] then
-            table.insert(missing, value)
+function CombatActions.ComboRequirementsMet(combo, inventory)
+    local record = CombatActions.GetRequirementRecord(combo)
+    if record.Error then return false, record.Error end
+    inventory = inventory or Runtime.ToolCache:Get()
+    if record.InventoryVersion ~= inventory.Version then
+        local missing = {}
+        for index, name in ipairs(record.Names) do
+            if not inventory.ByNormalized[name] then missing[#missing + 1] = record.Items[index] end
         end
+        record.InventoryVersion = inventory.Version
+        record.Ready = #missing == 0
+        record.Reason = not record.Ready and ("Missing owned Tool: " .. table.concat(missing, ", ")) or nil
+        record.State = not record.Ready and "missing-tools" or nil
     end
-
-    if #missing > 0 then
-        return false, "Missing owned Tool: " .. table.concat(missing, ", "), "missing-tools"
-    end
-
-    return true
+    return record.Ready, record.Reason, record.State
 end
 
 function CombatActions.GetActiveComboConfig()
     local combo = CombatActions.GetComboConfig()
+    if not combo then return nil end
+    local inventory = Runtime.ToolCache:Get()
 
-    if not combo then
-        return nil
-    end
-
-    -- Profiles are ordered: the first enabled profile with all required Tools wins.
-    -- Return its original table so the worker can detect a change during equip.
     if combo.Profiles ~= nil then
-        if type(combo.Profiles) ~= "table" then
+        local profiles = combo.Profiles
+        if type(profiles) ~= "table" then
             warnOnce("combo:profiles:type", "Combo.Profiles must be an ordered list of combo tables")
             return nil
         end
-
-        for index, profile in ipairs(combo.Profiles) do
-            if type(profile) ~= "table" then
-                warnOnce("combo:profile:type:" .. tostring(index),
-                    "Combo profile " .. tostring(index) .. " must be a table; skipping")
-            elseif profile.Enabled ~= false then
-                local ready, reason, requirementState = CombatActions.ComboRequirementsMet(profile)
-
-                if ready then
-                    return profile
+        local cached = CombatActions.ComboSelection
+        if cached and cached.Combo == combo and cached.Profiles == profiles
+            and cached.InventoryVersion == inventory.Version then
+            local valid = true
+            for index, dependency in ipairs(cached.Dependencies) do
+                local profile = profiles[index]
+                if dependency.Profile ~= profile
+                    or (type(profile) == "table" and dependency.Enabled ~= profile.Enabled)
+                    or (dependency.Requirement and dependency.Requirement ~= CombatActions.GetRequirementRecord(profile)) then
+                    valid = false
+                    break
                 end
-
-                if requirementState ~= "missing-tools" then
-                    warnOnce("combo:profile:requirements:" .. tostring(index) .. ":" .. tostring(reason),
-                        "Combo profile " .. tostring(profile.Name or index) .. " skipped: " .. tostring(reason))
-                end
+            end
+            if valid and (cached.Selected ~= nil or profiles[#cached.Dependencies + 1] == nil) then
+                return cached.Selected
             end
         end
 
+        cached = {Combo = combo, Profiles = profiles, InventoryVersion = inventory.Version, Dependencies = {}}
+        CombatActions.ComboSelection = cached
+        for index, profile in ipairs(profiles) do
+            local dependency = {Profile = profile}
+            cached.Dependencies[index] = dependency
+            if type(profile) ~= "table" then
+                warnOnce("combo:profile:type:" .. tostring(index),
+                    "Combo profile " .. tostring(index) .. " must be a table; skipping")
+            else
+                dependency.Enabled = profile.Enabled
+                if profile.Enabled ~= false then
+                    dependency.Requirement = CombatActions.GetRequirementRecord(profile)
+                    local ready, reason, requirementState = CombatActions.ComboRequirementsMet(profile, inventory)
+                    if ready then
+                        cached.Selected = profile
+                        return profile
+                    end
+                    if requirementState ~= "missing-tools" then
+                        warnOnce("combo:profile:requirements:" .. tostring(index) .. ":" .. tostring(reason),
+                            "Combo profile " .. tostring(profile.Name or index) .. " skipped: " .. tostring(reason))
+                    end
+                end
+            end
+        end
         return nil
     end
 
-    -- Keep the existing single-combo configuration and validation behavior.
-    local ready, _, reason = CombatActions.ComboRequirementsMet(combo)
-
-    if not ready and reason == "missing-tools" then
-        return nil
-    end
-
+    -- Preserve the legacy single-profile invalid/blocked behavior.
+    local ready, _, reason = CombatActions.ComboRequirementsMet(combo, inventory)
+    if not ready and reason == "missing-tools" then return nil end
     return combo
 end
 
 function CombatActions.ResolveComboTool(step)
     local requested = CombatActions.NormalizeToolName(step.Tool or step.Weapon)
-
-    if not requested then
-        return nil
-    end
-
-    for _, tool in ipairs(collectTools()) do
-        if CombatActions.NormalizeToolName(tool.Name) == requested then
-            return tool
-        end
-    end
-
-    return nil
+    if not requested then return nil end
+    return Runtime.ToolCache:Get().ByNormalized[requested]
 end
 
 function CombatActions.ComboBlocked(reason)
@@ -5406,13 +5733,38 @@ function CombatActions.GetSkills(weaponOrder, forceDefault)
         if type(categoryConfig) == "table" and categoryConfig.Enabled == true then
             local tool = resolveTool(category, categoryConfig)
             local skills = type(categoryConfig.Skills) == "table" and categoryConfig.Skills or {}
+            local openerTool
+
+            -- Each default pass opens with owned Godhuman Z, even when another
+            -- melee tool is selected. Custom combo steps keep their own order.
+            if category == "Melee" then
+                local godhuman = Runtime.ToolCache:Get().ByNormalized.godhuman
+                local skillConfig = skills.Z
+                if godhuman and CombatActions.IsOwnedTool(godhuman)
+                    and type(skillConfig) == "table" and skillConfig.Enabled == true
+                    and isWeaponSkillAllowed(godhuman, "Z") then
+                    local cooling = CombatActions.ReadCooldown(godhuman, "Z")
+                    CombatActions.ObserveCooldown(godhuman, "Z", cooling)
+                    openerTool = godhuman
+                    table.insert(entries, 1, {
+                        Tool = godhuman,
+                        Category = category,
+                        CategoryConfig = categoryConfig,
+                        Key = "Z",
+                        Config = skillConfig,
+                        Cooling = cooling,
+                        DefaultGodhumanOpener = true,
+                    })
+                end
+            end
 
             if tool then
                 for _, keyName in ipairs(getSkillOrder(categoryConfig)) do
                     local skillConfig = skills[keyName]
 
                     if type(skillConfig) == "table" and skillConfig.Enabled == true
-                        and isWeaponSkillAllowed(tool, keyName) then
+                        and isWeaponSkillAllowed(tool, keyName)
+                        and not (tool == openerTool and keyName == "Z") then
                         local cooling = CombatActions.ReadCooldown(tool, keyName)
                         CombatActions.ObserveCooldown(tool, keyName, cooling)
                         table.insert(entries, {
@@ -6427,6 +6779,7 @@ local function handleLocalDeath(characterEpoch)
 end
 
 local function bindCharacter(character)
+    if Runtime.ToolCache then Runtime.ToolCache:Reset() end
     Runtime.CharacterEpoch = Runtime.CharacterEpoch + 1
     Runtime.SafeEpoch = Runtime.SafeEpoch + 1
     local characterEpoch = Runtime.CharacterEpoch
@@ -7870,7 +8223,7 @@ local function startFriendWorker()
         Runtime.NoProgressCharacters[player] = nil
         Runtime.FollowTimeoutCharacters[player] = nil
         Runtime.RouteFailures[player] = nil
-        Runtime.IgnoredTargetWeapons[player] = nil
+        TargetWeaponFilter.Forget(player)
 
         if Runtime.CurrentTarget == player then
             clearTarget("Target left the server")
@@ -8016,6 +8369,10 @@ function Runtime:Stop(reason)
 
     self.Running = false
 
+    if self.ToolCache then self.ToolCache:Stop() end
+    TargetWeaponFilter.Stop()
+    CombatActions.ComboSelection = nil
+    table.clear(CombatActions.RequirementCache)
     table.clear(SavedTargetFilter.Entries)
     StartupFPSBoost:Stop()
     ServerTimeout.Pending = false
