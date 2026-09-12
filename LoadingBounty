@@ -32,7 +32,7 @@ end
 
 assert(LocalPlayer, "[AutoBounty Loader] LocalPlayer is unavailable")
 
-loadstring(game:HttpGet("https://raw.githubusercontent.com/JustParadozCode/CentuDox-Hub/refs/heads/main/CentuDox-Pvp.xyz"))()
+
 
 Environment.AutoBountyConfig = {
     Team = "Pirates", -- "Pirates" or "Marines"
