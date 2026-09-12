@@ -463,5 +463,5 @@ _G["HoHo Hub Auto Bounty V67"] = {
     ["Instant Teleport"] = false,
 }
 
-_G.loadCustomId = "QBCuQaWJKMSfVhtJaZObmnEkrEpzbTxK"
+_G.loadCustomId = "fac6dbd013c78163f8061ce11b2c1330"
 loadstring(game:HttpGet("https://raw.githubusercontent.com/acsu123/HOHO_H/main/Loading_UI"))()
