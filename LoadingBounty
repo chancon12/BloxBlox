@@ -215,7 +215,7 @@ Combo = {
                 {Weapon = "Dragonheart", Key = "Z", Hold = 0.5},
                 {Weapon = "Dragon Talon", Key = "Z", Hold = 0.1},
                 {Weapon = "Dragon Talon", Key = "X", Hold = 0.1},
-                {Weapon = "Dragonheart", Key = "X", Hold = 0.5}, -- Adjustable hold
+                {Weapon = "Dragonheart", Key = "X", Hold = 0.5}, -- Adjustable hold, not a verified maximum
                 {Weapon = "Dragon-Dragon", Key = "Z", Hold = 0.1},
             },
         },
@@ -245,6 +245,21 @@ Combo = {
                 {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
                 {Weapon = "Shark Anchor", Key = "Z", Hold = 0.5},
                 {Weapon = "Lightning-Lightning", Key = "V", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.1},
+            },
+        },
+        {
+            Name = "Skull Guitar + Portal + Cursed Dual Katana + Godhuman",
+            Enabled = true,
+            RequiredWeapons = {"Skull Guitar", "Portal-Portal", "Cursed Dual Katana", "Godhuman"},
+            Steps = {
+                {Weapon = "Skull Guitar", Key = "X", Hold = 0.1},
+                {Weapon = "Portal-Portal", Key = "X", Hold = 0.1},
+                {Weapon = "Portal-Portal", Key = "Z", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
                 {Weapon = "Godhuman", Key = "C", Hold = 0.1},
             },
         },
