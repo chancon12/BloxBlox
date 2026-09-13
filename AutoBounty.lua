@@ -40,6 +40,10 @@
 -- Either qualifies the current target for this check until a different target acquisition.
 -- SkipPreviousTargets defaults to true; set false to allow previous targets through this filter.
 -- OrbitEnabled defaults to true; set false to follow the target directly without circling.
+-- Orbit pauses for every skill key press/hold, including continuous default spam.
+-- Settings.OrbitResumeDelay defaults to 0.5 seconds after the last skill release; 0 resumes immediately.
+-- Each new press keeps orbit paused, and its release restarts the delay.
+-- While paused, follow the target from the current side; configured SkillOffset takes priority.
 -- ClickAttack defaults to true; normal attacks fill gaps when no enabled skill can be attempted.
 -- ClickAttack also pauses while the local player's health is below 20% of MaxHealth.
 -- Settings.ClickAttackMinTargetHealth = 3000 pauses all blade attacks below that target HP (raw Health).
@@ -56,7 +60,7 @@
 --     ["Godhuman"]={Z=Vector3.new(0, 0, 0)},
 -- }} overrides HitboxOffset for matching equipped Tool names and skill keys.
 -- Tween/CFrame positioning completes within 0.5 studs before key-down; timeout skips the skill.
--- Orbit pauses until key release, then the normal HitboxOffset/orbit resumes. Omitted/false is disabled.
+-- The offset ends on key release; orbit waits for OrbitResumeDelay before resuming. Omitted/false is disabled.
 -- Empty-target hop: rise continuously at TweenSpeed with fixed X/Z until the server hop.
 -- SafeModeY does not cap this ascent; each update puts the goal above the current height.
 -- Once ascent starts, new targets cannot cancel the hop; the commitment survives recovery/respawn.
@@ -821,6 +825,7 @@ local Runtime = {
     WinEntranceAttempt = nil,
     CurrentTool = nil,
     SkillOffsetState = nil,
+    OrbitSkillPause = nil,
     TargetEpoch = 0,
     CharacterEpoch = 0,
     SafeEpoch = 0,
@@ -1913,6 +1918,9 @@ end
 
 local function releaseAllKeys()
     Runtime.ReleaseGunClick()
+    if Runtime.ClearOrbitSkillPause then
+        Runtime.ClearOrbitSkillPause()
+    end
     if Runtime.ClearSkillOffset then
         Runtime.ClearSkillOffset()
     end
@@ -1934,6 +1942,8 @@ local function pressKeyDown(keyName)
         return false
     end
 
+    local previousOrbitPause = Runtime.OrbitSkillPause
+    local orbitPause = Runtime.BeginOrbitSkillPause(keyName)
     local success, result = pcall(function()
         VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
     end)
@@ -1943,6 +1953,14 @@ local function pressKeyDown(keyName)
         return true
     end
 
+    if orbitPause and Runtime.OrbitSkillPause == orbitPause then
+        Runtime.ClearOrbitSkillPause(orbitPause)
+        -- A failed input must not erase the quiet period from the last successful skill.
+        if previousOrbitPause and not previousOrbitPause.Held
+            and Runtime.IsOrbitSkillPauseCurrent(previousOrbitPause) then
+            Runtime.OrbitSkillPause = previousOrbitPause
+        end
+    end
     warnOnce("skill:key-down:" .. keyName, "Could not press " .. keyName .. ": " .. tostring(result))
     return false
 end
@@ -1957,6 +1975,10 @@ local function releaseKey(keyName)
     end
 
     Runtime.PressedKeys[keyName] = nil
+    local orbitPause = Runtime.OrbitSkillPause
+    if orbitPause and orbitPause.Key == keyName then
+        Runtime.ReleaseOrbitSkillPause(orbitPause)
+    end
 end
 
 local function restoreTargetHitbox()
@@ -4683,6 +4705,103 @@ function Runtime.PrepareSkillOffset(tool, key, targetEpoch, characterEpoch, atta
     return true, state
 end
 
+function Runtime.ClearOrbitSkillPause(state)
+    local current = Runtime.OrbitSkillPause
+    if not current or (state and state ~= current) then return end
+    Runtime.OrbitSkillPause = nil
+    if current.Tween and Runtime.ActiveTween == current.Tween then
+        current.Tween:Cancel()
+        Runtime.ActiveTween = nil
+    end
+    Runtime.ChaseMovementMode = nil
+    Runtime.ChaseTweenTimeMultiplier = nil
+end
+
+function Runtime.GetOrbitResumeDelay()
+    local delay = tonumber(Settings.OrbitResumeDelay)
+    return isFiniteNumber(delay) and delay >= 0 and delay or 0.5
+end
+
+function Runtime.IsOrbitSkillPauseCurrent(state)
+    if not state or not OrbitEnabled
+        or Runtime.CharacterEpoch ~= state.CharacterEpoch
+        or Runtime.Character ~= state.Character or Runtime.Root ~= state.Root
+        or Runtime.CurrentTarget ~= state.Player
+        or not Runtime.CurrentTargetInfo or Runtime.CurrentTargetInfo.Root ~= state.TargetRoot
+        or not canAttack(state.TargetEpoch, nil, true) then
+        return false
+    end
+
+    if state.Held then
+        return Runtime.AttackBusy and Runtime.CurrentTool == state.Tool
+            and state.Tool ~= nil and state.Tool.Parent == state.Character
+    end
+
+    -- AttackBusy ends and weapons may change between skills; keep the same side until the delay ends.
+    return state.ResumeAt ~= nil and os.clock() < state.ResumeAt
+end
+
+function Runtime.BeginOrbitSkillPause(key)
+    local previous = Runtime.OrbitSkillPause
+    local keepOffset = Runtime.IsOrbitSkillPauseCurrent(previous) and not Runtime.SkillOffsetState
+    Runtime.ClearOrbitSkillPause()
+    if not OrbitEnabled or not Runtime.AttackBusy or not canAttack(Runtime.TargetEpoch, nil, true) then
+        return nil
+    end
+
+    local root = Runtime.Root
+    local targetRoot = Runtime.CurrentTargetInfo.Root
+    local state = {
+        Key = key, Held = true, Tool = Runtime.CurrentTool, Character = Runtime.Character,
+        CharacterEpoch = Runtime.CharacterEpoch, TargetEpoch = Runtime.TargetEpoch,
+        Player = Runtime.CurrentTarget, Root = root, TargetRoot = targetRoot,
+        Offset = keepOffset and previous.Offset or root.Position - targetRoot.Position,
+        UsesSkillOffset = Runtime.SkillOffsetState ~= nil,
+    }
+    Runtime.OrbitSkillPause = state
+    -- Stop the pending arc before key-down, including one-Heartbeat presses.
+    if Runtime.ActiveTween and not Runtime.SkillOffsetState then
+        Runtime.ActiveTween:Cancel()
+        Runtime.ActiveTween = nil
+    end
+    return state
+end
+
+function Runtime.ReleaseOrbitSkillPause(state)
+    if Runtime.OrbitSkillPause ~= state or not state.Held then return end
+    if not Runtime.IsOrbitSkillPauseCurrent(state) then
+        Runtime.ClearOrbitSkillPause(state)
+        return
+    end
+
+    if state.UsesSkillOffset then
+        -- Hold the position reached by this skill's offset instead of returning to a previous side.
+        state.Offset = state.Root.Position - state.TargetRoot.Position
+    end
+    state.Held = false
+    state.ResumeAt = os.clock() + Runtime.GetOrbitResumeDelay()
+    if os.clock() >= state.ResumeAt then Runtime.ClearOrbitSkillPause(state) end
+end
+
+function Runtime.UpdateOrbitSkillPause(deltaTime)
+    local state = Runtime.OrbitSkillPause
+    if not state then return false end
+    if not Runtime.IsOrbitSkillPauseCurrent(state) then
+        Runtime.ClearOrbitSkillPause(state)
+        return false
+    end
+    if Runtime.SkillOffsetState then return false end
+
+    -- A world-space displacement keeps the same side even when the target turns.
+    local goal = getHitboxMovementCFrame(state.Root, state.TargetRoot,
+        state.TargetRoot.Position + state.Offset)
+    local multiplier, insideTweenHitbox = getTargetTweenTimeMultiplier(state.Root, state.TargetRoot)
+    local useCFrame = insideTweenHitbox and INTERNAL.TweenHitboxMode == "CFrame"
+    Runtime.MoveToTargetGoal(goal, deltaTime, true, multiplier, useCFrame)
+    state.Tween = not useCFrame and Runtime.ActiveTween or nil
+    return true
+end
+
 local function enforceLocalYFloor()
     local character = Runtime.Character
     local root = Runtime.Root
@@ -7304,6 +7423,11 @@ local function startMovementWorker()
         end
 
         if Runtime.SkillOffsetState and Runtime.UpdateSkillOffset(deltaTime) then
+            faceRootTowardTarget(localRoot, targetRoot)
+            return
+        end
+
+        if Runtime.OrbitSkillPause and Runtime.UpdateOrbitSkillPause(deltaTime) then
             faceRootTowardTarget(localRoot, targetRoot)
             return
         end
