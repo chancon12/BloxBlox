@@ -266,6 +266,17 @@ Combo = {
     },
 },
 
+    SkillOffset = {
+    Enabled = true,
+    MoveTimeout = 0.1, -- Maximum seconds to reach the offset
+
+    Weapons = {
+        ["Godhuman"] = {
+            Z = Vector3.new(0, 0, 0),
+        },
+    },
+},
+
     Weapon = {
 
         Moveset = {
