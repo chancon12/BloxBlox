@@ -130,6 +130,9 @@
 -- Attempted JobIds and transport locks survive same-server reloads; no external hop script is loaded.
 -- Pending server-list/teleport calls must return before another call of the same type can start.
 -- Startup order: confirm team, run enabled FPS boost, then continue setup 5 seconds after it starts.
+-- Startup keeps retrying late remotes, team/data readiness, PlayerGui, and character parts.
+-- Settings.LoadRetryDelay defaults to 5 seconds between completed SetTeam attempts.
+-- Readiness polling is cancellable on reload; a retry never starts another copy of the module.
 -- A longer FPS pass continues in the background without extending the startup delay.
 -- After 300 seconds in this script's server session, queue a hop when local InCombat is known false.
 -- This timeout respects AutoHop/recovery gates and survives same-server reloads.
@@ -472,82 +475,76 @@ local ENTRANCES = {
     },
 }
 
-if not game:IsLoaded() then
-    game.Loaded:Wait()
+-- Retire the old copy before any indefinite load wait can begin.
+do
+    local previous = Environment.__AutoBountyRuntime
+    if previous and type(previous.Stop) == "function" then
+        pcall(previous.Stop, previous, "reload")
+    end
 end
 
-if not bootstrapStillCurrent() then
-    return
+while bootstrapStillCurrent() and not game:IsLoaded() do
+    task.wait(0.1)
 end
+if not bootstrapStillCurrent() then return end
 
 local LocalPlayer = Players.LocalPlayer
-
 while not LocalPlayer and bootstrapStillCurrent() do
     task.wait(0.1)
     LocalPlayer = Players.LocalPlayer
 end
+if not bootstrapStillCurrent() then return end
 
-if not bootstrapStillCurrent() then
-    return
+local Remotes, CommF
+local StartupLoad = {NextTeamRequestAt = 0, Warned = {}, RetryDelay = tonumber(Settings.LoadRetryDelay)}
+if not isFiniteNumber(StartupLoad.RetryDelay) or StartupLoad.RetryDelay <= 0 then
+    StartupLoad.RetryDelay = 5
 end
 
-assert(LocalPlayer, "[AutoBounty] LocalPlayer is unavailable")
-
-local Remotes = ReplicatedStorage:WaitForChild("Remotes", 30)
-assert(Remotes, "[AutoBounty] ReplicatedStorage.Remotes was not found within 30 seconds")
-
-local CommF = Remotes:WaitForChild("CommF_", 30)
-assert(CommF, "[AutoBounty] ReplicatedStorage.Remotes.CommF_ was not found within 30 seconds")
-
-if not bootstrapStillCurrent() then
-    return
-end
-
-local PreviousRuntime = Environment.__AutoBountyRuntime
-
-if PreviousRuntime and type(PreviousRuntime.Stop) == "function" then
-    pcall(function()
-        PreviousRuntime:Stop("reload")
-    end)
-end
-
-if not bootstrapStillCurrent() then
-    return
-end
-
--- Select the team first. In the current client, DataLoaded's presence is the
--- usable marker; its BoolValue.Value can remain false after gameplay is ready.
-local TeamRequestOk, TeamRequestResult = pcall(function()
-    return CommF:InvokeServer("SetTeam", Config.Team)
-end)
-
-if not bootstrapStillCurrent() then
-    return
-end
-
-assert(
-    TeamRequestOk,
-    "[AutoBounty] SetTeam failed: " .. tostring(TeamRequestResult)
-)
-
-local TeamDeadline = os.clock() + 15
-
-while bootstrapStillCurrent() and os.clock() < TeamDeadline do
-    if LocalPlayer.Team and LocalPlayer.Team.Name == Config.Team then
-        break
+function StartupLoad.Warn(key, message)
+    if not StartupLoad.Warned[key] then
+        StartupLoad.Warned[key] = true
+        warn("[AutoBounty] " .. message)
     end
+end
 
+function StartupLoad.ResolveRemotes()
+    Remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    CommF = Remotes and Remotes:FindFirstChild("CommF_")
+    return CommF ~= nil and CommF:IsA("RemoteFunction")
+end
+
+function StartupLoad.EnsureTeam()
+    if not bootstrapStillCurrent() or not StartupLoad.ResolveRemotes() then
+        return false
+    end
+    -- Keep a yielding SetTeam call serialized, including across script reloads.
+    if Environment.__AutoBountyTeamRequest then return false end
+    if LocalPlayer.Team and LocalPlayer.Team.Name == Config.Team then return true end
+    if os.clock() < StartupLoad.NextTeamRequestAt then return false end
+
+    local request = {Remote = CommF}
+    Environment.__AutoBountyTeamRequest = request
+    local ok, err = pcall(function()
+        return request.Remote:InvokeServer("SetTeam", Config.Team)
+    end)
+    if Environment.__AutoBountyTeamRequest == request then
+        Environment.__AutoBountyTeamRequest = nil
+    end
+    StartupLoad.NextTeamRequestAt = os.clock() + StartupLoad.RetryDelay
+    if not bootstrapStillCurrent() then return false end
+    if not ok then
+        StartupLoad.Warn("team-request", "SetTeam failed; retrying until confirmed: " .. tostring(err))
+    end
+    return StartupLoad.ResolveRemotes()
+        and LocalPlayer.Team ~= nil and LocalPlayer.Team.Name == Config.Team
+end
+
+-- Confirm team before starting the one FPS boost pass.
+while bootstrapStillCurrent() and not StartupLoad.EnsureTeam() do
     task.wait(0.1)
 end
-
-if not bootstrapStillCurrent() then
-    return
-end
-
-assert(
-    LocalPlayer.Team and LocalPlayer.Team.Name == Config.Team,
-    "[AutoBounty] The requested team was not confirmed within 15 seconds"
-)
+if not bootstrapStillCurrent() then return end
 
 -- The startup delay is measured from the start of the FPS boost, not its completion.
 local StartupFPSBoost = {
@@ -777,107 +774,39 @@ if Settings.FPSBoost ~= false then
 end
 
 
-local DataLoadedDeadline = os.clock() + 60
-local DataLoaded
-local LoadedData
-local LoadedLevelObject
-local StableDataLoaded
-local StableData
-local StableLevelObject
-local ReadySince
-local LastTeamName = "<missing>"
-local LastMarkerState = "<missing>"
-local LastLevelState = "<missing>"
+function StartupLoad.WaitForData()
+    local stableMarker, stableData, stableLevel, readySince
+    while bootstrapStillCurrent() do
+        local teamReady = StartupLoad.EnsureTeam()
+        if not bootstrapStillCurrent() then return false end
+        local marker = LocalPlayer:FindFirstChild("DataLoaded")
+        local data = LocalPlayer:FindFirstChild("Data")
+        local levelObject = data and data:FindFirstChild("Level")
+        local rawLevel = levelObject and levelObject:IsA("ValueBase") and levelObject.Value
+        local level = (type(rawLevel) == "number" or type(rawLevel) == "string") and tonumber(rawLevel)
 
-while bootstrapStillCurrent() and os.clock() < DataLoadedDeadline do
-    local current = LocalPlayer:FindFirstChild("DataLoaded")
-    local currentTeam = LocalPlayer.Team
-    local teamMatches = currentTeam and currentTeam.Name == Config.Team
-    local data = LocalPlayer:FindFirstChild("Data")
-    local levelObject = data and data:FindFirstChild("Level")
-    local level = levelObject
-        and levelObject:IsA("ValueBase")
-        and tonumber(levelObject.Value)
+        -- Preserve the existing marker-presence rule: Value may remain false.
+        local ready = teamReady and marker and marker:IsA("BoolValue")
+            and marker.Parent == LocalPlayer and data and data.Parent == LocalPlayer
+            and levelObject and levelObject.Parent == data
+            and isFiniteNumber(level) and level >= 1
 
-    if current and not current:IsA("BoolValue") then
-        StartupFPSBoost:Stop()
-        error("[AutoBounty] LocalPlayer.DataLoaded must be a BoolValue")
-    end
-
-    LastTeamName = currentTeam and currentTeam.Name or "<missing>"
-    LastMarkerState = current
-        and (current.ClassName .. " Value=" .. tostring(current.Value))
-        or "<missing>"
-    LastLevelState = level and tostring(level) or "<missing-or-invalid>"
-
-    local ready = teamMatches
-        and current
-        and data
-        and levelObject
-        and isFiniteNumber(level)
-        and level >= 1
-
-    if ready then
-        if StableDataLoaded == current
-            and StableData == data
-            and StableLevelObject == levelObject then
-
-            if os.clock() - ReadySince >= 0.5 then
-                DataLoaded = current
-                LoadedData = data
-                LoadedLevelObject = levelObject
-                break
+        if ready then
+            if stableMarker == marker and stableData == data and stableLevel == levelObject then
+                if os.clock() - readySince >= 0.5 then return true end
+            else
+                stableMarker, stableData, stableLevel = marker, data, levelObject
+                readySince = os.clock()
             end
         else
-            StableDataLoaded = current
-            StableData = data
-            StableLevelObject = levelObject
-            ReadySince = os.clock()
+            stableMarker, stableData, stableLevel, readySince = nil, nil, nil, nil
         end
-    else
-        StableDataLoaded = nil
-        StableData = nil
-        StableLevelObject = nil
-        ReadySince = nil
+        task.wait(0.1)
     end
-
-    task.wait(0.1)
+    return false
 end
 
-if not bootstrapStillCurrent() then
-    StartupFPSBoost:Stop()
-    return
-end
-
-local finalLevel = LoadedLevelObject
-    and LoadedLevelObject:IsA("ValueBase")
-    and tonumber(LoadedLevelObject.Value)
-local readinessStillValid = LocalPlayer.Team
-    and LocalPlayer.Team.Name == Config.Team
-    and DataLoaded
-    and LocalPlayer:FindFirstChild("DataLoaded") == DataLoaded
-    and DataLoaded.Parent == LocalPlayer
-    and LoadedData
-    and LocalPlayer:FindFirstChild("Data") == LoadedData
-    and LoadedLevelObject
-    and LoadedData:FindFirstChild("Level") == LoadedLevelObject
-    and LoadedLevelObject.Parent == LoadedData
-    and isFiniteNumber(finalLevel)
-    and finalLevel >= 1
-
-if not readinessStillValid then
-    StartupFPSBoost:Stop()
-    error(
-        "[AutoBounty] Readiness timed out or changed: team="
-            .. LastTeamName
-            .. ", DataLoaded="
-            .. LastMarkerState
-            .. ", Level="
-            .. LastLevelState
-    )
-end
-
-if not bootstrapStillCurrent() then
+if not StartupLoad.WaitForData() or not bootstrapStillCurrent() then
     StartupFPSBoost:Stop()
     return
 end
@@ -1615,7 +1544,16 @@ local function createTextLabel(parent, name, position, size, text, textSize)
 end
 
 local function createGUI()
-    local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+    local playerGui
+    while Runtime.Running and bootstrapStillCurrent() and Environment.__AutoBountyRuntime == Runtime do
+        playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if playerGui and playerGui.Parent == LocalPlayer then break end
+        task.wait(0.1)
+    end
+    if not playerGui or not Runtime.Running or not bootstrapStillCurrent()
+        or Environment.__AutoBountyRuntime ~= Runtime then
+        return false
+    end
     local oldGui = playerGui:FindFirstChild("AutoBountyStatus")
 
     if oldGui then
@@ -1681,6 +1619,7 @@ local function createGUI()
 
     Runtime.GUI = screenGui
     SavedBounty.UpdateGUI()
+    return true
 end
 
 local function setStatus(status)
@@ -6960,6 +6899,10 @@ local function handleLocalDeath(characterEpoch)
 end
 
 local function bindCharacter(character)
+    if not Runtime.Running or not bootstrapStillCurrent()
+        or Environment.__AutoBountyRuntime ~= Runtime or LocalPlayer.Character ~= character then
+        return
+    end
     if Runtime.ToolCache then Runtime.ToolCache:Reset() end
     Runtime.CharacterEpoch = Runtime.CharacterEpoch + 1
     Runtime.SafeEpoch = Runtime.SafeEpoch + 1
@@ -6969,82 +6912,83 @@ local function bindCharacter(character)
     Runtime.SafeMode = false
     Runtime.SafeModeAtAltitude = false
     clearTarget()
+    Runtime.Character = nil
+    Runtime.Humanoid = nil
+    Runtime.Root = nil
+    Runtime.EffectiveLowHealth = nil
+    Runtime.EffectiveRecoveryHealth = nil
     Runtime.Mode = "RESPAWN"
     setStatus("Binding character")
 
     task.spawn(function()
-        local humanoid = character:WaitForChild("Humanoid", 10)
-        local root = character:WaitForChild("HumanoidRootPart", 10)
-
-        if not Runtime.Running
-            or Runtime.CharacterEpoch ~= characterEpoch
-            or LocalPlayer.Character ~= character then
-
-            return
+        local function stillCurrent()
+            return Runtime.Running and bootstrapStillCurrent()
+                and Environment.__AutoBountyRuntime == Runtime
+                and Runtime.CharacterEpoch == characterEpoch
+                and LocalPlayer.Character == character
         end
 
-        if not humanoid or not humanoid:IsA("Humanoid") or not root or not root:IsA("BasePart") then
-            warnOnce("character:parts:" .. tostring(characterEpoch), "The respawned character did not provide Humanoid and HumanoidRootPart in time.")
-            setStatus("Character parts missing")
-            return
-        end
+        while stillCurrent() do
+            -- Refresh both references each poll, including partially replicated respawns.
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            local root = character:FindFirstChild("HumanoidRootPart")
+            local partsReady = character.Parent ~= nil
+                and humanoid and humanoid.Parent == character and humanoid.Health > 0
+                and root and root:IsA("BasePart") and root.Parent == character
 
-        if humanoid.Health <= 0 then
-            setStatus("Character was already dead; waiting for respawn")
-            return
-        end
+            if partsReady then
+                Runtime.Character = character
+                Runtime.Humanoid = humanoid
+                Runtime.Root = root
+                updateEffectiveHealthThresholds(humanoid, characterEpoch)
 
-        Runtime.Character = character
-        Runtime.Humanoid = humanoid
-        Runtime.Root = root
-        updateEffectiveHealthThresholds(humanoid, characterEpoch)
+                connect(humanoid.HealthChanged, function(health)
+                    handleHealthChanged(health, characterEpoch)
+                end, true)
+                connect(humanoid:GetPropertyChangedSignal("MaxHealth"), function()
+                    updateEffectiveHealthThresholds(humanoid, characterEpoch)
+                    handleHealthChanged(humanoid.Health, characterEpoch)
+                end, true)
+                connect(humanoid.Died, function()
+                    handleLocalDeath(characterEpoch)
+                end, true)
 
-        connect(humanoid.HealthChanged, function(health)
-            handleHealthChanged(health, characterEpoch)
-        end, true)
+                ensureCombatAttributes()
+                if not stillCurrent() then return end
 
-        connect(humanoid:GetPropertyChangedSignal("MaxHealth"), function()
-            updateEffectiveHealthThresholds(humanoid, characterEpoch)
-            handleHealthChanged(humanoid.Health, characterEpoch)
-        end, true)
+                -- Buso setup can yield while Humanoid/HRP are replaced. Retry the
+                -- same current character, and disconnect this partial binding first.
+                if character.Parent and Runtime.Character == character
+                    and Runtime.Humanoid == humanoid and Runtime.Root == root
+                    and character:FindFirstChildOfClass("Humanoid") == humanoid
+                    and character:FindFirstChild("HumanoidRootPart") == root
+                    and humanoid.Parent == character and root.Parent == character
+                    and humanoid.Health > 0 then
 
-        connect(humanoid.Died, function()
-            handleLocalDeath(characterEpoch)
-        end, true)
+                    Runtime.LocalDead = false
+                    readLocalInCombat()
+                    startPvPEnable()
+                    handleHealthChanged(humanoid.Health, characterEpoch)
+                    if not Runtime.SafeMode then
+                        Runtime.Mode = Runtime.HopPending and "HOP_WAIT" or "SCAN"
+                        setStatus(Runtime.HopPending and "Character ready; resuming server hop"
+                            or "Character ready; scanning")
+                    end
+                    return
+                end
 
-        ensureCombatAttributes()
-
-        local characterStillCurrent = Runtime.Running
-            and Runtime.CharacterEpoch == characterEpoch
-            and LocalPlayer.Character == character
-            and character.Parent ~= nil
-            and Runtime.Character == character
-            and Runtime.Humanoid == humanoid
-            and Runtime.Root == root
-            and humanoid.Parent ~= nil
-            and humanoid.Health > 0
-
-        if not characterStillCurrent then
-            if Runtime.CharacterEpoch == characterEpoch and Runtime.Character == character then
+                disconnectConnections(Runtime.CharacterConnections)
                 Runtime.Character = nil
                 Runtime.Humanoid = nil
                 Runtime.Root = nil
                 Runtime.EffectiveLowHealth = nil
                 Runtime.EffectiveRecoveryHealth = nil
-                setStatus("Character changed during setup; waiting for respawn")
             end
 
-            return
-        end
-
-        Runtime.LocalDead = false
-        readLocalInCombat()
-        startPvPEnable()
-        handleHealthChanged(humanoid.Health, characterEpoch)
-
-        if not Runtime.SafeMode then
-            Runtime.Mode = Runtime.HopPending and "HOP_WAIT" or "SCAN"
-            setStatus(Runtime.HopPending and "Character ready; resuming server hop" or "Character ready; scanning")
+            if Runtime.Status ~= "Waiting for character parts/health; retrying" then
+                setStatus("Waiting for character parts/health; retrying")
+            end
+            task.wait(0.1)
         end
     end)
 end
@@ -8671,7 +8615,7 @@ if not SavedAccountCheck.StillCurrent() then
     return
 end
 
-createGUI()
+if not createGUI() then return end
 PublicHop.Initialize()
 ServerTimeout.Initialize()
 SavedBounty.StartWorker()
