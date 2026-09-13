@@ -52,6 +52,11 @@
 -- False/omitted retains the existing cooldown-based blade fallback; custom combo steps keep their timing.
 -- HitboxOffset defaults to Vector3.new(0, 0, 0), relative to the target's CFrame:
 -- +X right, +Y up, -Z front, +Z behind. Positions stay inside the hitbox and above sea level.
+-- Settings.SkillOffset = {Enabled=true, MoveTimeout=1, Weapons={
+--     ["Godhuman"]={Z=Vector3.new(0, 0, 0)},
+-- }} overrides HitboxOffset for matching equipped Tool names and skill keys.
+-- Tween/CFrame positioning completes within 0.5 studs before key-down; timeout skips the skill.
+-- Orbit pauses until key release, then the normal HitboxOffset/orbit resumes. Omitted/false is disabled.
 -- Empty-target hop: rise continuously at TweenSpeed with fixed X/Z until the server hop.
 -- SafeModeY does not cap this ascent; each update puts the goal above the current height.
 -- Once ascent starts, new targets cannot cancel the hop; the commitment survives recovery/respawn.
@@ -886,6 +891,7 @@ local Runtime = {
     TargetRecoveryState = nil,
     WinEntranceAttempt = nil,
     CurrentTool = nil,
+    SkillOffsetState = nil,
     TargetEpoch = 0,
     CharacterEpoch = 0,
     SafeEpoch = 0,
@@ -1968,6 +1974,9 @@ end
 
 local function releaseAllKeys()
     Runtime.ReleaseGunClick()
+    if Runtime.ClearSkillOffset then
+        Runtime.ClearSkillOffset()
+    end
 
     for keyName, keyCode in pairs(Runtime.PressedKeys) do
         pcall(function()
@@ -4624,6 +4633,117 @@ local function getHitboxMovementCFrame(localRoot, targetRoot, requestedPosition)
     return CFrame.new(position) * localRoot.CFrame.Rotation
 end
 
+function Runtime.ClearSkillOffset(state)
+    local current = Runtime.SkillOffsetState
+    if not current or (state and state ~= current) then
+        return
+    end
+    Runtime.SkillOffsetState = nil
+    if current.Tween and Runtime.ActiveTween == current.Tween then
+        current.Tween:Cancel()
+        Runtime.ActiveTween = nil
+    end
+    Runtime.ChaseMovementMode = nil
+    Runtime.ChaseTweenTimeMultiplier = nil
+end
+
+function Runtime.IsSkillOffsetCurrent(state)
+    local config = Settings.SkillOffset
+    local weapons = type(config) == "table" and config.Weapons
+    local skills = type(weapons) == "table" and weapons[state.ToolName]
+    return Runtime.SkillOffsetState == state
+        and type(config) == "table" and config.Enabled == true
+        and config == state.Config and type(skills) == "table"
+        and skills[state.Key] == state.Offset
+        and Runtime.CharacterEpoch == state.CharacterEpoch
+        and Runtime.Character == state.Character and Runtime.Root == state.Root
+        and Runtime.CurrentTarget == state.Player
+        and Runtime.CurrentTargetInfo ~= nil
+        and Runtime.CurrentTargetInfo.Character == state.TargetCharacter
+        and Runtime.CurrentTargetInfo.Root == state.TargetRoot
+        and Runtime.CurrentTool == state.Tool and state.Tool.Parent == state.Character
+        and state.Tool.Name == state.ToolName
+        and canAttack(state.TargetEpoch, state.AttackMode, true)
+        and (not state.StillValid or state.StillValid())
+end
+
+function Runtime.UpdateSkillOffset(deltaTime)
+    local state = Runtime.SkillOffsetState
+    if not state then
+        return false
+    end
+    if not Runtime.IsSkillOffsetCurrent(state) then
+        Runtime.ClearSkillOffset(state)
+        return false
+    end
+
+    local goal = getHitboxMovementCFrame(state.Root, state.TargetRoot,
+        state.TargetRoot.CFrame:PointToWorldSpace(state.Offset))
+    local multiplier, insideTweenHitbox = getTargetTweenTimeMultiplier(state.Root, state.TargetRoot)
+    local useCFrame = insideTweenHitbox and INTERNAL.TweenHitboxMode == "CFrame"
+    Runtime.MoveToTargetGoal(goal, deltaTime, true, multiplier, useCFrame)
+    state.Tween = not useCFrame and Runtime.ActiveTween or nil
+    return true
+end
+
+function Runtime.PrepareSkillOffset(tool, key, targetEpoch, characterEpoch, attackMode, stillValid)
+    local config = Settings.SkillOffset
+    local weapons = type(config) == "table" and config.Weapons
+    local skills = type(weapons) == "table" and tool and weapons[tool.Name]
+    local offset = type(skills) == "table" and skills[key]
+    if type(config) ~= "table" or config.Enabled ~= true or offset == nil or offset == false then
+        return true, nil
+    end
+    if not isFiniteVector3(offset) then
+        warnOnce("skill-offset:" .. tool.Name .. ":" .. key,
+            "SkillOffset for " .. tool.Name .. " " .. key .. " must be a finite Vector3; using HitboxOffset.")
+        return true, nil
+    end
+    if not canAttack(targetEpoch, attackMode) or Runtime.CharacterEpoch ~= characterEpoch
+        or tool ~= Runtime.CurrentTool or tool.Parent ~= Runtime.Character
+        or (stillValid and not stillValid()) then
+        return false, nil
+    end
+
+    Runtime.ClearSkillOffset()
+    local info = Runtime.CurrentTargetInfo
+    local state = {
+        Config = config, Offset = offset, Key = key, Tool = tool, ToolName = tool.Name,
+        Player = Runtime.CurrentTarget, TargetRoot = info.Root, TargetCharacter = info.Character,
+        Root = Runtime.Root, Character = Runtime.Character,
+        TargetEpoch = targetEpoch, CharacterEpoch = characterEpoch,
+        AttackMode = attackMode, StillValid = stillValid,
+    }
+    Runtime.SkillOffsetState = state
+    local timeout = tonumber(config.MoveTimeout)
+    if not isFiniteNumber(timeout) or timeout < 0 then timeout = 1 end
+    local deadline = os.clock() + timeout
+
+    -- The existing movement Heartbeat keeps this goal current while this worker waits.
+    -- No additional movement connection or per-frame task is created.
+    local ok, reached = pcall(function()
+        if not Runtime.UpdateSkillOffset(0) then return false end
+        while Runtime.IsSkillOffsetCurrent(state) do
+            local goal = getHitboxMovementCFrame(state.Root, state.TargetRoot,
+                state.TargetRoot.CFrame:PointToWorldSpace(state.Offset))
+            if (state.Root.Position - goal.Position).Magnitude <= 0.5 then
+                return true
+            end
+            if os.clock() >= deadline then return false end
+            RunService.Heartbeat:Wait()
+        end
+        return false
+    end)
+    if not ok or not reached then
+        Runtime.ClearSkillOffset(state)
+        if not ok then
+            warnOnce("skill-offset:prepare", "Could not prepare skill offset: " .. tostring(reached))
+        end
+        return false, nil
+    end
+    return true, state
+end
+
 local function enforceLocalYFloor()
     local character = Runtime.Character
     local root = Runtime.Root
@@ -5175,12 +5295,28 @@ local function equipTool(tool, targetEpoch, attackMode)
     return false
 end
 
-local function castSkill(keyName, skillConfig, targetEpoch, attackMode, holdOverride)
+local function castSkill(keyName, skillConfig, targetEpoch, attackMode, holdOverride, beforePress, stillValid)
+    local tool = Runtime.CurrentTool
+    local characterEpoch = Runtime.CharacterEpoch
     if not canAttack(targetEpoch, attackMode)
-        or not isWeaponSkillAllowed(Runtime.CurrentTool, keyName) then
+        or not isWeaponSkillAllowed(tool, keyName)
+        or (stillValid and not stillValid()) then
         Runtime.AttackBusy = false
         Runtime.AimActive = false
         Runtime.GunAimActive = false
+        return false
+    end
+
+    local prepared, offsetState = Runtime.PrepareSkillOffset(
+        tool, keyName, targetEpoch, characterEpoch, attackMode, stillValid)
+    if not prepared then return false end
+    if not canAttack(targetEpoch, attackMode) or Runtime.CharacterEpoch ~= characterEpoch
+        or Runtime.CurrentTool ~= tool or not tool or tool.Parent ~= Runtime.Character
+        or not isWeaponSkillAllowed(tool, keyName)
+        or (stillValid and not stillValid())
+        or (offsetState and not Runtime.IsSkillOffsetCurrent(offsetState))
+        or (beforePress and not beforePress(offsetState)) then
+        if offsetState then Runtime.ClearSkillOffset(offsetState) end
         return false
     end
 
@@ -5204,6 +5340,7 @@ local function castSkill(keyName, skillConfig, targetEpoch, attackMode, holdOver
     end
 
     if not pressKeyDown(keyName) then
+        if offsetState then Runtime.ClearSkillOffset(offsetState) end
         Runtime.AttackBusy = false
         Runtime.AimActive = false
         Runtime.GunAimActive = false
@@ -5211,8 +5348,14 @@ local function castSkill(keyName, skillConfig, targetEpoch, attackMode, holdOver
     end
 
 
-    local waitOk, completed = pcall(waitWhileAttackable, holdTime, targetEpoch, attackMode)
+    local waitOk, completed = pcall(waitWhileAttackable, holdTime, targetEpoch, attackMode, function()
+        return Runtime.CharacterEpoch == characterEpoch and Runtime.CurrentTool == tool
+            and tool.Parent == Runtime.Character
+            and (not stillValid or stillValid())
+            and (not offsetState or Runtime.IsSkillOffsetCurrent(offsetState))
+    end)
     releaseKey(keyName)
+    if offsetState then Runtime.ClearSkillOffset(offsetState) end
     Runtime.AttackBusy = false
     Runtime.AimActive = false
     Runtime.GunAimActive = false
@@ -5371,10 +5514,25 @@ function CombatActions.EquipDefaultTool(entry, targetEpoch, characterEpoch)
     return true
 end
 
-function CombatActions.CastDefaultSkill(entry, targetEpoch, characterEpoch)
+function CombatActions.CastDefaultSkill(entry, targetEpoch, characterEpoch, stillValid)
     if Runtime.CharacterEpoch ~= characterEpoch or not canAttack(targetEpoch)
         or not CombatActions.DefaultEntryValid(entry)
-        or entry.Tool.Parent ~= Runtime.Character or Runtime.CurrentTool ~= entry.Tool then
+        or entry.Tool.Parent ~= Runtime.Character or Runtime.CurrentTool ~= entry.Tool
+        or (stillValid and not stillValid()) then
+        return false
+    end
+
+    local prepared, offsetState = Runtime.PrepareSkillOffset(
+        entry.Tool, entry.Key, targetEpoch, characterEpoch, nil, function()
+            return CombatActions.DefaultEntryValid(entry) and (not stillValid or stillValid())
+        end)
+    if not prepared then return false end
+    if Runtime.CharacterEpoch ~= characterEpoch or not canAttack(targetEpoch)
+        or not CombatActions.DefaultEntryValid(entry)
+        or entry.Tool.Parent ~= Runtime.Character or Runtime.CurrentTool ~= entry.Tool
+        or (stillValid and not stillValid())
+        or (offsetState and not Runtime.IsSkillOffsetCurrent(offsetState)) then
+        if offsetState then Runtime.ClearSkillOffset(offsetState) end
         return false
     end
 
@@ -5396,6 +5554,7 @@ function CombatActions.CastDefaultSkill(entry, targetEpoch, characterEpoch)
     end
 
     if not pressKeyDown(entry.Key) then
+        if offsetState then Runtime.ClearSkillOffset(offsetState) end
         Runtime.AttackBusy = false
         Runtime.AimActive = false
         return false
@@ -5412,9 +5571,12 @@ function CombatActions.CastDefaultSkill(entry, targetEpoch, characterEpoch)
                 and entry.Tool.Parent == Runtime.Character
                 and Runtime.CurrentTool == entry.Tool
                 and CombatActions.DefaultEntryValid(entry)
+                and (not stillValid or stillValid())
+                and (not offsetState or Runtime.IsSkillOffsetCurrent(offsetState))
         end)
     end)
     releaseKey(entry.Key)
+    if offsetState then Runtime.ClearSkillOffset(offsetState) end
     Runtime.AttackBusy = false
     Runtime.AimActive = false
     Runtime.GunAimActive = false
@@ -6384,7 +6546,10 @@ local function startWeaponWorker()
 
                                 if customCombo == CombatActions.GetActiveComboConfig() and selectedCombo() == nil then
                                     if readyForSkill then
-                                        castCompleted = CombatActions.CastDefaultSkill(entry, targetEpoch, comboCharacterEpoch)
+                                        castCompleted = CombatActions.CastDefaultSkill(entry, targetEpoch, comboCharacterEpoch, function()
+                                            return customCombo == CombatActions.GetActiveComboConfig()
+                                                and selectedCombo() == nil
+                                        end)
                                     end
                                 else
                                     comboEntries = nil
@@ -6418,8 +6583,20 @@ local function startWeaponWorker()
 
                             CombatActions.UpdateComboGUI(entry.ComboConfig,
                                 followupCombo and "Default skills (follow-up)" or nil)
-                            CombatActions.MarkAttempt(entry)
-                            castCompleted = castSkill(entry.Key, entry.Config, targetEpoch, attackMode, entry.HoldOverride)
+                            castCompleted = castSkill(entry.Key, entry.Config, targetEpoch, attackMode, entry.HoldOverride,
+                                function(offsetState)
+                                    -- Only positioning can add a wait after the worker's cooldown check.
+                                    if offsetState and not CombatActions.CanAttempt(entry) then return false end
+                                    CombatActions.MarkAttempt(entry)
+                                    return true
+                                end,
+                                function()
+                                    return Runtime.CharacterEpoch == comboCharacterEpoch
+                                        and entry.Tool == Runtime.CurrentTool
+                                        and customCombo == CombatActions.GetActiveComboConfig()
+                                        and entry.ComboConfig == selectedCombo()
+                                        and CombatActions.CustomEntryValid(entry)
+                                end)
 
                             if castCompleted then
                                 local delay = getComboNumberSetting("ComboDelay", 0.03)
@@ -7180,6 +7357,11 @@ local function startMovementWorker()
         local chaseMovementMode = useCFrame and "CFrame" or "Tween"
         if useCFrame then
             chaseTimeMultiplier = 1
+        end
+
+        if Runtime.SkillOffsetState and Runtime.UpdateSkillOffset(deltaTime) then
+            faceRootTowardTarget(localRoot, targetRoot)
+            return
         end
 
         if insideHitbox and OrbitEnabled then
