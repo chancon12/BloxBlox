@@ -369,6 +369,7 @@ Combo = {
         RaceV3 = true,
         RaceV4 = true,
         OrbitEnabled = false,
+        OrbitResumeDelay = 0.5,
         HitboxOffset = Vector3.new(0, 10, -10), -- 5 studs above, 6 behind
         SafeZoneRadius = 500,
         SeaHeightFirst = false,
