@@ -266,18 +266,6 @@ Combo = {
     },
 },
 
-    SkillOffset = {
-    Enabled = true,
-    MoveTimeout = 0.1, -- Maximum seconds to reach the offset
-
-    Weapons = {
-        ["Godhuman"] = {
-            Z = Vector3.new(0, 0, 0),
-            X = Vector3.new(0, 0, 10),
-        },
-    },
-},
-
     Weapon = {
 
         Moveset = {
@@ -352,6 +340,17 @@ Combo = {
     },
 
     Settings = {
+        SkillOffset = {
+            Enabled = true,
+            MoveTimeout = 0.1, -- Maximum seconds to reach the offset
+            Weapons = {
+                ["Godhuman"] = {
+                    Z = Vector3.new(0, 0, 0),
+                    X = Vector3.new(0, 0, 10),
+                },
+            },
+        },
+
         ClickAttack = true,
         ClickAttackMinTargetHealth = 5000,
         BladeBeforeDefaultSkill = true,
