@@ -324,7 +324,7 @@ Combo = {
         },
 
         ClickAttack = true,
-        ClickAttackMinTargetHealth = 5000,
+        ClickAttackMinTargetHealth = 0,
         BladeBeforeDefaultSkill = true,
         Attack = true, -- master switch for automatic weapon switching and skill casting
         FastTP = true,
