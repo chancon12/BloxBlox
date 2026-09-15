@@ -1,8 +1,404 @@
+-- Complete AutoBounty menu script with the supplied config embedded below.
+-- No external module download is needed. Both menu controls start OFF.
+-- Edit this config for weapons, combos, movement, and other settings.
+do
+local Environment = getgenv and getgenv() or _G
+-- Supersede older loader runs before the menu retires their runtime.
+Environment.__AutoBountyLoaderToken = {}
+Environment.AutoBountyConfig = {
+    Team = "Pirates", -- "Pirates" or "Marines"
 
--- Menu version of the complete AutoBounty module. Load with your existing AutoBountyConfig.
--- Both controls start OFF on every load. Auto server hop is armed only while a hunt runs.
--- Stopping a hunt cancels its movement, input, searches, and startup waits; the menu stays available.
--- Selecting a different team restarts an active hunt with the selected team.
+Combo = {
+    Enabled = true,
+    Profiles = {
+        {
+            Name = "Blizzard + Cursed Dual Katana",
+            Enabled = true,
+            RequiredWeapons = {"Blizzard-Blizzard", "Cursed Dual Katana", "Godhuman"},
+            Steps = {
+                {Weapon = "Blizzard-Blizzard", Key = "V", Hold = 0.1},
+                {Weapon = "Blizzard-Blizzard", Key = "C", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+            },
+        },
+        {
+            Name = "Blizzard + Shark Anchor",
+            Enabled = true,
+            RequiredWeapons = {"Blizzard-Blizzard", "Shark Anchor", "Godhuman"},
+            Steps = {
+                {Weapon = "Blizzard-Blizzard", Key = "V", Hold = 0.1},
+                {Weapon = "Blizzard-Blizzard", Key = "C", Hold = 0.1},
+                {Weapon = "Shark Anchor", Key = "X", Hold = 0.1},
+                {Weapon = "Shark Anchor", Key = "Z", Hold = 0.5},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+            },
+        },
+        {
+            Name = "Magma + Cursed Dual Katana + Godhuman",
+            Enabled = true,
+            RequiredWeapons = {"Magma-Magma", "Cursed Dual Katana", "Godhuman"},
+            Steps = {
+                {Weapon = "Magma-Magma", Key = "Z", Hold = 3},
+                {Weapon = "Magma-Magma", Key = "V", Hold = 0.1},
+                {Weapon = "Magma-Magma", Key = "C", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.5},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+            },
+        },
+        {
+            Name = "Ice + Skull Guitar + Cursed Dual Katana + Godhuman",
+            Enabled = true,
+            RequiredWeapons = {"Ice-Ice", "Skull Guitar", "Cursed Dual Katana", "Godhuman"},
+            Steps = {
+                {Weapon = "Ice-Ice", Key = "V", Hold = 0.1},
+                {Weapon = "Ice-Ice", Key = "C", Hold = 0.1},
+                {Weapon = "Skull Guitar", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.5},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.5},
+            },
+        },
+        {
+            Name = "Dough + Skull Guitar + Shark Anchor + Godhuman",
+            Enabled = true,
+            RequiredWeapons = {"Dough-Dough", "Skull Guitar", "Shark Anchor", "Godhuman"},
+            Steps = {
+                {Weapon = "Skull Guitar", Key = "X", Hold = 0.1},
+                {Weapon = "Dough-Dough", Key = "V", Hold = 0.1},
+                {Weapon = "Dough-Dough", Key = "X", Hold = 0.1},
+                {Weapon = "Shark Anchor", Key = "Z", Hold = 0.1},
+                {Weapon = "Shark Anchor", Key = "X", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.5},
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+                {Weapon = "Dough-Dough", Key = "C", Hold = 0.1},
+            },
+        },
+        {
+            Name = "T-Rex + Skull Guitar + Cursed Dual Katana + Godhuman",
+            Enabled = true,
+            RequiredWeapons = {"T-Rex-T-Rex", "Skull Guitar", "Cursed Dual Katana", "Godhuman"},
+            Steps = {
+                {Weapon = "Skull Guitar", Key = "X", Hold = 0.1},
+                {Weapon = "T-Rex-T-Rex", Key = "C", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.5},
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
+                {Weapon = "T-Rex-T-Rex", Key = "X", Hold = 0.1},
+            },
+        },
+        {
+            Name = "Kitsune + Skull Guitar + Cursed Dual Katana + Godhuman",
+            Enabled = true,
+            RequiredWeapons = {"Kitsune-Kitsune", "Skull Guitar", "Cursed Dual Katana", "Godhuman"},
+            Steps = {
+                {Weapon = "Skull Guitar", Key = "X", Hold = 0.1},
+                {Weapon = "Kitsune-Kitsune", Key = "C", Hold = 0.1},
+                {Weapon = "Kitsune-Kitsune", Key = "X", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.5},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.5},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Kitsune-Kitsune", Key = "Z", Hold = 0.1},
+            },
+        },
+        {
+            Name = "Yeti + Skull Guitar + Shark Anchor + Godhuman",
+            Enabled = true,
+            RequiredWeapons = {"Yeti-Yeti", "Skull Guitar", "Shark Anchor", "Godhuman"},
+            Steps = {
+                {Weapon = "Skull Guitar", Key = "X", Hold = 0.1},
+                {Weapon = "Shark Anchor", Key = "Z", Hold = 0.5},
+                {Weapon = "Shark Anchor", Key = "X", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.5},
+                {Weapon = "Yeti-Yeti", Key = "F", Hold = 0.1},
+                {Weapon = "Yeti-Yeti", Key = "X", Hold = 0.1},
+                {Weapon = "Yeti-Yeti", Key = "C", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+            },
+        },
+        {
+            Name = "Gravity Blade + Sanguine Art + Ice",
+            Enabled = true,
+            RequiredWeapons = {"Gravity Blade", "Sanguine Art", "Ice-Ice"},
+            Steps = {
+                {Weapon = "Gravity Blade", Key = "Z", Hold = 0.1},
+                {Weapon = "Sanguine Art", Key = "Z", Hold = 0.1},
+                {Weapon = "Ice-Ice", Key = "C", Hold = 0.1},
+                {Weapon = "Ice-Ice", Key = "Z", Hold = 0.1},
+                {Weapon = "Sanguine Art", Key = "X", Hold = 0.1},
+                {Weapon = "Ice-Ice", Key = "V", Hold = 0.1},
+                {Weapon = "Sanguine Art", Key = "C", Hold = 0.1},
+            },
+        },
+        {
+            Name = "Godhuman + Cursed Dual Katana + Yeti",
+            Enabled = true,
+            RequiredWeapons = {"Godhuman", "Cursed Dual Katana", "Yeti-Yeti"},
+            Steps = {
+                {Weapon = "Godhuman", Key = "C", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.1},
+                {Weapon = "Yeti-Yeti", Key = "F", Hold = 0.1},
+                {Weapon = "Yeti-Yeti", Key = "X", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Yeti-Yeti", Key = "Z", Hold = 0.1},
+                {Weapon = "Yeti-Yeti", Key = "C", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+            },
+        },
+        {
+            Name = "Godhuman + Dough + Cursed Dual Katana + Kabucha",
+            Enabled = true,
+            RequiredWeapons = {"Godhuman", "Dough-Dough", "Cursed Dual Katana", "Kabucha"},
+            Steps = {
+                {Weapon = "Godhuman", Key = "C", Hold = 0.5},
+                {Weapon = "Dough-Dough", Key = "X", Hold = 0.1}, -- Air version depends on character state
+                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 1.0}, -- Adjustable hold
+                {Weapon = "Kabucha", Key = "X", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
+                {Weapon = "Dough-Dough", Key = "V", Hold = 0.1},
+                {Weapon = "Dough-Dough", Key = "X", Hold = 0.1}, -- Ground version depends on character state
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.1},
+            },
+        },
+        {
+            Name = "Dragon + Dragonstorm + Dragonheart + Dragon Talon",
+            Enabled = true,
+            RequiredWeapons = {"Dragon-Dragon", "Dragonstorm", "Dragonheart", "Dragon Talon"},
+            Steps = {
+                {Weapon = "Dragon-Dragon", Key = "C", Hold = 0.5},
+                {Weapon = "Dragon-Dragon", Key = "X", Hold = 0.1},
+                {Weapon = "Dragonstorm", Key = "Z", Hold = 0.1}, -- Air version depends on character state
+                {Weapon = "Dragonstorm", Key = "X", Hold = 0.1},
+                {Weapon = "Dragonheart", Key = "Z", Hold = 0.5},
+                {Weapon = "Dragon Talon", Key = "Z", Hold = 0.1},
+                {Weapon = "Dragon Talon", Key = "X", Hold = 0.1},
+                {Weapon = "Dragonheart", Key = "X", Hold = 0.5}, -- Adjustable hold, not a verified maximum
+                {Weapon = "Dragon-Dragon", Key = "Z", Hold = 0.1},
+            },
+        },
+        {
+            Name = "Dark + Venom Bow + Dark Blade + Godhuman",
+            Enabled = true,
+            RequiredWeapons = {"Dark-Dark", "Venom Bow", "Dark Blade", "Godhuman"},
+            Steps = {
+                {Weapon = "Dark-Dark", Key = "C", Hold = 0.1},
+                {Weapon = "Venom Bow", Key = "Z", Hold = 0.1},
+                {Weapon = "Venom Bow", Key = "X", Hold = 0.1},
+                {Weapon = "Dark Blade", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.1},
+                {Weapon = "Dark Blade", Key = "X", Hold = 0.1},
+                {Weapon = "Dark-Dark", Key = "X", Hold = 0.1},
+            },
+        },
+        {
+            Name = "Lightning + Shark Anchor + Godhuman",
+            Enabled = true,
+            RequiredWeapons = {"Lightning-Lightning", "Shark Anchor", "Godhuman"},
+            Steps = {
+                {Weapon = "Lightning-Lightning", Key = "X", Hold = 0.1},
+                {Weapon = "Shark Anchor", Key = "X", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Shark Anchor", Key = "Z", Hold = 0.5},
+                {Weapon = "Lightning-Lightning", Key = "V", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.1},
+            },
+        },
+        {
+            Name = "Skull Guitar + Portal + Cursed Dual Katana + Godhuman",
+            Enabled = true,
+            RequiredWeapons = {"Skull Guitar", "Portal-Portal", "Cursed Dual Katana", "Godhuman"},
+            Steps = {
+                {Weapon = "Skull Guitar", Key = "X", Hold = 0.1},
+                {Weapon = "Portal-Portal", Key = "X", Hold = 0.1},
+                {Weapon = "Portal-Portal", Key = "Z", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "Z", Hold = 0.1},
+                {Weapon = "Cursed Dual Katana", Key = "X", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "Z", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "X", Hold = 0.1},
+                {Weapon = "Godhuman", Key = "C", Hold = 0.1},
+            },
+        },
+    },
+},
+
+    Weapon = {
+
+        Moveset = {
+    ["Yeti-Yeti"] = {
+        V = false, -- skip Yeti's V
+        },
+    ["T-Rex-T-Rex"] = {
+        V = false, -- skip Yeti's V
+        },
+    ["Kitsune-Kitsune"] = {
+        V = false, -- skip Yeti's V
+        },
+    ["Portal-Portal"] = {
+        C = false, -- skip Yeti's V
+        V = false, -- skip Yeti's V
+        },
+    },
+
+        Order = {"Melee", "Blox Fruit", "Sword", "Gun"},
+
+        Melee = {
+            Enabled = true,
+            Name = "Auto", -- Exact tool name, or Auto to match ToolTip == "Melee"
+            Delay = 0.10,
+            Skills = {
+                Z = {Enabled = true, Hold = 0},
+                X = {Enabled = true, Hold = 0},
+                C = {Enabled = true, Hold = 0},
+                V = {Enabled = false, Hold = 0},
+                F = {Enabled = false, Hold = 0},
+            },
+        },
+
+        ["Blox Fruit"] = {
+            Enabled = true,
+            Name = "Auto", -- Exact fruit tool name, or Auto for ToolTip == "Blox Fruit"
+            Delay = 0.10,
+            Skills = {
+                Z = {Enabled = true, Hold = 0},
+                X = {Enabled = true, Hold = 0},
+                C = {Enabled = true, Hold = 0},
+                V = {Enabled = true, Hold = 0},
+                F = {Enabled = false, Hold = 0},
+            },
+        },
+
+        Sword = {
+            Enabled = true,
+            Name = "Auto", -- Example exact name: "Cursed Dual Katana"
+            Delay = 0.10,
+            Skills = {
+                Z = {Enabled = true, Hold = 0},
+                X = {Enabled = true, Hold = 0},
+                C = {Enabled = false, Hold = 0},
+                V = {Enabled = false, Hold = 0},
+                F = {Enabled = false, Hold = 0},
+            },
+        },
+
+        Gun = {
+            Enabled = true,
+            Name = "Auto", -- Example exact name: "Skull Guitar"
+            Delay = 0.10,
+            Skills = {
+                Z = {Enabled = true, Hold = 0},
+                X = {Enabled = true, Hold = 0},
+                C = {Enabled = false, Hold = 0},
+                V = {Enabled = false, Hold = 0},
+                F = {Enabled = false, Hold = 0},
+            },
+        },
+    },
+
+    Settings = {
+        SkillOffset = {
+            Enabled = true,
+            MoveTimeout = 0.1, -- Maximum seconds to reach the offset
+        
+            Weapons = {
+                ["Godhuman"] = {
+                    Z = Vector3.new(0, 0, 0),
+                    X = Vector3.new(0, 0, 10),
+                },
+            },
+        },
+
+        ClickAttack = true,
+        ClickAttackMinTargetHealth = 5000,
+        BladeBeforeDefaultSkill = true,
+        Attack = true, -- master switch for automatic weapon switching and skill casting
+        FastTP = true,
+        ESPPlayer = false,
+        AutoHop = false, -- The menu controls this independently; starts OFF.
+        NoClip = true, -- disables collision for every Character BasePart and adds BodyClip while moving
+        PlayerFollowTime = 120, -- Switch after 120 seconds without combat
+        NoDamageTimeout = 30,  -- Switch if no health drops within 30 seconds of entering hitbox
+        SkipPreviousTargets = false,
+        SafeModeY = 3000, -- absolute world Y used by the low-health SafeMode tween
+        LowHealth = 10000,
+        MaxHealth = 12000,
+        RaceV3 = true,
+        RaceV4 = true,
+        OrbitEnabled = true,
+        OrbitResumeDelay = 0.5,
+        HitboxOffset = Vector3.new(0, 10, -10), -- 5 studs above, 6 behind
+        SafeZoneRadius = 500,
+        SeaHeightFirst = false,
+        ComboDelay = 0, -- No extra delay between skills
+        ComboHold = 0, -- Release each key after the minimum input wait
+        GunOpenerEnabled = false,
+        MaxTargetDistance = 10000,
+        SafeModeType = "Above",
+        FPSBoost = true, -- true = enabled, false = disabled
+        FPSBoostLive = true,
+        -- true hides ALL meshes, including map and character meshes.
+        FPSBoostHideMeshes = false,
+        -- Hide effect parts under folders/models with these names.
+        FPSBoostEffectFolders = {""},
+
+        Region = "", -- "" = any region
+        ServerHopMode = "Random",
+        DefaultSkillPressTime = 0,
+        SafeModeTweenSpeed = 300,
+        SafeModeInitialLift = {
+        Enabled = true,
+        Height = 500,
+        },
+
+        Hitbox = {
+            Enabled = true,
+            Size = Vector3.new(50, 50, 50),
+            Transparency = 0.5, -- 0 = visible, 1 = invisible
+        },
+
+        TweenHitbox = {
+        Enabled = true,
+        Mode = "CFrame", -- "CFrame" or "CFrame"
+        Size = Vector3.new(200, 200, 200),
+        TimeMultiplier = 0.9,
+        },
+
+        Aimbot = {
+        Gun = true,    -- Aim basic gun shots
+        Skills = true, -- Aim combo skills
+        },
+
+        TargetWeaponFilter = {
+        Enabled = true,
+        Ignore = {
+        "Portal-Portal",
+        -- Add more weapon names here.
+        },
+      },
+    },
+}
+end
+
+-- Menu controls for the complete AutoBounty script; the config is embedded above.
+-- Both controls start OFF on every load and operate independently.
+-- Server hop ON keeps automatic hop checks running even with bounty hunting OFF.
+-- Stopping a hunt releases its movement and input; a hop-only session continues if hopping is ON.
+-- Selecting a different team restarts whichever systems are enabled with the selected team.
 local MenuEnvironment = getgenv and getgenv() or _G
 local MenuPlayers = game:GetService("Players")
 local MenuReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -49,7 +445,6 @@ function Menu:StopSession()
     local session = self.Session
     self.Session = nil
     self.Runtime = nil
-    self.HuntEnabled = false
     if not session then return end
     session.Cancelled = true
     if session.Runtime then
@@ -67,21 +462,31 @@ function Menu:StopSession()
     end
 end
 
-function Menu:SetHuntEnabled(enabled)
+function Menu:SyncSession()
     if not self:IsCurrent() then return false end
-    enabled = enabled == true
-    if not enabled then
+    if not self.HuntEnabled and not self.AutoHopEnabled then
         self:StopSession()
-        self.Status = "Bounty hunt stopped."
+        self.Status = "Bounty hunt and server hop are off."
         self:Refresh()
         return true
     end
-    if self.HuntEnabled then return true end
+    local current = self.Session
+    if current and not current.Cancelled and current.HuntEnabled == self.HuntEnabled then
+        current.HopEnabled = self.AutoHopEnabled
+        if current.Ready and current.Runtime then
+            current.Runtime:SetAutoHopEnabled(self.AutoHopEnabled)
+        end
+        self:Refresh()
+        return true
+    end
+    self:StopSession()
 
     self.TeamEpoch = self.TeamEpoch + 1
     self.TeamBusy = false
     local source = MenuEnvironment.AutoBountyConfig
     if type(source) ~= "table" then
+        self.HuntEnabled = false
+        self.AutoHopEnabled = false
         self.Status = "AutoBountyConfig is missing. Set your config and try again."
         self:Refresh()
         return false
@@ -95,10 +500,14 @@ function Menu:SetHuntEnabled(enabled)
     config.Settings = settings
     -- Startup remains hop-free until the newest menu choice is applied after initialization.
     settings.AutoHop = false
-    local session = {Owner = self, Config = config, HopEnabled = self.AutoHopEnabled, Cancelled = false}
+    if not self.HuntEnabled then
+        settings.Attack = false
+        settings.FPSBoost = false
+    end
+    local session = {Owner = self, Config = config, HuntEnabled = self.HuntEnabled,
+        HopEnabled = self.AutoHopEnabled, Cancelled = false}
     self.Session = session
-    self.HuntEnabled = true
-    self.Status = "Starting bounty hunt..."
+    self.Status = self.HuntEnabled and "Starting bounty hunt..." or "Starting server hop checks..."
     self:Refresh()
 
     task.spawn(function()
@@ -111,6 +520,8 @@ function Menu:SetHuntEnabled(enabled)
         end
         if not ok or type(result) ~= "table" or not result.Running then
             self:StopSession()
+            self.HuntEnabled = false
+            self.AutoHopEnabled = false
             self.Status = ok and "Startup stopped. Press Start to retry."
                 or ("Start failed: " .. tostring(result))
             if not ok then warn("[AutoBounty Menu] " .. tostring(result)) end
@@ -118,36 +529,31 @@ function Menu:SetHuntEnabled(enabled)
             return
         end
         self.Runtime = result
-        self.Status = "Bounty hunt running."
+        self.Status = self.HuntEnabled and "Bounty hunt running."
+            or "Server hop on. Bounty hunting is off."
         self:Refresh()
     end)
     return true
 end
 
+function Menu:SetHuntEnabled(enabled)
+    if not self:IsCurrent() then return false end
+    self.HuntEnabled = enabled == true
+    return self:SyncSession()
+end
+
 function Menu:SetAutoHopEnabled(enabled)
     if not self:IsCurrent() then return false end
     self.AutoHopEnabled = enabled == true
-    local session = self.Session
-    if session then
-        session.HopEnabled = self.AutoHopEnabled
-        if session.Ready and session.Runtime then
-            session.Runtime:SetAutoHopEnabled(self.AutoHopEnabled)
-        end
-    end
-    if not self.HuntEnabled then
-        self.Status = self.AutoHopEnabled and "Server hop enabled for your next hunt."
-            or "Server hop off. Bounty hunt is stopped."
-    end
-    self:Refresh()
-    return true
+    return self:SyncSession()
 end
 
 function Menu:SelectTeam(team)
     if not self:IsCurrent() or (team ~= "Pirates" and team ~= "Marines") then return false end
     self.SelectedTeam = team
-    if self.HuntEnabled then
+    if self.HuntEnabled or self.AutoHopEnabled then
         self:StopSession()
-        return self:SetHuntEnabled(true)
+        return self:SyncSession()
     end
 
     self.TeamEpoch = self.TeamEpoch + 1
@@ -159,7 +565,8 @@ function Menu:SelectTeam(team)
         local deadline, retryAt, confirmed = os.clock() + 30, 0, false
         local lastRequest
         local function current()
-            return self:IsCurrent() and self.TeamEpoch == epoch and not self.HuntEnabled
+            return self:IsCurrent() and self.TeamEpoch == epoch
+                and not self.HuntEnabled and not self.AutoHopEnabled
         end
         while current() and os.clock() < deadline do
             if lastRequest and lastRequest.FinishedAt then
@@ -202,6 +609,8 @@ end
 function Menu:Stop(reason)
     if not self.Active then return end
     self:StopSession()
+    self.HuntEnabled = false
+    self.AutoHopEnabled = false
     self.Active = false
     self.Running = false
     self.TeamEpoch = self.TeamEpoch + 1
@@ -971,7 +1380,7 @@ while bootstrapStillCurrent() and not StartupLoad.EnsureTeam() do
 end
 if not bootstrapStillCurrent() then return end
 
-MenuSession.Owner:SetSessionStatus(MenuSession, "Preparing graphics...")
+MenuSession.Owner:SetSessionStatus(MenuSession, MenuSession.HuntEnabled and "Preparing graphics..." or "Preparing server hop checks...")
 
 -- The startup delay is measured from the start of the FPS boost, not its completion.
 local StartupFPSBoost = {
@@ -2084,7 +2493,7 @@ local function updateTargetGUI()
     end
 end
 
-local WinEntrance = {Enabled = Settings.WinEntrance ~= false}
+local WinEntrance = {Enabled = MenuSession.HuntEnabled and Settings.WinEntrance ~= false}
 
 local function startBountyValueBinder()
     task.spawn(function()
@@ -3465,6 +3874,7 @@ local function releaseIgnoredTarget(weapon)
 end
 
 local function ensureCombatAttributes()
+    if not MenuSession.HuntEnabled then return end
     setRequiredLocalAttribute("KenActive")
     setRequiredLocalAttribute("BusoEnabled")
 
@@ -3488,6 +3898,7 @@ local function ensureCombatAttributes()
 end
 
 local function startPvPEnable()
+    if not MenuSession.HuntEnabled then return end
     if Runtime.PvPWorkerRunning or not Runtime.Running or Runtime.LocalDead then
         return
     end
@@ -4048,6 +4459,7 @@ local function fastTeleportForTarget(targetInfo, targetEpoch, targetPlayer, entr
 end
 
 local function setTarget(player, targetInfo, resumeRecovery)
+    if not MenuSession.HuntEnabled then return false end
     if not Runtime.Running or Runtime.SafeMode or Runtime.LocalDead or Runtime.HopPending
         or Runtime.EmptyHopCommitted or Runtime.WinEntranceAttempt then
 
@@ -7291,6 +7703,14 @@ enterSafeMode = function()
         return
     end
 
+    if not MenuSession.HuntEnabled then
+        Runtime.SafeMode = true
+        Runtime.SafeEpoch = Runtime.SafeEpoch + 1
+        Runtime.Mode = "SAFE_MODE"
+        setStatus("Waiting for health recovery before server hop")
+        return
+    end
+
     Runtime.SafeMode = true
     Runtime.SafeEpoch = Runtime.SafeEpoch + 1
     Runtime.SafeModeAtAltitude = false
@@ -7321,6 +7741,14 @@ end
 
 exitSafeMode = function()
     if not Runtime.SafeMode or Runtime.LocalDead then
+        return
+    end
+    if not MenuSession.HuntEnabled then
+        Runtime.SafeMode = false
+        Runtime.SafeEpoch = Runtime.SafeEpoch + 1
+        if not Runtime.HopPending then Runtime.EmptySince = nil end
+        Runtime.Mode = Runtime.HopPending and "HOP_WAIT" or "SCAN"
+        setStatus("Recovered; server hop checks running")
         return
     end
 
@@ -7538,7 +7966,29 @@ local function bindCharacter(character)
     end)
 end
 
+-- Hop-only mode never binds the camera or runs target/skill/recovery movement.
+function Runtime.UpdateMenuHopMovement(deltaTime)
+    if not Runtime.Running or Runtime.LocalDead then
+        stopEmptyHopMovement()
+        return
+    end
+    local humanoid = Runtime.Humanoid
+    if not humanoid or not humanoid.Parent or humanoid.Health <= 0 then
+        handleLocalDeath(Runtime.CharacterEpoch)
+        return
+    end
+    handleHealthChanged(humanoid.Health, Runtime.CharacterEpoch)
+    if Runtime.HopPending and (Runtime.EmptyHopCommitted
+        or (not Runtime.SafeMode and isEmptyListHopReady())) then
+        updateEmptyHopMovement(deltaTime)
+    end
+end
+
 local function startMovementWorker()
+    if not MenuSession.HuntEnabled then
+        connect(RunService.Heartbeat, Runtime.UpdateMenuHopMovement)
+        return
+    end
     pcall(function()
         RunService:UnbindFromRenderStep(Runtime.CameraBindName)
     end)
@@ -9065,7 +9515,9 @@ local function startTargetWorker()
                     elseif Runtime.CurrentTarget then
                         -- The selected target owns movement/status, including recovery preparation.
                     elseif #candidates > 0 then
-                        if not Runtime.CurrentTarget then
+                        if not MenuSession.HuntEnabled then
+                            setStatus("Bounty hunting off; monitoring server hop conditions")
+                        elseif not Runtime.CurrentTarget then
                             setTarget(candidates[1], Runtime.CandidateInfo[candidates[1]])
                         end
                     elseif Runtime.PendingCandidateCount > 0 then
@@ -9179,12 +9631,15 @@ function Runtime:Stop(reason)
     end
     if MenuSession.Owner.Session == MenuSession and not MenuSession.Cancelled then
         MenuSession.Owner:StopSession()
-        MenuSession.Owner.Status = "Bounty hunt stopped."
+        MenuSession.Owner.HuntEnabled = false
+        MenuSession.Owner.AutoHopEnabled = false
+        MenuSession.Owner.Status = "Bounty hunt and server hop stopped."
         MenuSession.Owner:Refresh()
     end
 end
 
-MenuSession.Owner:SetSessionStatus(MenuSession, "Preparing bounty hunt...")
+MenuSession.Owner:SetSessionStatus(MenuSession, MenuSession.HuntEnabled
+    and "Preparing bounty hunt..." or "Preparing server hop checks...")
 SavedTargetFilter.Initialize()
 SavedAccountCheck.Initialize()
 if not SavedAccountCheck.StillCurrent() then
@@ -9197,9 +9652,9 @@ ServerTimeout.Initialize()
 SavedBounty.StartWorker()
 SavedTargetFilter.StartWorker()
 startBountyValueBinder()
-WinEntrance.StartWorker()
+if MenuSession.HuntEnabled then WinEntrance.StartWorker() end
 startSafeZoneBinder()
-installAimHook()
+if MenuSession.HuntEnabled then installAimHook() end
 do
     local savedAccount = SavedAccountCheck.FindPresent()
     if savedAccount then
@@ -9213,9 +9668,11 @@ do
 end
 startFriendWorker()
 startMovementWorker()
-startWeaponWorker()
-startRaceWorker()
-startESPWorker()
+if MenuSession.HuntEnabled then
+    startWeaponWorker()
+    startRaceWorker()
+    startESPWorker()
+end
 startTargetWorker()
 
 connect(LocalPlayer.CharacterAdded, function(character)
