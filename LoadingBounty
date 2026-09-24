@@ -1,5 +1,7 @@
 local MODULE_URL = "https://raw.githubusercontent.com/chancon12/BloxBlox/refs/heads/main/AutoBounty.lua"
 local Environment = getgenv()
+local SelectedTeam = type(Environment.AutoBountyConfig) == "table"
+    and Environment.AutoBountyConfig.Team or "Pirates"
 local LoaderToken = {}
 
 Environment.__AutoBountyLoaderToken = LoaderToken
@@ -35,7 +37,7 @@ assert(LocalPlayer, "[AutoBounty Loader] LocalPlayer is unavailable")
 
 
 Environment.AutoBountyConfig = {
-    Team = "Pirates", -- "Pirates" or "Marines"
+    Team = SelectedTeam, -- Set by the launcher; defaults to Pirates
 
 Combo = {
     Enabled = true,
