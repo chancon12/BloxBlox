@@ -44,6 +44,10 @@
 -- Settings.OrbitResumeDelay defaults to 0.5 seconds after the last skill release; 0 resumes immediately.
 -- Each new press keeps orbit paused, and its release restarts the delay.
 -- While paused, follow the target from the current side; configured SkillOffset takes priority.
+-- Settings.EngageChasePause = {Enabled=true, After=10, MinDuration=1, MaxDuration=2}
+-- Optional: after first entering ENGAGE, pause target-follow movement once for a random duration.
+-- Omitted/disabled preserves normal movement. Re-entering the hitbox or recovering against the
+-- same target does not rearm it; a new target selection does. Skills can still attack in range.
 -- ClickAttack defaults to true; normal attacks fill gaps when no enabled skill can be attempted.
 -- ClickAttack also pauses while the local player's health is below 20% of MaxHealth.
 -- Settings.ClickAttackMinTargetHealth = 3000 pauses all blade attacks below that target HP (raw Health).
@@ -405,7 +409,25 @@ local INTERNAL = {
     ServerBrowserPages = 100,
     FPSBoostWait = 5,
     ServerTimeout = 300,
+    EngageChasePause = {Enabled = false, After = 10, MinDuration = 1, MaxDuration = 2},
 }
+
+do
+    local configured = Settings.EngageChasePause
+    local pause = INTERNAL.EngageChasePause
+    if type(configured) == "table" then
+        pause.Enabled = configured.Enabled == true
+        for _, field in ipairs({"After", "MinDuration", "MaxDuration"}) do
+            local value = tonumber(configured[field])
+            if isFiniteNumber(value) and (field == "After" and value >= 0 or value > 0) then
+                pause[field] = value
+            end
+        end
+    end
+    if pause.MaxDuration < pause.MinDuration then
+        pause.MinDuration, pause.MaxDuration = pause.MaxDuration, pause.MinDuration
+    end
+end
 
 if INTERNAL.TweenHitboxMode ~= "Tween" and INTERNAL.TweenHitboxMode ~= "CFrame" then
     warn('[AutoBounty] Settings.TweenHitbox.Mode must be "Tween" or "CFrame"; using "Tween".')
@@ -826,6 +848,7 @@ local Runtime = {
     CurrentTool = nil,
     SkillOffsetState = nil,
     OrbitSkillPause = nil,
+    EngageChasePause = nil,
     TargetEpoch = 0,
     CharacterEpoch = 0,
     SafeEpoch = 0,
@@ -2901,6 +2924,7 @@ local function resetTargetTimers()
 end
 
 local function clearTarget(reason, markPrevious)
+    Runtime.EngageChasePause = nil
     local ignoredWeapon = TargetWeaponFilter.FindIgnored(Runtime.CurrentTarget)
     local savedReason = SavedTargetFilter.Reason(Runtime.CurrentTarget)
     Runtime.TargetRecoveryState = nil
@@ -3974,6 +3998,57 @@ local function getTargetTweenTimeMultiplier(localRoot, targetRoot)
     return 1, false
 end
 
+function Runtime.UpdateEngageChasePause(now)
+    local config = INTERNAL.EngageChasePause
+    if not config.Enabled then return false end
+    -- Recovery and server hopping have their own movement and must never be blocked.
+    if not Runtime.Running or Runtime.LocalDead or Runtime.SafeMode or Runtime.HopPending
+        or Runtime.EmptyHopCommitted or Runtime.WinEntranceAttempt
+        or (Runtime.Mode ~= "CHASE" and Runtime.Mode ~= "ENGAGE") then return false end
+    local info = Runtime.CurrentTargetInfo
+    if not Runtime.CurrentTarget or not info or not info.Root or not Runtime.Root then return false end
+    now = now or os.clock()
+    local state = Runtime.EngageChasePause
+    if state and (state.Player ~= Runtime.CurrentTarget or state.TargetRoot ~= info.Root
+        or state.TargetCharacter ~= info.Character or state.LocalRoot ~= Runtime.Root
+        or state.CharacterEpoch ~= Runtime.CharacterEpoch) then
+        Runtime.EngageChasePause = nil
+        state = nil
+    end
+    if not state then
+        if Runtime.Mode ~= "ENGAGE" or not Runtime.InsideHitbox then return false end
+        state = {
+            Player = Runtime.CurrentTarget, TargetRoot = info.Root, TargetCharacter = info.Character,
+            LocalRoot = Runtime.Root, CharacterEpoch = Runtime.CharacterEpoch,
+            StartedAt = now, Used = false, PauseUntil = nil,
+        }
+        Runtime.EngageChasePause = state
+    end
+    if state.PauseUntil then
+        if now < state.PauseUntil then return true end
+        state.PauseUntil = nil
+        Runtime.ChaseMoveCycle = nil
+        Runtime.ChaseMovementMode = nil
+        Runtime.ChaseTweenTimeMultiplier = nil
+        setStatus((Runtime.Mode == "ENGAGE" and "Engaging " or "Chasing ") .. state.Player.Name)
+    end
+    if state.Used or now - state.StartedAt < config.After then return false end
+
+    state.Used = true
+    local duration = config.MinDuration + (config.MaxDuration - config.MinDuration) * math.random()
+    state.PauseUntil = now + duration
+    stopSeaHeightMovement()
+    if Runtime.ActiveTween then
+        Runtime.ActiveTween:Cancel()
+        Runtime.ActiveTween = nil
+    end
+    Runtime.ChaseMoveCycle = nil
+    Runtime.ChaseMovementMode = nil
+    Runtime.ChaseTweenTimeMultiplier = nil
+    setStatus(string.format("Chase paused for %.1fs; target: %s", duration, state.Player.Name))
+    return true
+end
+
 local function AutoTween(goalCFrame, deltaTime, insideHitbox, timeMultiplier, speedOverride)
     stopSeaHeightMovement()
     local root = Runtime.Root
@@ -4011,6 +4086,8 @@ local function AutoTween(goalCFrame, deltaTime, insideHitbox, timeMultiplier, sp
 end
 
 function Runtime.MoveToTargetGoal(goalCFrame, deltaTime, insideHitbox, timeMultiplier, useCFrame)
+    -- SkillOffset also calls this outside the movement Heartbeat.
+    if Runtime.UpdateEngageChasePause() then return end
     if not useCFrame then
         AutoTween(goalCFrame, deltaTime, insideHitbox, timeMultiplier)
         return
@@ -4684,13 +4761,25 @@ function Runtime.PrepareSkillOffset(tool, key, targetEpoch, characterEpoch, atta
     -- No additional movement connection or per-frame task is created.
     local ok, reached = pcall(function()
         if not Runtime.UpdateSkillOffset(0) then return false end
+        local pausedForChase = false
         while Runtime.IsSkillOffsetCurrent(state) do
+            local now = os.clock()
+            if Runtime.UpdateEngageChasePause(now) then
+                pausedForChase = true
+                -- A deliberate chase pause must not consume the skill's positioning budget.
+                deadline = math.max(deadline, Runtime.EngageChasePause.PauseUntil + timeout)
+            elseif pausedForChase then
+                pausedForChase = false
+                deadline = math.max(deadline, now + timeout)
+                -- Resume positioning even if this worker wakes before movement Heartbeat.
+                if not Runtime.UpdateSkillOffset(0) then return false end
+            end
             local goal = getHitboxMovementCFrame(state.Root, state.TargetRoot,
                 state.TargetRoot.CFrame:PointToWorldSpace(state.Offset))
             if (state.Root.Position - goal.Position).Magnitude <= 0.5 then
                 return true
             end
-            if os.clock() >= deadline then return false end
+            if now >= deadline then return false end
             RunService.Heartbeat:Wait()
         end
         return false
@@ -7415,6 +7504,11 @@ local function startMovementWorker()
             setStatus("Chasing " .. player.Name)
         end
             
+        if Runtime.UpdateEngageChasePause(now) then
+            if insideHitbox then faceRootTowardTarget(localRoot, targetRoot) end
+            return
+        end
+
         local chaseTimeMultiplier, insideTweenHitbox = getTargetTweenTimeMultiplier(localRoot, targetRoot)
         local useCFrame = insideTweenHitbox and INTERNAL.TweenHitboxMode == "CFrame"
         local chaseMovementMode = useCFrame and "CFrame" or "Tween"
@@ -8649,6 +8743,7 @@ function Runtime:Stop(reason)
     end
 
     self.Running = false
+    self.EngageChasePause = nil
 
     if self.ToolCache then self.ToolCache:Stop() end
     TargetWeaponFilter.Stop()
