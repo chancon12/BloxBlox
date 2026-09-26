@@ -387,7 +387,7 @@ Combo = {
         FPSBoostEffectFolders = {""},
 
         Region = "", -- "" = any region
-        ServerHopMode = "Random",
+        ServerHopMode = "Populated",
         DefaultSkillPressTime = 0,
         SafeModeTweenSpeed = 300,
         SafeModeInitialLift = {
