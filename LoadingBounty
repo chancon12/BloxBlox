@@ -355,10 +355,11 @@ Combo = {
 
         EngageChasePause = {
         Enabled = true,
-        After = 10,       -- Seconds after first entering Engage
+        After = 2,       -- Seconds after first entering Engage
         MinDuration = 1,
         MaxDuration = 2,
         },
+
         ClickAttack = false,
         ClickAttackMinTargetHealth = 5000,
         BladeBeforeDefaultSkill = true,
