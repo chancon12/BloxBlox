@@ -353,7 +353,7 @@ Combo = {
             },
         },
 
-        ClickAttack = true,
+        ClickAttack = false,
         ClickAttackMinTargetHealth = 5000,
         BladeBeforeDefaultSkill = true,
         Attack = true, -- master switch for automatic weapon switching and skill casting
@@ -365,7 +365,7 @@ Combo = {
         NoDamageTimeout = 30,  -- Switch if no health drops within 30 seconds of entering hitbox
         SkipPreviousTargets = false,
         SafeModeY = 3000, -- absolute world Y used by the low-health SafeMode tween
-        LowHealth = 10000,
+        LowHealth = 6000s,
         MaxHealth = 12000,
         RaceV3 = true,
         RaceV4 = true,
