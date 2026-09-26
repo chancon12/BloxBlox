@@ -409,7 +409,7 @@ Combo = {
         },
 
         Aimbot = {
-        Gun = false,    -- Aim basic gun shots
+        Gun = true,    -- Aim basic gun shots
         Skills = true, -- Aim combo skills
         },
 
