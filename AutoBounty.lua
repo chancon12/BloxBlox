@@ -27,7 +27,7 @@ local function runAutoBounty(PauseControl, pauseGeneration)
 -- AutoBountyAccounts/<UserId>.txt stores UserId and cumulative Bounty/Honor Gained/Lost.
 -- ID-only and gain-only files migrate without resetting gains; historical losses start at zero.
 -- GUI shows current bounty, total gained, total lost, and net change (gained minus lost).
--- Stats tab: manually refund, wait 0.2 seconds, then request the five entered allocations.
+-- Stats tab: refund "1", confirm with "2", wait 0.2 seconds, then request the five allocations.
 -- Blank/zero inputs leave points unspent. Requests are serialized, including across reloads.
 -- Initial/rebound stats and losses add nothing. GUI Total gained uses saved total plus pending gains.
 -- Saved gains need host isfolder/makefolder/isfile/writefile/readfile functions.
@@ -1685,6 +1685,14 @@ do
             if not Stats.IsCurrent() then return end
             if result == false then
                 Stats.SetMessage("Refund was rejected. No allocation requests were sent.", true)
+                return
+            end
+
+            Stats.SetMessage("Confirming stat refund...")
+            local confirmed = request.Remote:InvokeServer("BlackbeardReward", "Refund", "2")
+            if not Stats.IsCurrent() then return end
+            if confirmed == false then
+                Stats.SetMessage("Refund confirmation was rejected. No allocation requests were sent.", true)
                 return
             end
 
