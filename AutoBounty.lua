@@ -31,6 +31,9 @@ local function runAutoBounty(PauseControl, pauseGeneration)
 -- The exception expires on target release or respawn. Low-health recovery and queued hops take priority.
 -- The ordinary server timeout waits for this defensive acquisition to end; its deadline is retained.
 -- The ordinary server timeout cannot shorten a custom empty wait; other hop reasons keep priority.
+-- Settings.WalkWater defaults to false; every 0.2s, WaterBase-Plane uses Size(1000,112,1000)
+-- when true and Size(1000,80,1000) otherwise. Missing parts are retried without blocking startup.
+-- Pause/stop or replacing the water part restores its captured original size. Collision is unchanged.
 -- Settings.TargetWeaponFilter = {Enabled=true, Ignore={"Portal-Portal"}}; false disables it.
 -- Filters visible Tool names and equipped/unequipped weapon model WeaponName attributes.
 -- Low-health recovery keeps the selected target and freezes its no-damage countdown.
@@ -1459,6 +1462,63 @@ local function disconnectConnections(connections)
     end
 
     table.clear(connections)
+end
+
+local WalkWater = {
+    EnabledSize = Vector3.new(1000, 112, 1000),
+    DisabledSize = Vector3.new(1000, 80, 1000),
+    NextUpdateAt = 0,
+}
+
+function WalkWater.Restore()
+    local part, size = WalkWater.Part, WalkWater.OriginalSize
+    WalkWater.Part, WalkWater.OriginalSize = nil, nil
+    if part and size then
+        pcall(function()
+            part.Size = size
+        end)
+    end
+end
+
+function WalkWater.Update()
+    if WalkWater.Stopped or not Runtime.Running or not bootstrapStillCurrent() then
+        return
+    end
+
+    local map = Workspace:FindFirstChild("Map")
+    local part = map and map:FindFirstChild("WaterBase-Plane")
+    if part and not part:IsA("BasePart") then part = nil end
+
+    if part ~= WalkWater.Part then
+        WalkWater.Restore()
+        if part then
+            WalkWater.Part = part
+            WalkWater.OriginalSize = part.Size
+        end
+    end
+    if not part then return end
+
+    local size = Settings.WalkWater == true and WalkWater.EnabledSize or WalkWater.DisabledSize
+    if part.Size ~= size then
+        part.Size = size
+    end
+end
+
+function WalkWater.Start()
+    if WalkWater.Started or WalkWater.Stopped then return end
+    WalkWater.Started = true
+    connect(RunService.Heartbeat, function()
+        if WalkWater.Stopped or not Runtime.Running or not bootstrapStillCurrent() then return end
+        local now = os.clock()
+        if now < WalkWater.NextUpdateAt then return end
+        WalkWater.NextUpdateAt = now + 0.2
+        pcall(WalkWater.Update)
+    end)
+end
+
+function WalkWater.Stop()
+    WalkWater.Stopped = true
+    WalkWater.Restore()
 end
 
 local function readBooleanAttribute(instance, name, fallback)
@@ -9365,6 +9425,7 @@ function Runtime:Stop(reason)
     end
 
     self.Running = false
+    WalkWater.Stop()
     EmptyServerIdle.DamageTarget = nil
     EmptyServerIdle.HealthSnapshot = nil
     self.EngageChasePause = nil
@@ -9483,6 +9544,7 @@ do
 end
 BlockedPlayerCheck.StartWorker()
 startFriendWorker()
+WalkWater.Start()
 startMovementWorker()
 startWeaponWorker()
 startRaceWorker()
