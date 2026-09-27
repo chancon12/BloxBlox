@@ -24,6 +24,8 @@
 -- AutoBountyAccounts/<UserId>.txt stores UserId and cumulative Bounty/Honor Gained/Lost.
 -- ID-only and gain-only files migrate without resetting gains; historical losses start at zero.
 -- GUI shows current bounty, total gained, total lost, and net change (gained minus lost).
+-- Stats tab: manually refund, wait 0.2 seconds, then request the five entered allocations.
+-- Blank/zero inputs leave points unspent. Requests are serialized, including across reloads.
 -- Initial/rebound stats and losses add nothing. GUI Total gained uses saved total plus pending gains.
 -- Saved gains need host isfolder/makefolder/isfile/writefile/readfile functions.
 -- SavedAccountHop defaults to true: at startup, hop if another player has a saved ID file.
@@ -1571,6 +1573,239 @@ local function createTextLabel(parent, name, position, size, text, textSize)
     return label
 end
 
+do
+    local Stats = {
+        Fields = {
+            {Label = "Melee", Stat = "Melee"},
+            {Label = "Defense", Stat = "Defense"},
+            {Label = "Sword", Stat = "Sword"},
+            {Label = "Gun", Stat = "Gun"},
+            {Label = "Devil Fruit", Stat = "Demon Fruit"},
+        },
+        Inputs = {},
+        Busy = false,
+    }
+    Runtime.StatsUI = Stats
+
+    function Stats.IsCurrent()
+        return Runtime.Running and bootstrapStillCurrent()
+            and Environment.__AutoBountyRuntime == Runtime
+            and Runtime.GUI ~= nil and Runtime.GUI.Parent ~= nil
+    end
+
+    function Stats.GetPoints()
+        local data = LocalPlayer:FindFirstChild("Data")
+        local points = data and data:FindFirstChild("Points")
+        if points and (points:IsA("IntValue") or points:IsA("NumberValue")) then
+            local value = points.Value
+            if isFiniteNumber(value) and value >= 0 then
+                return value
+            end
+        end
+        return nil
+    end
+
+    function Stats.RefreshPoints()
+        if not Stats.IsCurrent() then return end
+        local points = Stats.GetPoints()
+        Stats.PointsLabel.Text = "Unspent points: " .. (points and tostring(points) or "Loading...")
+    end
+
+    function Stats.SetMessage(message, failed)
+        if not Stats.IsCurrent() then return end
+        Stats.StatusLabel.Text = message
+        Stats.StatusLabel.TextColor3 = failed
+            and Color3.fromRGB(245, 145, 145) or Color3.fromRGB(130, 200, 255)
+    end
+
+    function Stats.SetBusy(busy)
+        Stats.Busy = busy
+        if not Stats.IsCurrent() then return end
+        Stats.ApplyButton.Text = busy and "Applying..." or "Reset & Add Stats"
+        Stats.ApplyButton.Active = not busy
+        Stats.ApplyButton.AutoButtonColor = not busy
+        for _, input in ipairs(Stats.Inputs) do
+            input.TextEditable = not busy
+        end
+    end
+
+    function Stats.ReadInputs()
+        local amounts, total = {}, 0
+        for index, field in ipairs(Stats.Fields) do
+            local text = Stats.Inputs[index].Text:match("^%s*(.-)%s*$")
+            local amount = text == "" and 0 or tonumber(text)
+            if (text ~= "" and not text:match("^%d+$"))
+                or not isFiniteNumber(amount) or amount < 0 or amount % 1 ~= 0
+                or amount > 9007199254740991 - total then
+                return nil, nil, field.Label .. ": enter a non-negative whole number."
+            end
+            amounts[index] = amount
+            total = total + amount
+        end
+        return amounts, total
+    end
+
+    function Stats.Apply()
+        if not Stats.IsCurrent() or Stats.Busy then return end
+        if Environment.__AutoBountyStatRequest then
+            Stats.SetMessage("A stat request is still pending. Wait for it to return before trying again.", true)
+            return
+        end
+
+        -- Snapshot and validate every field before spending the refund or yielding.
+        local amounts, total, inputError = Stats.ReadInputs()
+        if not amounts then
+            Stats.SetMessage(inputError, true)
+            return
+        end
+        if Stats.GetPoints() == nil or not StartupLoad.ResolveRemotes() then
+            Stats.SetMessage("Stats or the stat remote are not loaded yet. Try again once loaded.", true)
+            return
+        end
+
+        local request = {Remote = CommF}
+        Environment.__AutoBountyStatRequest = request
+        Stats.SetBusy(true)
+        local ok, err = pcall(function()
+            Stats.SetMessage("Requesting stat refund...")
+            local result = request.Remote:InvokeServer("BlackbeardReward", "Refund", "1")
+            if not Stats.IsCurrent() then return end
+            if result == false then
+                Stats.SetMessage("Refund was rejected. No allocation requests were sent.", true)
+                return
+            end
+
+            task.wait(0.2)
+            if not Stats.IsCurrent() then return end
+            local available = Stats.GetPoints()
+            if available == nil or total > available then
+                Stats.SetMessage(available == nil
+                    and "Points unavailable after refund. No allocations sent."
+                    or string.format("Requested %s points; only %s available after refund. No allocations sent.",
+                        tostring(total), tostring(available)), true)
+                return
+            end
+
+            for index, field in ipairs(Stats.Fields) do
+                if not Stats.IsCurrent() then return end
+                local amount = amounts[index]
+                if amount > 0 then
+                    Stats.SetMessage("Adding " .. tostring(amount) .. " points to " .. field.Label .. "...")
+                    local response = request.Remote:InvokeServer("AddPoint", field.Stat, amount)
+                    if not Stats.IsCurrent() then return end
+                    if response == false then
+                        Stats.SetMessage(field.Label .. " allocation was rejected. Stopped; check your stats.", true)
+                        return
+                    end
+                end
+            end
+            Stats.SetMessage(total == 0 and "Refund request completed. No points were allocated."
+                or "Allocation requests sent. Check your stats for the result.")
+        end)
+        -- Stop/reload cannot cancel an in-flight remote; its owner releases this lock on return.
+        if Environment.__AutoBountyStatRequest == request then
+            Environment.__AutoBountyStatRequest = nil
+        end
+        Stats.SetBusy(false)
+        if not ok then
+            Stats.SetMessage("Stat request failed: " .. tostring(err):sub(1, 130)
+                .. ". Stopped; check your stats before retrying.", true)
+        end
+        Stats.RefreshPoints()
+    end
+
+    function Stats.Build(panel)
+        local function button(name, text, position, size)
+            local control = Instance.new("TextButton")
+            control.Name = name
+            control.Position = position
+            control.Size = size
+            control.BackgroundColor3 = Color3.fromRGB(40, 65, 105)
+            control.BorderSizePixel = 0
+            control.Font = Enum.Font.GothamSemibold
+            control.TextSize = 14
+            control.TextColor3 = Color3.fromRGB(235, 235, 235)
+            control.Text = text
+            control.Parent = panel
+            local corner = Instance.new("UICorner")
+            corner.CornerRadius = UDim.new(0, 6)
+            corner.Parent = control
+            return control
+        end
+
+        local statusPage = Instance.new("Frame")
+        statusPage.Name = "StatusPage"
+        statusPage.BackgroundTransparency = 1
+        statusPage.Position = UDim2.fromOffset(0, 74)
+        statusPage.Size = UDim2.new(1, 0, 1, -86)
+        statusPage.Parent = panel
+        for name, label in pairs(Runtime.Labels) do
+            if name ~= "Title" then
+                label.Position = label.Position - UDim2.fromOffset(0, 36)
+                label.Parent = statusPage
+            end
+        end
+
+        local statsPage = Instance.new("Frame")
+        statsPage.Name = "StatsPage"
+        statsPage.BackgroundTransparency = 1
+        statsPage.Position = UDim2.fromOffset(12, 74)
+        statsPage.Size = UDim2.new(1, -24, 1, -86)
+        statsPage.Visible = false
+        statsPage.Parent = panel
+
+        local statusTab = button("StatusTab", "Status", UDim2.fromOffset(12, 36), UDim2.fromOffset(139, 28))
+        local statsTab = button("StatsTab", "Stats", UDim2.fromOffset(159, 36), UDim2.fromOffset(139, 28))
+        local function selectTab(showStats)
+            statusPage.Visible = not showStats
+            statsPage.Visible = showStats
+            panel.Size = UDim2.fromOffset(310, showStats and 382 or 340)
+            statusTab.BackgroundColor3 = Color3.fromRGB(40, 65, 105)
+            statsTab.BackgroundColor3 = Color3.fromRGB(40, 65, 105)
+            local active = showStats and statsTab or statusTab
+            active.BackgroundColor3 = Color3.fromRGB(55, 95, 155)
+            if showStats then Stats.RefreshPoints() end
+        end
+        connect(statusTab.Activated, function() selectTab(false) end)
+        connect(statsTab.Activated, function() selectTab(true) end)
+
+        Stats.PointsLabel = createTextLabel(statsPage, "Points", UDim2.fromOffset(0, 0),
+            UDim2.new(1, 0, 0, 20), "Unspent points: Loading...", 14)
+        for index, field in ipairs(Stats.Fields) do
+            local y = 28 + (index - 1) * 32
+            createTextLabel(statsPage, field.Stat .. "Label", UDim2.fromOffset(0, y),
+                UDim2.fromOffset(126, 26), field.Label, 14)
+            local input = Instance.new("TextBox")
+            input.Name = field.Stat .. "Points"
+            input.Position = UDim2.fromOffset(138, y)
+            input.Size = UDim2.new(1, -138, 0, 26)
+            input.BackgroundColor3 = Color3.fromRGB(35, 39, 48)
+            input.BorderSizePixel = 0
+            input.Font = Enum.Font.Gotham
+            input.TextSize = 14
+            input.TextColor3 = Color3.fromRGB(235, 235, 235)
+            input.PlaceholderText = "0"
+            input.Text = ""
+            input.ClearTextOnFocus = false
+            input.MultiLine = false
+            input.Parent = statsPage
+            Stats.Inputs[index] = input
+        end
+
+        Stats.ApplyButton = button("ApplyStats", "Reset & Add Stats", UDim2.fromOffset(0, 194),
+            UDim2.new(1, 0, 0, 32))
+        Stats.ApplyButton.Parent = statsPage
+        Stats.StatusLabel = createTextLabel(statsPage, "StatStatus", UDim2.fromOffset(0, 234),
+            UDim2.new(1, 0, 0, 62), "Refunds stats, waits 0.2s, then adds your entries. Blank or 0 leaves points unspent.", 12)
+        Stats.StatusLabel.TextWrapped = true
+        Stats.StatusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+        Stats.StatusLabel.TextYAlignment = Enum.TextYAlignment.Top
+        Stats.StatusLabel.TextColor3 = Color3.fromRGB(130, 200, 255)
+        connect(Stats.ApplyButton.Activated, Stats.Apply)
+        selectTab(false)
+    end
+end
+
 local function createGUI()
     local playerGui
     while Runtime.Running and bootstrapStillCurrent() and Environment.__AutoBountyRuntime == Runtime do
@@ -1646,6 +1881,7 @@ local function createGUI()
     Runtime.Labels.Status.TextColor3 = Color3.fromRGB(130, 200, 255)
 
     Runtime.GUI = screenGui
+    Runtime.StatsUI.Build(frame)
     SavedBounty.UpdateGUI()
     return true
 end
