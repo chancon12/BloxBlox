@@ -26,10 +26,11 @@ local function runAutoBounty(PauseControl, pauseGeneration)
 -- Settings.HopOnBlockedPlayer defaults to true; hop if a locally blocked account is present.
 -- Settings.EmptyServerIdleTime = 0 keeps the normal 5-second empty grace; positive values replace it.
 -- During that wait, eligible players cancel/reset the countdown and can be chased normally.
--- A health drop during a positive idle countdown retries the nearest valid player by HRP distance.
--- This acquisition may bypass previous-target/no-progress/follow-timeout skips; other filters remain.
--- The exception expires on target release or respawn. Low-health recovery and queued hops take priority.
--- The ordinary server timeout waits for this defensive acquisition to end; its deadline is retained.
+-- With no normally eligible targets and confirmed Character.InCombat=true, chase the nearest living player.
+-- This temporary combat fallback bypasses all target exclusions and distance limits; it requires no
+-- health drop, idle timer, or AutoHop. It ends when combat clears or the target/character changes.
+-- Empty/friend/blocked/saved-account hops yield to this chase; bounty-loss and issued teleports do not.
+-- Local death, low-health recovery, pause, and valid character/HRP requirements still apply.
 -- The ordinary server timeout cannot shorten a custom empty wait; other hop reasons keep priority.
 -- Settings.WalkWater defaults to false; every 0.2s, WaterBase-Plane uses Size(1000,112,1000)
 -- when true and Size(1000,80,1000) otherwise. Missing parts are retried without blocking startup.
@@ -86,7 +87,7 @@ local function runAutoBounty(PauseControl, pauseGeneration)
 -- The offset ends on key release; orbit waits for OrbitResumeDelay before resuming. Omitted/false is disabled.
 -- Empty-target hop: rise continuously at TweenSpeed with fixed X/Z until the server hop.
 -- SafeModeY does not cap this ascent; each update puts the goal above the current height.
--- Once ascent starts, new targets cannot cancel the hop; the commitment survives recovery/respawn.
+-- Once ascent starts, ordinary targets cannot cancel the hop; the in-combat fallback can interrupt it.
 -- SafeZoneRadius defaults to 100 studs from each zone part's center (3D distance).
 -- For a zone inside a Model, use the nearest ancestor Model's valid PrimaryPart when available.
 -- SafeModePanicEnabled defaults to true; SafeModePanicRadius defaults to 200 studs.
@@ -995,6 +996,7 @@ local SavedAccountCheck = {
     Ready = false,
 }
 
+local CombatFallback = {NormalCount = 0}
 local SavedTargetFilter = {Entries = {}, FileExists = nil}
 
 function SavedTargetFilter.StillCurrent()
@@ -1554,6 +1556,28 @@ end
 
 local function readLocalInCombat()
     return readBooleanAttribute(Runtime.Character, "InCombat", nil)
+end
+
+function CombatFallback.InCombat()
+    local character = Runtime.Character
+    -- Direct calls keep namecall forwarding intact when attack/aim validation uses this check.
+    return character ~= nil and character == LocalPlayer.Character and character.Parent ~= nil
+        and character.GetAttribute(character, "InCombat") == true
+end
+
+function CombatFallback.IsActive(player)
+    local target = CombatFallback.Target
+    return target ~= nil and target.Player == player
+        and Runtime.Running and bootstrapStillCurrent() and not Runtime.LocalDead
+        and target.CharacterEpoch == Runtime.CharacterEpoch
+        and player ~= LocalPlayer and player.Parent == Players
+        and player.Character == target.Character and target.Character.Parent ~= nil
+        and target.Humanoid.Parent == target.Character and target.Humanoid.Health > 0
+        and target.Root.Parent ~= nil
+        and target.Root.IsDescendantOf(target.Root, target.Character)
+        and target.Character.FindFirstChild(target.Character, "HumanoidRootPart") == target.Root
+        and target.Character.FindFirstChildOfClass(target.Character, "Humanoid") == target.Humanoid
+        and CombatFallback.InCombat()
 end
 
 local function setRequiredLocalAttribute(name)
@@ -2860,7 +2884,7 @@ function BlockedPlayerCheck.StartWorker()
     end)
 end
 
-local function getTargetRoute(player, info, preferEntrance)
+local function getTargetRoute(player, info, preferEntrance, normalOnly)
     local localRoot = Runtime.Root
     local targetRoot = info and info.Root
 
@@ -2879,6 +2903,9 @@ local function getTargetRoute(player, info, preferEntrance)
     end
 
     local directDistance = (targetRoot.Position - localRoot.Position).Magnitude
+    if not normalOnly and CombatFallback.IsActive(player) then
+        return {Kind = "direct", Distance = directDistance}
+    end
     local directRoute
 
     if directDistance < MaxTargetDistance then
@@ -3176,23 +3203,28 @@ local function keepSelectedTargetInSafeZone(player)
     return Runtime.SafeMode or not known or inCombat == true
 end
 
-function EmptyServerIdle.IsDamageTarget(player)
-    local retry = EmptyServerIdle.DamageTarget
-    if not retry then return false end
-    if retry.CharacterEpoch ~= Runtime.CharacterEpoch
-        or retry.Player.Parent ~= Players
-        or retry.Player.Character ~= retry.Character
-        or retry.Humanoid.Parent ~= retry.Character
-        or retry.Humanoid.Health <= 0 then
-        EmptyServerIdle.DamageTarget = nil
-        return false
-    end
-    return retry.Player == player
-end
-
-local function evaluateTarget(player, ignoreHistory)
+function CombatFallback.GetInfo(player)
     if not player or player == LocalPlayer or player.Parent ~= Players then
         return false, "self-or-left"
+    end
+    local character, humanoid, root = getAliveCharacter(player)
+    if not character or humanoid.Parent ~= character or not root:IsA("BasePart")
+        or not root:IsDescendantOf(character) or not isFiniteVector3(root.Position) then
+        return false, "invalid-character"
+    end
+    return true, {Player = player, Character = character, Humanoid = humanoid,
+        Root = root, Level = readLevel(player)}
+end
+
+local function evaluateTarget(player, normalOnly)
+    if not player or player == LocalPlayer or player.Parent ~= Players then
+        return false, "self-or-left"
+    end
+    if not normalOnly and CombatFallback.IsActive(player) then
+        return CombatFallback.GetInfo(player)
+    end
+    if BlockedPlayerCheck.Ids[player.UserId] then
+        return false, "blocked-player"
     end
 
     local savedReason = SavedTargetFilter.Reason(player)
@@ -3204,13 +3236,7 @@ local function evaluateTarget(player, ignoreHistory)
         return false, "ignored-weapon"
     end
 
-    local damageRetry = EmptyServerIdle.IsDamageTarget(player)
-    if (ignoreHistory or damageRetry) and BlockedPlayerCheck.Ids[player.UserId] then
-        return false, "blocked-player"
-    end
-    local bypassHistory = ignoreHistory == true or damageRetry
-
-    if not bypassHistory and SkipPreviousTargets and Runtime.PreviouslyTargeted[player.UserId] then
+    if SkipPreviousTargets and Runtime.PreviouslyTargeted[player.UserId] then
         return false, "previously-targeted"
     end
 
@@ -3261,7 +3287,7 @@ local function evaluateTarget(player, ignoreHistory)
 
     local followTimeoutCharacter = Runtime.FollowTimeoutCharacters[player]
 
-    if followTimeoutCharacter and not bypassHistory then
+    if followTimeoutCharacter then
         if followTimeoutCharacter == character then
             return false, "follow-timeout-target"
         end
@@ -3271,7 +3297,7 @@ local function evaluateTarget(player, ignoreHistory)
 
     local noProgressCharacter = Runtime.NoProgressCharacters[player]
 
-    if noProgressCharacter and not bypassHistory then
+    if noProgressCharacter then
         if noProgressCharacter == character then
             return false, "no-health-progress"
         end
@@ -3317,10 +3343,10 @@ local function rebuildCandidates()
 
     if Runtime.SafeZonesFolder and Runtime.SafeZonesFolder.Parent and Runtime.SafeZonesReady then
         for _, player in ipairs(Players:GetPlayers()) do
-            local eligible, result = evaluateTarget(player)
+            local eligible, result = evaluateTarget(player, true)
 
             if eligible then
-                local route, routeReason = getTargetRoute(player, result)
+                local route, routeReason = getTargetRoute(player, result, false, true)
 
                 if route then
                     result.Route = route
@@ -3373,6 +3399,21 @@ local function rebuildCandidates()
     end
 
     local candidates = #directCandidates > 0 and directCandidates or entranceCandidates
+    CombatFallback.NormalCount = #candidates
+
+    local fallback = CombatFallback.Target
+    if fallback and CombatFallback.IsActive(fallback.Player) then
+        local eligible, info = CombatFallback.GetInfo(fallback.Player)
+        local route = eligible and getTargetRoute(fallback.Player, info)
+        if route then
+            info.Route = route
+            candidateInfo[fallback.Player] = info
+            candidateReasons[fallback.Player] = "eligible-combat-fallback"
+            if not table.find(candidates, fallback.Player) then
+                table.insert(candidates, fallback.Player)
+            end
+        end
+    end
 
     table.sort(candidates, function(firstPlayer, secondPlayer)
         local firstInfo = candidateInfo[firstPlayer]
@@ -3489,7 +3530,7 @@ local function resetTargetTimers()
 end
 
 local function clearTarget(reason, markPrevious)
-    EmptyServerIdle.DamageTarget = nil
+    CombatFallback.Target = nil
     Runtime.EngageChasePause = nil
     local ignoredWeapon = TargetWeaponFilter.FindIgnored(Runtime.CurrentTarget)
     local savedReason = SavedTargetFilter.Reason(Runtime.CurrentTarget)
@@ -3541,6 +3582,9 @@ end
 
 function SavedTargetFilter.ReleaseCurrent()
     local player = Runtime.CurrentTarget
+    if CombatFallback.IsActive(player) then
+        return false
+    end
     local reason = SavedTargetFilter.Reason(player)
     if not reason then
         return false
@@ -3619,6 +3663,9 @@ end
 
 local function releaseIgnoredTarget(weapon)
     local player = Runtime.CurrentTarget
+    if CombatFallback.IsActive(player) then
+        return
+    end
     local reference = Runtime.SafeModeReference
 
     if reference and reference.TargetInfo and reference.TargetInfo.Player == player then
@@ -4251,10 +4298,9 @@ local function setTarget(player, targetInfo, resumeRecovery)
         end
     else
         -- clearTarget resets exceptions; carry only this acquisition's matching marker.
-        local damageRetry = EmptyServerIdle.IsDamageTarget(player)
-            and EmptyServerIdle.DamageTarget or nil
+        local fallback = CombatFallback.IsActive(player) and CombatFallback.Target or nil
         clearTarget()
-        EmptyServerIdle.DamageTarget = damageRetry
+        CombatFallback.Target = fallback
     end
 
     Runtime.CurrentTarget = player
@@ -4316,7 +4362,9 @@ local function setTarget(player, targetInfo, resumeRecovery)
                 and not Runtime.HopPending
                 and Runtime.TargetEpoch == targetEpoch
                 and Runtime.CurrentTarget == player
-                and not SavedTargetFilter.Reason(player)
+                and (not CombatFallback.Target or CombatFallback.Target.Player ~= player
+                    or CombatFallback.IsActive(player))
+                and (CombatFallback.IsActive(player) or not SavedTargetFilter.Reason(player))
                 and Runtime.CharacterEpoch == preparationCharacterEpoch
                 and Runtime.Root == preparationRoot
                 and preparationRoot ~= nil
@@ -4431,78 +4479,90 @@ local function setTarget(player, targetInfo, resumeRecovery)
     return true
 end
 
-function EmptyServerIdle.CanReactToDamage()
+CombatFallback.CancellableHops = {
+    empty = true, friend = true, ["blocked-player"] = true, ["saved-account"] = true,
+    ["server-timeout"] = true, ["follow-timeout"] = true,
+}
+
+function CombatFallback.Ready()
+    local humanoid, root, character = Runtime.Humanoid, Runtime.Root, Runtime.Character
     return Runtime.Running and bootstrapStillCurrent()
-        and AutoHopEnabled
         and not Runtime.LocalDead and not Runtime.SafeMode
-        and not Runtime.HopPending and not Runtime.EmptyHopCommitted
         and not Runtime.WinEntranceAttempt and not Runtime.TargetRecoveryState
-        and Runtime.CurrentTarget == nil
-        and Runtime.EmptySince ~= nil
-        and EmptyServerIdle.IsWaiting()
+        and not Runtime.Teleporting and not Runtime.BountyLossHopDetail
+        and character ~= nil and character == LocalPlayer.Character and character.Parent ~= nil
+        and humanoid ~= nil and humanoid.Parent == character
+        and humanoid.Health > (Runtime.EffectiveLowHealth or LowHealth)
+        and root ~= nil and root.Parent ~= nil and root:IsDescendantOf(character)
+        and isFiniteVector3(root.Position) and CombatFallback.InCombat()
 end
 
-function EmptyServerIdle.ObserveHealth(health, humanoid, characterEpoch)
-    if not Runtime.Running or not bootstrapStillCurrent()
-        or Runtime.CharacterEpoch ~= characterEpoch or Runtime.Humanoid ~= humanoid
-        or not isFiniteNumber(health) or health <= 0 then
-        return
+function CombatFallback.Acquire()
+    if Runtime.BountyLossHopDetail or Runtime.Teleporting
+        or (Runtime.HopPending and not CombatFallback.CancellableHops[Runtime.HopReason]) then
+        return false
     end
-
-    local previous = EmptyServerIdle.HealthSnapshot
-    EmptyServerIdle.HealthSnapshot = {
-        Humanoid = humanoid, CharacterEpoch = characterEpoch,
-        Health = health, MaxHealth = humanoid.MaxHealth,
-    }
-    if not previous or previous.Humanoid ~= humanoid
-        or previous.CharacterEpoch ~= characterEpoch
-        or previous.MaxHealth ~= humanoid.MaxHealth
-        or health >= previous.Health
-        or health <= (Runtime.EffectiveLowHealth or LowHealth)
-        or not EmptyServerIdle.CanReactToDamage() then
-        return
+    if CombatFallback.IsActive(Runtime.CurrentTarget) then
+        if Runtime.HopPending or Runtime.EmptyHopCommitted then
+            return CombatFallback.CancelHop and CombatFallback.CancelHop() or false
+        end
+        return true
     end
+    if Runtime.CurrentTarget or not CombatFallback.Ready() then return false end
 
-    -- Confirm the list is still empty; an ordinary eligible arrival needs no exception.
-    local candidates = rebuildCandidates()
-    EmptyServerIdle.Update(candidates)
-    if not EmptyServerIdle.CanReactToDamage() then return end
-
-    local localRoot = Runtime.Root
-    if not localRoot or not localRoot.Parent or not isFiniteVector3(localRoot.Position) then
-        return
-    end
-
+    -- Count normal targets separately; the exception never makes itself normally eligible.
+    rebuildCandidates()
+    if CombatFallback.NormalCount > 0 or not CombatFallback.Ready() then return false end
     local nearest, nearestInfo, nearestDistance
     for _, player in ipairs(Players:GetPlayers()) do
-        local eligible, info = evaluateTarget(player, true)
-        if eligible then
-            local route = getTargetRoute(player, info)
-            if route then
-                local distance = (info.Root.Position - localRoot.Position).Magnitude
-                if not nearest or distance < nearestDistance
-                    or (distance == nearestDistance and player.UserId < nearest.UserId) then
-                    nearest, nearestInfo, nearestDistance = player, info, distance
-                end
+        local alive, info = CombatFallback.GetInfo(player)
+        if alive then
+            local distance = (info.Root.Position - Runtime.Root.Position).Magnitude
+            if isFiniteNumber(distance) and (not nearest or distance < nearestDistance
+                or (distance == nearestDistance and player.UserId < nearest.UserId)) then
+                nearest, nearestInfo, nearestDistance = player, info, distance
             end
         end
     end
+    if not nearest or not CombatFallback.Ready() then return false end
 
-    if not nearest or not EmptyServerIdle.CanReactToDamage() then return end
-    EmptyServerIdle.DamageTarget = {
+    if Runtime.HopPending or Runtime.EmptyHopCommitted then
+        if not CombatFallback.CancelHop or not CombatFallback.CancelHop() then return false end
+    end
+    if not CombatFallback.Ready() or Runtime.CurrentTarget then return false end
+    CombatFallback.Target = {
         Player = nearest, Character = nearestInfo.Character, Humanoid = nearestInfo.Humanoid,
-        CharacterEpoch = characterEpoch,
+        Root = nearestInfo.Root, CharacterEpoch = Runtime.CharacterEpoch,
     }
     if setTarget(nearest, nearestInfo) and Runtime.CurrentTarget == nearest then
         Runtime.EmptySince = nil
         rebuildCandidates()
-    else
-        EmptyServerIdle.DamageTarget = nil
+        return true
     end
+    CombatFallback.Target = nil
+    return false
+end
+
+function CombatFallback.TryAcquire()
+    if CombatFallback.Trying then return false end
+    CombatFallback.Trying = true
+    local ok, acquired = pcall(CombatFallback.Acquire)
+    CombatFallback.Trying = false
+    if not ok then
+        warnOnce("combat-fallback:acquire", "Combat target check failed: " .. tostring(acquired))
+    end
+    return ok and acquired == true
 end
 
 local function canAttack(targetEpoch, attackMode, readOnly)
     local gunApproach = attackMode == "GunApproach"
+    local combatFallback = CombatFallback.IsActive(Runtime.CurrentTarget)
+
+    -- Do not let an expired fallback cast before the next movement/target tick.
+    if CombatFallback.Target and CombatFallback.Target.Player == Runtime.CurrentTarget
+        and not combatFallback then
+        return false
+    end
 
     if not AttackEnabled
         or not Runtime.Running
@@ -4512,13 +4572,13 @@ local function canAttack(targetEpoch, attackMode, readOnly)
         or Runtime.LocalDead
         or Runtime.HopPending
         or Runtime.WinEntranceAttempt
-        or not Runtime.FriendAuditComplete then
+        or (not combatFallback and not Runtime.FriendAuditComplete) then
 
         return false
     end
 
-    if SavedTargetFilter.Reason(Runtime.CurrentTarget)
-        or TargetWeaponFilter.FindIgnored(Runtime.CurrentTarget) then
+    if not combatFallback and (SavedTargetFilter.Reason(Runtime.CurrentTarget)
+        or TargetWeaponFilter.FindIgnored(Runtime.CurrentTarget)) then
         return false
     end
 
@@ -4570,7 +4630,7 @@ local function canAttack(targetEpoch, attackMode, readOnly)
         or not targetRoot
         or not targetRoot.IsDescendantOf(targetRoot, targetCharacter)
         or not isFiniteVector3(targetRoot.Position)
-        or targetRoot.Position.Y < INTERNAL.MinimumTweenY then
+        or (not combatFallback and targetRoot.Position.Y < INTERNAL.MinimumTweenY) then
 
         return false
     end
@@ -4586,7 +4646,8 @@ local function canAttack(targetEpoch, attackMode, readOnly)
         return false
     end
 
-    if Runtime.CurrentTarget.GetAttribute(Runtime.CurrentTarget, "PvpDisabled") == true then
+    if not combatFallback
+        and Runtime.CurrentTarget.GetAttribute(Runtime.CurrentTarget, "PvpDisabled") == true then
         return false
     end
 
@@ -4982,7 +5043,7 @@ local function getSafeModeGoalY()
 
     if info then
         if info.Player.Parent == Players
-            and not SavedTargetFilter.Reason(info.Player)
+            and (CombatFallback.IsActive(info.Player) or not SavedTargetFilter.Reason(info.Player))
             and info.Character and info.Character.Parent
             and info.Player.Character == info.Character
             and info.Humanoid and info.Humanoid.Parent == info.Character
@@ -5646,8 +5707,8 @@ local function updateEmptyHopMovement(deltaTime)
     end
     movement.Goal = goal
 
-    -- Keep this separate from the root-bound tween: returning candidates, health
-    -- recovery and respawn must not reopen target selection or cancel this hop.
+    -- Ordinary returning candidates/recovery do not reopen selection. The explicit
+    -- combat fallback cancels this movement through stopHopPending before chasing.
     if not Runtime.EmptyHopCommitted then
         Runtime.EmptyHopCommitted = true
         Runtime.TargetRecoveryState = nil
@@ -5661,11 +5722,15 @@ local function updateEmptyHopMovement(deltaTime)
 end
 
 local function faceCameraTowardTarget()
+    local combatFallback = CombatFallback.IsActive(Runtime.CurrentTarget)
+
     if not Runtime.Running
         or Runtime.LocalDead
         or Runtime.SafeMode
         or Runtime.HopPending
-        or SavedTargetFilter.Reason(Runtime.CurrentTarget) then
+        or (CombatFallback.Target and CombatFallback.Target.Player == Runtime.CurrentTarget
+            and not combatFallback)
+        or (not combatFallback and SavedTargetFilter.Reason(Runtime.CurrentTarget)) then
 
         return
     end
@@ -5698,7 +5763,8 @@ local function faceCameraTowardTarget()
         or not targetRoot
         or not targetRoot:IsA("BasePart")
         or not targetRoot:IsDescendantOf(targetCharacter)
-        or targetRoot.Position.Y < INTERNAL.MinimumTweenY
+        or not isFiniteVector3(targetRoot.Position)
+        or (not combatFallback and targetRoot.Position.Y < INTERNAL.MinimumTweenY)
         or not camera then
 
         return
@@ -7686,8 +7752,6 @@ local function handleHealthChanged(health, characterEpoch)
         return
     end
 
-    EmptyServerIdle.ObserveHealth(health, humanoid, characterEpoch)
-
     local effectiveLow = Runtime.EffectiveLowHealth or LowHealth
     local effectiveRecovery = Runtime.EffectiveRecoveryHealth or math.min(RecoveryHealth, humanoid.MaxHealth)
 
@@ -7881,6 +7945,15 @@ local function startMovementWorker()
             return
         end
 
+        local fallbackTarget = CombatFallback.Target
+        if fallbackTarget and not CombatFallback.IsActive(fallbackTarget.Player) then
+            if Runtime.CurrentTarget == fallbackTarget.Player then
+                clearTarget("Combat fallback ended; scanning", false)
+            else
+                CombatFallback.Target = nil
+            end
+        end
+
         enforceLocalYFloor()
 
         if Runtime.LocalDead then
@@ -7890,7 +7963,9 @@ local function startMovementWorker()
         end
 
         SavedTargetFilter.ReleaseCurrent()
-        local ignoredWeapon = TargetWeaponFilter.FindIgnored(Runtime.CurrentTarget)
+        local combatFallback = CombatFallback.IsActive(Runtime.CurrentTarget)
+        local ignoredWeapon = not combatFallback
+            and TargetWeaponFilter.FindIgnored(Runtime.CurrentTarget)
 
         if ignoredWeapon then
             releaseIgnoredTarget(ignoredWeapon)
@@ -7938,7 +8013,7 @@ local function startMovementWorker()
             return
         end
 
-        if not Runtime.FriendAuditComplete then
+        if not combatFallback and not Runtime.FriendAuditComplete then
             if Runtime.CurrentTarget then
                 clearTarget("Waiting for friend checks")
             end
@@ -7960,26 +8035,28 @@ local function startMovementWorker()
             return
         end
 
-        if targetRoot.Position.Y < INTERNAL.MinimumTweenY then
+        if not combatFallback and targetRoot.Position.Y < INTERNAL.MinimumTweenY then
             clearTarget("Target moved below sea level; switching target")
             return
         end
 
-        local targetPvpDisabled = readBooleanAttribute(player, "PvpDisabled", false)
+        if not combatFallback then
+            local targetPvpDisabled = readBooleanAttribute(player, "PvpDisabled", false)
 
-        if targetPvpDisabled == true then
-            clearTarget("Target PvP is disabled")
-            return
-        end
+            if targetPvpDisabled == true then
+                clearTarget("Target PvP is disabled")
+                return
+            end
 
-        local inSafeZone = isInsideSafeZone(targetRoot.Position)
+            local inSafeZone = isInsideSafeZone(targetRoot.Position)
 
-        if inSafeZone == nil then
-            clearTarget("Waiting for SafeZones")
-            return
-        elseif inSafeZone and not keepSelectedTargetInSafeZone(player) then
-            clearTarget("Target entered the safe-zone radius while local combat is off")
-            return
+            if inSafeZone == nil then
+                clearTarget("Waiting for SafeZones")
+                return
+            elseif inSafeZone and not keepSelectedTargetInSafeZone(player) then
+                clearTarget("Target entered the safe-zone radius while local combat is off")
+                return
+            end
         end
 
         local localRoot = Runtime.Root
@@ -8442,7 +8519,7 @@ function ServerTimeout.StartWorker()
                     EmptyServerIdle.Update(rebuildCandidates())
                 end
                 if not EmptyServerIdle.IsWaiting()
-                    and not EmptyServerIdle.IsDamageTarget(Runtime.CurrentTarget) then
+                    and not CombatFallback.IsActive(Runtime.CurrentTarget) then
                     local inCombat, inCombatKnown = readLocalInCombat()
                     if inCombatKnown and inCombat == false then
                         ServerTimeout.Pending = true
@@ -8467,6 +8544,8 @@ determineHopReason = function()
         return "bounty-loss", Runtime.BountyLossHopDetail
     end
 
+    if CombatFallback.IsActive(Runtime.CurrentTarget) then return nil end
+
     local friend = findFriendInServer()
 
     if friend then
@@ -8488,7 +8567,7 @@ determineHopReason = function()
     end
 
     if ServerTimeout.Pending and ServerTimeout.IsDue() and not EmptyServerIdle.IsWaiting()
-        and not EmptyServerIdle.IsDamageTarget(Runtime.CurrentTarget) then
+        and not CombatFallback.IsActive(Runtime.CurrentTarget) then
         return "server-timeout", "5-minute server timeout"
     end
 
@@ -8607,6 +8686,16 @@ local function stopHopPending(message)
         Runtime.Mode = "SCAN"
         setStatus(message or "Hop cancelled; scanning")
     end
+end
+
+function CombatFallback.CancelHop()
+    if Runtime.BountyLossHopDetail or Runtime.Teleporting
+        or (Runtime.HopPending and not CombatFallback.CancellableHops[Runtime.HopReason]) then
+        return false
+    end
+    stopHopPending("Combat active; chasing nearest player")
+    Runtime.EmptySince = nil
+    return true
 end
 
 cancelFollowTimeoutHop = function(message)
@@ -9144,6 +9233,7 @@ local function runHopWorker()
                 task.wait(0.05)
                 continue
             end
+            if CombatFallback.TryAcquire() then break end
             if Runtime.CurrentTarget then
                 clearTarget()
             end
@@ -9202,6 +9292,10 @@ end
 
 requestHop = function(reason, detail)
     if not Runtime.Running or not AutoHopEnabled then
+        return false
+    end
+
+    if CombatFallback.CancellableHops[reason] and CombatFallback.TryAcquire() then
         return false
     end
 
@@ -9274,7 +9368,7 @@ local function startFriendWorker()
     connect(Players.PlayerAdded, function(player)
         Runtime.FriendAuditComplete = false
 
-        if Runtime.CurrentTarget then
+        if Runtime.CurrentTarget and not CombatFallback.IsActive(Runtime.CurrentTarget) then
             clearTarget("Checking newly joined player for friend status")
         end
 
@@ -9333,6 +9427,13 @@ end
 local function startTargetWorker()
     task.spawn(function()
         while Runtime.Running do
+            if CombatFallback.Target and not CombatFallback.IsActive(CombatFallback.Target.Player) then
+                if Runtime.CurrentTarget == CombatFallback.Target.Player then
+                    clearTarget("Combat fallback ended; scanning", false)
+                else
+                    CombatFallback.Target = nil
+                end
+            end
             if Runtime.WinEntranceAttempt then
                 task.wait(0.05)
             else
@@ -9344,8 +9445,8 @@ local function startTargetWorker()
                     local ignoredWeapon = TargetWeaponFilter.FindIgnored(player)
 
                     if SavedTargetFilter.ReleaseCurrent() then
-                        -- Saved accounts stay excluded during recovery and combat as well.
-                    elseif ignoredWeapon then
+                        -- Normal targets still respect saved-account exclusions.
+                    elseif ignoredWeapon and not CombatFallback.IsActive(player) then
                         releaseIgnoredTarget(ignoredWeapon)
                     elseif Runtime.SafeMode then
                         -- Recovery movement can put the selected target out of range temporarily.
@@ -9353,13 +9454,13 @@ local function startTargetWorker()
                     elseif Runtime.TargetRecoveryState then
                         if not Runtime.LocalDead and not Runtime.HopPending
                             and not Runtime.TargetRecoveryState.Preparing
-                            and Runtime.FriendAuditComplete then
+                            and (Runtime.FriendAuditComplete or CombatFallback.IsActive(player)) then
 
                             if not currentInfo or not setTarget(player, currentInfo, true) then
                                 clearTarget("Recovered target no longer qualifies")
                             end
                         end
-                    elseif not Runtime.FriendAuditComplete then
+                    elseif not Runtime.FriendAuditComplete and not CombatFallback.IsActive(player) then
                         clearTarget("Waiting for initial friend checks")
                     elseif currentInfo then
                         local lockedInfo = Runtime.CurrentTargetInfo
@@ -9383,11 +9484,16 @@ local function startTargetWorker()
                     end
                 end
 
+                if not Runtime.CurrentTarget and CombatFallback.TryAcquire() then
+                    candidates = Runtime.Candidates
+                end
                 EmptyServerIdle.Update(candidates)
 
                 if not Runtime.LocalDead and not Runtime.SafeMode and not Runtime.HopPending
                     and not Runtime.EmptyHopCommitted then
-                    if not Runtime.FriendAuditComplete then
+                    if CombatFallback.IsActive(Runtime.CurrentTarget) then
+                        -- The combat fallback owns movement even while normal filters have no candidates.
+                    elseif not Runtime.FriendAuditComplete then
                         setStatus("Checking players for friends")
                     elseif not Runtime.SafeZonesFolder or not Runtime.SafeZonesReady then
                         setStatus("Waiting for workspace._WorldOrigin.SafeZones")
@@ -9426,8 +9532,7 @@ function Runtime:Stop(reason)
 
     self.Running = false
     WalkWater.Stop()
-    EmptyServerIdle.DamageTarget = nil
-    EmptyServerIdle.HealthSnapshot = nil
+    CombatFallback.Target = nil
     self.EngageChasePause = nil
 
     if self.ToolCache then self.ToolCache:Stop() end
