@@ -1,3 +1,6 @@
+-- Pause/Resume shuts down workers and starts a fresh runtime on resume.
+-- Skipped targets and stat input drafts survive; paused time does not count toward the server timeout.
+local function runAutoBounty(PauseControl, pauseGeneration)
 -- GitHub-side Auto Bounty module.
 -- Engage lookups cache owned weapons, matching combo profiles, and allowed target weapons.
 -- Inventory events and config edits refresh caches; a 0.1-second fallback covers deferred signals.
@@ -161,6 +164,8 @@ local Environment = getgenv and getgenv() or _G
 local Config = Environment.AutoBountyConfig
 local LoaderToken = Environment.__AutoBountyLoaderToken
 local BootstrapToken = {}
+if not PauseControl:IsCurrent(pauseGeneration) then return end
+PauseControl.BootstrapToken = BootstrapToken
 
 -- A boost may still own listeners during startup, before its Runtime exists.
 if type(Environment.__AutoBountyFPSBoost) == "table"
@@ -170,7 +175,8 @@ end
 Environment.__AutoBountyBootstrapToken = BootstrapToken
 
 local function bootstrapStillCurrent()
-    return Environment.__AutoBountyBootstrapToken == BootstrapToken
+    return PauseControl:IsCurrent(pauseGeneration)
+        and Environment.__AutoBountyBootstrapToken == BootstrapToken
         and (LoaderToken == nil or Environment.__AutoBountyLoaderToken == LoaderToken)
 end
 
@@ -938,6 +944,12 @@ local Runtime = {
 }
 
 Environment.__AutoBountyRuntime = Runtime
+PauseControl.Runtime = Runtime
+if PauseControl.SavedState then
+    for name, values in pairs(PauseControl.SavedState) do
+        Runtime[name] = table.clone(values)
+    end
+end
 
 local Warned = {}
 
@@ -1525,6 +1537,7 @@ local function formatNumber(value)
 end
 
 function SavedBounty.UpdateGUI()
+    if not Runtime.Running then return end
     local labels = Runtime.Labels
     if not SavedAccountCheck.StillCurrent() or not labels then return end
 
@@ -1882,11 +1895,13 @@ local function createGUI()
 
     Runtime.GUI = screenGui
     Runtime.StatsUI.Build(frame)
+    PauseControl:Attach(Runtime, pauseGeneration)
     SavedBounty.UpdateGUI()
     return true
 end
 
 local function setStatus(status)
+    if not Runtime.Running then return end
     Runtime.Status = status
 
     if Runtime.Labels.Status then
@@ -1906,6 +1921,7 @@ local function isEmptyListHopReady()
 end
 
 local function updateTargetGUI()
+    if not Runtime.Running then return end
     if Runtime.Labels.Target then
         Runtime.Labels.Target.Text = "Target: " .. (
             Runtime.CurrentTarget and Runtime.CurrentTarget.Name or "None"
@@ -2225,6 +2241,8 @@ local function pressKeyDown(keyName)
 end
 
 local function releaseKey(keyName)
+    -- A stopped worker must not release a key now held by a resumed runtime.
+    if not Runtime.Running and not Runtime.PressedKeys[keyName] then return end
     local keyCode = Runtime.PressedKeys[keyName] or Enum.KeyCode[keyName]
 
     if keyCode then
@@ -2516,6 +2534,7 @@ local function requestFriendCheck(player)
                 return LocalPlayer:IsFriendsWithAsync(player.UserId)
             end)
 
+            if not Runtime.Running or not bootstrapStillCurrent() then break end
             if not success then
                 success, isFriend = pcall(function()
                     return LocalPlayer:IsFriendsWith(player.UserId)
@@ -2856,6 +2875,17 @@ do
     end
 
     TargetWeaponFilter.RefreshConfig()
+end
+
+if PauseControl.SavedState and PauseControl.SavedState.IgnoredTargetWeapons
+    and TargetWeaponFilter.Enabled then
+    for player, cached in pairs(PauseControl.SavedState.IgnoredTargetWeapons) do
+        local name = TargetWeaponFilter.NormalizeName(cached.Weapon)
+        if player.Parent == Players and player.Character == cached.Character
+            and name and TargetWeaponFilter.Names[name] then
+            Runtime.IgnoredTargetWeapons[player] = cached
+        end
+    end
 end
 
 local function keepSelectedTargetInSafeZone(player)
@@ -3379,7 +3409,7 @@ local function invokeEntrance(position, purpose, targetEpoch, validityCheck, bef
         return success and result == true
     end
 
-    while Runtime.Running and Runtime.EntranceBusy do
+    while Runtime.Running and (Runtime.EntranceBusy or Environment.__AutoBountyEntranceRequest) do
         if (targetEpoch and Runtime.TargetEpoch ~= targetEpoch) or not stillValid() then
             return false
         end
@@ -3407,11 +3437,15 @@ local function invokeEntrance(position, purpose, targetEpoch, validityCheck, bef
         end
     end
 
-    if not stillValid() then
+    if not Runtime.Running or not bootstrapStillCurrent()
+        or (targetEpoch and Runtime.TargetEpoch ~= targetEpoch) or not stillValid()
+        or Environment.__AutoBountyEntranceRequest then
         return false
     end
 
     Runtime.EntranceBusy = true
+    local request = {}
+    Environment.__AutoBountyEntranceRequest = request
 
     local success, result = pcall(function()
         if beforeInvoke then
@@ -3421,6 +3455,9 @@ local function invokeEntrance(position, purpose, targetEpoch, validityCheck, bef
         return CommF:InvokeServer("requestEntrance", position)
     end)
 
+    if Environment.__AutoBountyEntranceRequest == request then
+        Environment.__AutoBountyEntranceRequest = nil
+    end
     Runtime.LastEntranceAt = os.clock()
     Runtime.EntranceBusy = false
 
@@ -5975,6 +6012,7 @@ function CombatActions.GetComboConfig()
 end
 
 function CombatActions.UpdateComboGUI(combo, state)
+    if not Runtime.Running then return end
     local label = Runtime.Labels and Runtime.Labels.Combo
 
     if not label or not label.Parent then
@@ -9051,7 +9089,7 @@ function Runtime:Stop(reason)
         self.BountyConnection = nil
     end
 
-    if self.GUI then
+    if self.GUI and reason ~= "paused" then
         pcall(function()
             self.GUI:Destroy()
         end)
@@ -9114,3 +9152,176 @@ end
 ServerTimeout.StartWorker()
 
 return Runtime
+end
+
+-- This controller owns the one connection that stays alive while workers are stopped.
+local PauseControl = {
+    Environment = getgenv and getgenv() or _G,
+    Generation = 0,
+    Paused = false,
+    Starting = false,
+    Disposed = false,
+}
+PauseControl.LoaderToken = PauseControl.Environment.__AutoBountyLoaderToken
+
+function PauseControl:IsCurrent(generation)
+    return not self.Disposed and self.Environment.__AutoBountyPauseControl == self
+        and (self.LoaderToken == nil or self.Environment.__AutoBountyLoaderToken == self.LoaderToken)
+        and (generation == nil or (generation == self.Generation and not self.Paused))
+end
+
+function PauseControl:Render(message)
+    if not self:IsCurrent() then return end
+    if self.Button and self.Button.Parent then
+        self.Button.Text = self.Paused and "Resume" or "Pause"
+        self.Button.BackgroundColor3 = self.Paused and Color3.fromRGB(45, 120, 80)
+            or Color3.fromRGB(125, 70, 45)
+    end
+    local runtime = self.DisplayRuntime or self.Runtime
+    if runtime and runtime.GUI and runtime.GUI.Parent then
+        local status = runtime.Labels.Status
+        if status and message then status.Text = "Status: " .. message end
+        local stats = runtime.StatsUI
+        if stats and stats.ApplyButton then
+            local active = runtime.Running and not self.Paused and not self.Starting and not stats.Busy
+            stats.ApplyButton.Active = active
+            stats.ApplyButton.AutoButtonColor = active
+            if not runtime.Running then
+                stats.ApplyButton.Text = "Paused"
+                stats.StatusLabel.Text = "Resume before applying stats. Your inputs are kept."
+            end
+        end
+    end
+end
+
+function PauseControl:CaptureInputs()
+    local displayed = self.DisplayRuntime or self.Runtime
+    local stats = displayed and displayed.StatsUI
+    if stats then
+        self.Inputs = {}
+        for index, input in ipairs(stats.Inputs) do self.Inputs[index] = input.Text end
+    end
+end
+
+function PauseControl:StopCurrent(reason)
+    local runtime = self.Runtime
+    if runtime and type(runtime.Stop) == "function" then
+        runtime:Stop(reason)
+    elseif runtime then
+        runtime.Running = false
+    end
+    -- A pause during startup must also stop the FPS pass before a Runtime exists.
+    if self.Environment.__AutoBountyBootstrapToken == self.BootstrapToken then
+        local boost = self.Environment.__AutoBountyFPSBoost
+        if boost and type(boost.Stop) == "function" then boost:Stop() end
+    end
+end
+
+function PauseControl:Pause()
+    if not self:IsCurrent() or self.Paused then return end
+    self.Paused = true
+    self.Starting = false
+    self.Generation = self.Generation + 1
+    self.PausedAt = os.clock()
+    local runtime = self.Runtime
+    if runtime and runtime.Running then
+        self.SavedState = {}
+        for _, name in ipairs({"PreviouslyTargeted", "NoProgressCharacters", "FollowTimeoutCharacters", "RouteFailures", "IgnoredTargetWeapons"}) do
+            self.SavedState[name] = table.clone(runtime[name])
+        end
+    end
+    self:CaptureInputs()
+    self:StopCurrent("paused")
+    self:Render("Paused — all automation stopped")
+end
+
+function PauseControl:Attach(runtime, generation)
+    if not self:IsCurrent(generation) then return end
+    if self.ButtonConnection then self.ButtonConnection:Disconnect() end
+    self.Runtime = runtime
+    self.DisplayRuntime = runtime
+    self.GUI = runtime.GUI
+    if self.Inputs then
+        for index, input in ipairs(runtime.StatsUI.Inputs) do input.Text = self.Inputs[index] or "" end
+    end
+    local panel = runtime.GUI:FindFirstChild("Panel")
+    runtime.Labels.Title.Size = UDim2.new(1, -112, 0, 22)
+    local button = Instance.new("TextButton")
+    button.Name = "PauseResume"
+    button.Position = UDim2.new(1, -94, 0, 8)
+    button.Size = UDim2.fromOffset(82, 24)
+    button.BorderSizePixel = 0
+    button.Font = Enum.Font.GothamSemibold
+    button.TextSize = 13
+    button.TextColor3 = Color3.fromRGB(235, 235, 235)
+    button.Parent = panel
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = button
+    self.Button = button
+    self.ButtonConnection = button.Activated:Connect(function()
+        if not self:IsCurrent() then return end
+        if self.Paused then
+            self:Resume()
+        else
+            self:Pause()
+        end
+    end)
+    self:Render()
+end
+
+function PauseControl:Run()
+    if not self:IsCurrent() or self.Starting then return end
+    self:CaptureInputs()
+    self.Paused = false
+    self.Starting = true
+    self.Generation = self.Generation + 1
+    local generation = self.Generation
+    self:Render("Starting; checking character and targets...")
+    local ok, result = pcall(runAutoBounty, self, generation)
+    if not self:IsCurrent(generation) then return end
+    self.Starting = false
+    if not ok or not result or not result.Running then
+        self.Paused = true
+        self.PausedAt = os.clock()
+        self.Generation = self.Generation + 1
+        self:StopCurrent("paused")
+        self:Render("Could not resume; " .. tostring(ok and "setup cancelled" or result):sub(1, 100))
+        if not self.GUI then error(result or "AutoBounty setup cancelled", 0) end
+        return
+    end
+    self.Runtime = result
+    self:Render()
+    return result
+end
+
+function PauseControl:Resume()
+    if not self:IsCurrent() or not self.Paused or self.Starting then return end
+    local state = self.Environment.__AutoBountyServerTimeoutState
+    if self.PausedAt and type(state) == "table" and type(state.StartedAt) == "number"
+        and state.PlaceId == game.PlaceId and state.SourceJobId == game.JobId then
+        state.StartedAt = state.StartedAt + math.max(0, os.clock() - self.PausedAt)
+    end
+    self.PausedAt = nil
+    -- Run marks Starting before it yields, so rapid clicks cannot launch duplicate copies.
+    self:Run()
+end
+
+function PauseControl:Dispose()
+    if self.Disposed then return end
+    self.Disposed = true
+    self.Generation = self.Generation + 1
+    self:StopCurrent("reload")
+    if self.ButtonConnection then self.ButtonConnection:Disconnect(); self.ButtonConnection = nil end
+    if self.GUI then self.GUI:Destroy(); self.GUI = nil end
+    if self.Environment.__AutoBountyPauseControl == self then
+        self.Environment.__AutoBountyPauseControl = nil
+    end
+end
+
+do
+    local previous = PauseControl.Environment.__AutoBountyPauseControl
+    if previous and type(previous.Dispose) == "function" then previous:Dispose() end
+end
+PauseControl.Environment.__AutoBountyPauseControl = PauseControl
+return PauseControl:Run()
