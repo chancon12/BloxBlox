@@ -26,6 +26,10 @@ local function runAutoBounty(PauseControl, pauseGeneration)
 -- Settings.HopOnBlockedPlayer defaults to true; hop if a locally blocked account is present.
 -- Settings.EmptyServerIdleTime = 0 keeps the normal 5-second empty grace; positive values replace it.
 -- During that wait, eligible players cancel/reset the countdown and can be chased normally.
+-- A health drop during a positive idle countdown retries the nearest valid player by HRP distance.
+-- This acquisition may bypass previous-target/no-progress/follow-timeout skips; other filters remain.
+-- The exception expires on target release or respawn. Low-health recovery and queued hops take priority.
+-- The ordinary server timeout waits for this defensive acquisition to end; its deadline is retained.
 -- The ordinary server timeout cannot shorten a custom empty wait; other hop reasons keep priority.
 -- Settings.TargetWeaponFilter = {Enabled=true, Ignore={"Portal-Portal"}}; false disables it.
 -- Filters visible Tool names and equipped/unequipped weapon model WeaponName attributes.
@@ -3112,7 +3116,21 @@ local function keepSelectedTargetInSafeZone(player)
     return Runtime.SafeMode or not known or inCombat == true
 end
 
-local function evaluateTarget(player)
+function EmptyServerIdle.IsDamageTarget(player)
+    local retry = EmptyServerIdle.DamageTarget
+    if not retry then return false end
+    if retry.CharacterEpoch ~= Runtime.CharacterEpoch
+        or retry.Player.Parent ~= Players
+        or retry.Player.Character ~= retry.Character
+        or retry.Humanoid.Parent ~= retry.Character
+        or retry.Humanoid.Health <= 0 then
+        EmptyServerIdle.DamageTarget = nil
+        return false
+    end
+    return retry.Player == player
+end
+
+local function evaluateTarget(player, ignoreHistory)
     if not player or player == LocalPlayer or player.Parent ~= Players then
         return false, "self-or-left"
     end
@@ -3126,7 +3144,13 @@ local function evaluateTarget(player)
         return false, "ignored-weapon"
     end
 
-    if SkipPreviousTargets and Runtime.PreviouslyTargeted[player.UserId] then
+    local damageRetry = EmptyServerIdle.IsDamageTarget(player)
+    if (ignoreHistory or damageRetry) and BlockedPlayerCheck.Ids[player.UserId] then
+        return false, "blocked-player"
+    end
+    local bypassHistory = ignoreHistory == true or damageRetry
+
+    if not bypassHistory and SkipPreviousTargets and Runtime.PreviouslyTargeted[player.UserId] then
         return false, "previously-targeted"
     end
 
@@ -3177,7 +3201,7 @@ local function evaluateTarget(player)
 
     local followTimeoutCharacter = Runtime.FollowTimeoutCharacters[player]
 
-    if followTimeoutCharacter then
+    if followTimeoutCharacter and not bypassHistory then
         if followTimeoutCharacter == character then
             return false, "follow-timeout-target"
         end
@@ -3187,7 +3211,7 @@ local function evaluateTarget(player)
 
     local noProgressCharacter = Runtime.NoProgressCharacters[player]
 
-    if noProgressCharacter then
+    if noProgressCharacter and not bypassHistory then
         if noProgressCharacter == character then
             return false, "no-health-progress"
         end
@@ -3405,6 +3429,7 @@ local function resetTargetTimers()
 end
 
 local function clearTarget(reason, markPrevious)
+    EmptyServerIdle.DamageTarget = nil
     Runtime.EngageChasePause = nil
     local ignoredWeapon = TargetWeaponFilter.FindIgnored(Runtime.CurrentTarget)
     local savedReason = SavedTargetFilter.Reason(Runtime.CurrentTarget)
@@ -4165,7 +4190,11 @@ local function setTarget(player, targetInfo, resumeRecovery)
             return false
         end
     else
+        -- clearTarget resets exceptions; carry only this acquisition's matching marker.
+        local damageRetry = EmptyServerIdle.IsDamageTarget(player)
+            and EmptyServerIdle.DamageTarget or nil
         clearTarget()
+        EmptyServerIdle.DamageTarget = damageRetry
     end
 
     Runtime.CurrentTarget = player
@@ -4340,6 +4369,76 @@ local function setTarget(player, targetInfo, resumeRecovery)
     end)
 
     return true
+end
+
+function EmptyServerIdle.CanReactToDamage()
+    return Runtime.Running and bootstrapStillCurrent()
+        and AutoHopEnabled
+        and not Runtime.LocalDead and not Runtime.SafeMode
+        and not Runtime.HopPending and not Runtime.EmptyHopCommitted
+        and not Runtime.WinEntranceAttempt and not Runtime.TargetRecoveryState
+        and Runtime.CurrentTarget == nil
+        and Runtime.EmptySince ~= nil
+        and EmptyServerIdle.IsWaiting()
+end
+
+function EmptyServerIdle.ObserveHealth(health, humanoid, characterEpoch)
+    if not Runtime.Running or not bootstrapStillCurrent()
+        or Runtime.CharacterEpoch ~= characterEpoch or Runtime.Humanoid ~= humanoid
+        or not isFiniteNumber(health) or health <= 0 then
+        return
+    end
+
+    local previous = EmptyServerIdle.HealthSnapshot
+    EmptyServerIdle.HealthSnapshot = {
+        Humanoid = humanoid, CharacterEpoch = characterEpoch,
+        Health = health, MaxHealth = humanoid.MaxHealth,
+    }
+    if not previous or previous.Humanoid ~= humanoid
+        or previous.CharacterEpoch ~= characterEpoch
+        or previous.MaxHealth ~= humanoid.MaxHealth
+        or health >= previous.Health
+        or health <= (Runtime.EffectiveLowHealth or LowHealth)
+        or not EmptyServerIdle.CanReactToDamage() then
+        return
+    end
+
+    -- Confirm the list is still empty; an ordinary eligible arrival needs no exception.
+    local candidates = rebuildCandidates()
+    EmptyServerIdle.Update(candidates)
+    if not EmptyServerIdle.CanReactToDamage() then return end
+
+    local localRoot = Runtime.Root
+    if not localRoot or not localRoot.Parent or not isFiniteVector3(localRoot.Position) then
+        return
+    end
+
+    local nearest, nearestInfo, nearestDistance
+    for _, player in ipairs(Players:GetPlayers()) do
+        local eligible, info = evaluateTarget(player, true)
+        if eligible then
+            local route = getTargetRoute(player, info)
+            if route then
+                local distance = (info.Root.Position - localRoot.Position).Magnitude
+                if not nearest or distance < nearestDistance
+                    or (distance == nearestDistance and player.UserId < nearest.UserId) then
+                    nearest, nearestInfo, nearestDistance = player, info, distance
+                end
+            end
+        end
+    end
+
+    if not nearest or not EmptyServerIdle.CanReactToDamage() then return end
+    EmptyServerIdle.DamageTarget = {
+        Player = nearest, Character = nearestInfo.Character, Humanoid = nearestInfo.Humanoid,
+        CharacterEpoch = characterEpoch,
+    }
+    if setTarget(nearest, nearestInfo) and Runtime.CurrentTarget == nearest then
+        Runtime.EmptySince = nil
+        rebuildCandidates()
+    else
+        EmptyServerIdle.DamageTarget = nil
+    end
 end
 
 local function canAttack(targetEpoch, attackMode, readOnly)
@@ -7527,6 +7626,8 @@ local function handleHealthChanged(health, characterEpoch)
         return
     end
 
+    EmptyServerIdle.ObserveHealth(health, humanoid, characterEpoch)
+
     local effectiveLow = Runtime.EffectiveLowHealth or LowHealth
     local effectiveRecovery = Runtime.EffectiveRecoveryHealth or math.min(RecoveryHealth, humanoid.MaxHealth)
 
@@ -8280,7 +8381,8 @@ function ServerTimeout.StartWorker()
                     -- Refresh before deciding; this worker can run before the target scan.
                     EmptyServerIdle.Update(rebuildCandidates())
                 end
-                if not EmptyServerIdle.IsWaiting() then
+                if not EmptyServerIdle.IsWaiting()
+                    and not EmptyServerIdle.IsDamageTarget(Runtime.CurrentTarget) then
                     local inCombat, inCombatKnown = readLocalInCombat()
                     if inCombatKnown and inCombat == false then
                         ServerTimeout.Pending = true
@@ -8325,7 +8427,8 @@ determineHopReason = function()
         return "empty", "Upward escape started; continuing server hop"
     end
 
-    if ServerTimeout.Pending and ServerTimeout.IsDue() and not EmptyServerIdle.IsWaiting() then
+    if ServerTimeout.Pending and ServerTimeout.IsDue() and not EmptyServerIdle.IsWaiting()
+        and not EmptyServerIdle.IsDamageTarget(Runtime.CurrentTarget) then
         return "server-timeout", "5-minute server timeout"
     end
 
@@ -9262,6 +9365,8 @@ function Runtime:Stop(reason)
     end
 
     self.Running = false
+    EmptyServerIdle.DamageTarget = nil
+    EmptyServerIdle.HealthSnapshot = nil
     self.EngageChasePause = nil
 
     if self.ToolCache then self.ToolCache:Stop() end
