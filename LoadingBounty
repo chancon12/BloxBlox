@@ -394,7 +394,10 @@ Combo = {
         FPSBoostEffectFolders = {""},
 
         Region = "", -- "" = any region
-        ServerHopMode = "Populated",
+        ServerHopMode = "Random",
+        ServerHopPageOrder = "Random", -- or "Random"
+        HopOnBlockedPlayer = true,
+        EmptyServerIdleTime = 0, -- 0 keeps 5-second grace; positive replaces it
         DefaultSkillPressTime = 0,
         SafeModeTweenSpeed = 300,
         SafeModeInitialLift = {
