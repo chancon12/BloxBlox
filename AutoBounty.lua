@@ -1,4 +1,5 @@
--- Pause/Resume shuts down workers and starts a fresh runtime on resume.
+-- Pause/Resume stops bounty workers; the Stats GUI and manual requests remain active.
+-- Resume starts fresh bounty workers while reusing the existing GUI and stat transaction.
 -- Skipped targets and stat input drafts survive; paused time does not count toward the server timeout.
 local function runAutoBounty(PauseControl, pauseGeneration)
 -- GitHub-side Auto Bounty module.
@@ -19,7 +20,13 @@ local function runAutoBounty(PauseControl, pauseGeneration)
 -- Stopping/reloading disconnects FPS watchers; already-applied graphics changes are not restored.
 -- Settings.Region = "Singapore, America" accepts either reported region (case-insensitive substring).
 -- Region = "" or omitted allows any region. Filtered hops use __ServerBrowser region listings.
--- Settings.ServerHopMode = "Populated" (default) or "Random", applied to eligible servers per page.
+-- Settings.ServerHopMode = "Random" (default) or "Populated", applied to eligible servers per page.
+-- Settings.ServerHopPageOrder = "Sequential" (default) or "Random" for numbered browser pages.
+-- Random page order visits each page once per sweep; HTTP listings still follow their cursors.
+-- Settings.HopOnBlockedPlayer defaults to true; hop if a locally blocked account is present.
+-- Settings.EmptyServerIdleTime = 0 keeps the normal 5-second empty grace; positive values replace it.
+-- During that wait, eligible players cancel/reset the countdown and can be chased normally.
+-- The ordinary server timeout cannot shorten a custom empty wait; other hop reasons keep priority.
 -- Settings.TargetWeaponFilter = {Enabled=true, Ignore={"Portal-Portal"}}; false disables it.
 -- Filters visible Tool names and equipped/unequipped weapon model WeaponName attributes.
 -- Low-health recovery keeps the selected target and freezes its no-damage countdown.
@@ -137,7 +144,8 @@ local function runAutoBounty(PauseControl, pauseGeneration)
 -- Empty-target hops rise continuously, lock target selection, and wait for known InCombat=false.
 -- AutoHop orders each fetched page by ServerHopMode, excluding full/current/attempted JobIds.
 -- Region-filtered browser buckets use the existing 1-second page spacing; join retries remain 0.1s.
--- Joining uses ReplicatedStorage.__ServerBrowser:InvokeServer("teleport", JobId).
+-- Place 2753915549 uses Roblox public listings and TeleportService:TeleportToPlaceInstance;
+-- Region is ignored there. Other places retain __ServerBrowser:InvokeServer("teleport", JobId).
 -- There is no minimum player count. Retry another unused JobId every 0.1 seconds while still here.
 -- Public server-list refreshes and failed lookups retain their separate 5-second backoff.
 -- Attempted JobIds and transport locks survive same-server reloads; no external hop script is loaded.
@@ -192,6 +200,9 @@ assert(Settings.Region == nil or type(Settings.Region) == "string",
 assert(Settings.ServerHopMode == nil or Settings.ServerHopMode == "Populated"
     or Settings.ServerHopMode == "Random",
     '[AutoBounty] Settings.ServerHopMode must be "Populated" or "Random"')
+assert(Settings.ServerHopPageOrder == nil or Settings.ServerHopPageOrder == "Sequential"
+    or Settings.ServerHopPageOrder == "Random",
+    '[AutoBounty] Settings.ServerHopPageOrder must be "Sequential" or "Random"')
 local WeaponConfig = type(Config.Weapon) == "table" and Config.Weapon or {}
 local HitboxConfig = type(Settings.Hitbox) == "table" and Settings.Hitbox or {}
 local TweenHitboxConfig = type(Settings.TweenHitbox) == "table" and Settings.TweenHitbox or {}
@@ -388,6 +399,7 @@ local INTERNAL = {
     MaxLevelDifference = 800,
     TargetRefreshInterval = 0.25,
     EmptyListGrace = 5,
+    EmptyServerIdleTime = 0,
     PendingTargetGrace = 8,
     FriendRefreshInterval = 2,
     NonFriendCacheTTL = 300,
@@ -419,6 +431,13 @@ local INTERNAL = {
     ServerTimeout = 300,
     EngageChasePause = {Enabled = false, After = 10, MinDuration = 1, MaxDuration = 2},
 }
+
+do
+    local seconds = tonumber(Settings.EmptyServerIdleTime)
+    if isFiniteNumber(seconds) and seconds > 0 then
+        INTERNAL.EmptyServerIdleTime = seconds
+    end
+end
 
 do
     local configured = Settings.EngageChasePause
@@ -1597,13 +1616,28 @@ do
         },
         Inputs = {},
         Busy = false,
+        Connections = {},
+        Stopped = false,
     }
     Runtime.StatsUI = Stats
 
     function Stats.IsCurrent()
-        return Runtime.Running and bootstrapStillCurrent()
-            and Environment.__AutoBountyRuntime == Runtime
-            and Runtime.GUI ~= nil and Runtime.GUI.Parent ~= nil
+        return not Stats.Stopped and PauseControl:IsCurrent()
+            and PauseControl.StatsUI == Stats
+            and Stats.GUI ~= nil and Stats.GUI.Parent ~= nil
+    end
+
+    function Stats.Connect(signal, callback)
+        local connection = signal:Connect(function(...)
+            if Stats.IsCurrent() then callback(...) end
+        end)
+        table.insert(Stats.Connections, connection)
+        return connection
+    end
+
+    function Stats.Stop()
+        Stats.Stopped = true
+        disconnectConnections(Stats.Connections)
     end
 
     function Stats.GetPoints()
@@ -1736,6 +1770,8 @@ do
     end
 
     function Stats.Build(panel)
+        Stats.GUI = Runtime.GUI
+        PauseControl.StatsUI = Stats
         local function button(name, text, position, size)
             local control = Instance.new("TextButton")
             control.Name = name
@@ -1787,8 +1823,8 @@ do
             active.BackgroundColor3 = Color3.fromRGB(55, 95, 155)
             if showStats then Stats.RefreshPoints() end
         end
-        connect(statusTab.Activated, function() selectTab(false) end)
-        connect(statsTab.Activated, function() selectTab(true) end)
+        Stats.Connect(statusTab.Activated, function() selectTab(false) end)
+        Stats.Connect(statsTab.Activated, function() selectTab(true) end)
 
         Stats.PointsLabel = createTextLabel(statsPage, "Points", UDim2.fromOffset(0, 0),
             UDim2.new(1, 0, 0, 20), "Unspent points: Loading...", 14)
@@ -1822,7 +1858,7 @@ do
         Stats.StatusLabel.TextTruncate = Enum.TextTruncate.AtEnd
         Stats.StatusLabel.TextYAlignment = Enum.TextYAlignment.Top
         Stats.StatusLabel.TextColor3 = Color3.fromRGB(130, 200, 255)
-        connect(Stats.ApplyButton.Activated, Stats.Apply)
+        Stats.Connect(Stats.ApplyButton.Activated, Stats.Apply)
         selectTab(false)
     end
 end
@@ -1838,6 +1874,20 @@ local function createGUI()
         or Environment.__AutoBountyRuntime ~= Runtime then
         return false
     end
+
+    -- The Stats controller belongs to the GUI, not to a bounty-worker generation.
+    -- Reuse it so pausing/resuming cannot cancel or duplicate a manual stat request.
+    local displayed = PauseControl.DisplayRuntime
+    if displayed and PauseControl.GUI and PauseControl.GUI.Parent == playerGui
+        and PauseControl.StatsUI and PauseControl.StatsUI.IsCurrent() then
+        Runtime.GUI = PauseControl.GUI
+        Runtime.Labels = displayed.Labels
+        Runtime.StatsUI = PauseControl.StatsUI
+        PauseControl:Attach(Runtime, pauseGeneration, true)
+        SavedBounty.UpdateGUI()
+        return true
+    end
+    if PauseControl.StatsUI then PauseControl.StatsUI.Stop() end
     local oldGui = playerGui:FindFirstChild("AutoBountyStatus")
 
     if oldGui then
@@ -1917,13 +1967,46 @@ local function setStatus(status)
     end
 end
 
-local function isEmptyListHopReady()
+local EmptyServerIdle = {}
+
+function EmptyServerIdle.Duration()
+    return INTERNAL.EmptyServerIdleTime > 0
+        and INTERNAL.EmptyServerIdleTime or INTERNAL.EmptyListGrace
+end
+
+function EmptyServerIdle.InputsReady()
     return Runtime.SafeZonesFolder ~= nil
         and Runtime.SafeZonesFolder.Parent ~= nil
         and Runtime.SafeZonesReady
         and Runtime.FriendAuditComplete
+end
+
+function EmptyServerIdle.Update(candidates)
+    if Runtime.CurrentTarget or not EmptyServerIdle.InputsReady()
+        or #candidates > 0 or Runtime.PendingCandidateCount > 0 then
+        Runtime.EmptySince = nil
+    elseif not Runtime.LocalDead and not Runtime.SafeMode
+        and not Runtime.EmptySince then
+        Runtime.EmptySince = os.clock()
+    end
+end
+
+function EmptyServerIdle.IsWaiting()
+    return INTERNAL.EmptyServerIdleTime > 0
+        and not Runtime.CurrentTarget
+        and not Runtime.EmptyHopCommitted
+        and EmptyServerIdle.InputsReady()
+        and #Runtime.Candidates == 0
+        and Runtime.PendingCandidateCount == 0
+        and (Runtime.EmptySince == nil
+            or os.clock() - Runtime.EmptySince < EmptyServerIdle.Duration())
+end
+
+local function isEmptyListHopReady()
+    return EmptyServerIdle.InputsReady()
+        and Runtime.CurrentTarget == nil
         and Runtime.EmptySince ~= nil
-        and os.clock() - Runtime.EmptySince >= INTERNAL.EmptyListGrace
+        and os.clock() - Runtime.EmptySince >= EmptyServerIdle.Duration()
         and #Runtime.Candidates == 0
         and Runtime.PendingCandidateCount == 0
 end
@@ -2587,6 +2670,130 @@ local function findFriendInServer()
     end
 
     return nil
+end
+
+local BlockedPlayerCheck = {
+    Enabled = Settings.HopOnBlockedPlayer ~= false,
+    Ids = {},
+    Revision = 0,
+    NextRefreshAt = 0,
+    Refreshing = false,
+    Hooks = {},
+    Started = false,
+}
+
+function BlockedPlayerCheck.StillCurrent()
+    return Runtime.Running and bootstrapStillCurrent()
+end
+
+function BlockedPlayerCheck.UserId(value)
+    if typeof(value) == "Instance" and value:IsA("Player") then
+        value = value.UserId
+    end
+    if isFiniteNumber(value) and value > 0 and value % 1 == 0 then
+        return value
+    end
+    return nil
+end
+
+-- This lookup is cached and never yields, including when a queued hop is rechecked.
+function BlockedPlayerCheck.FindPresent()
+    if not BlockedPlayerCheck.Enabled or not AutoHopEnabled
+        or not BlockedPlayerCheck.StillCurrent() then
+        return nil
+    end
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Parent == Players
+            and BlockedPlayerCheck.Ids[player.UserId] then
+            return player
+        end
+    end
+    return nil
+end
+
+function BlockedPlayerCheck.CheckPresent()
+    local player = BlockedPlayerCheck.FindPresent()
+    if player and requestHop
+        and not (Runtime.HopPending and Runtime.HopReason == "blocked-player") then
+        requestHop("blocked-player", player.Name)
+    end
+end
+
+function BlockedPlayerCheck.Refresh()
+    if not BlockedPlayerCheck.Enabled or not AutoHopEnabled
+        or not BlockedPlayerCheck.StillCurrent() or BlockedPlayerCheck.Refreshing
+        or os.clock() < BlockedPlayerCheck.NextRefreshAt then
+        return
+    end
+
+    BlockedPlayerCheck.Refreshing = true
+    local revision = BlockedPlayerCheck.Revision
+    local success, ids = pcall(function()
+        return game:GetService("StarterGui"):GetCore("GetBlockedUserIds")
+    end)
+    BlockedPlayerCheck.Refreshing = false
+    if not BlockedPlayerCheck.StillCurrent() then return end
+
+    -- A block/unblock event during GetCore is newer than the returned snapshot.
+    if success and type(ids) == "table" and revision == BlockedPlayerCheck.Revision then
+        local nextIds = {}
+        for _, value in pairs(ids) do
+            local userId = BlockedPlayerCheck.UserId(value)
+            if userId then nextIds[userId] = true end
+        end
+        BlockedPlayerCheck.Ids = nextIds
+        BlockedPlayerCheck.NextRefreshAt = os.clock() + 30
+        BlockedPlayerCheck.CheckPresent()
+    else
+        -- Core scripts may not have registered GetCore yet; preserve known IDs.
+        BlockedPlayerCheck.NextRefreshAt = os.clock() + 1
+    end
+end
+
+function BlockedPlayerCheck.TryHook(coreName, blocked)
+    if not BlockedPlayerCheck.StillCurrent() or BlockedPlayerCheck.Hooks[coreName] then
+        return
+    end
+    local success, event = pcall(function()
+        return game:GetService("StarterGui"):GetCore(coreName)
+    end)
+    if not BlockedPlayerCheck.StillCurrent() then return end
+    if not success or typeof(event) ~= "Instance" or not event:IsA("BindableEvent") then
+        return
+    end
+
+    BlockedPlayerCheck.Hooks[coreName] = connect(event.Event, function(value)
+        if not BlockedPlayerCheck.StillCurrent() then return end
+        BlockedPlayerCheck.Revision = BlockedPlayerCheck.Revision + 1
+        local userId = BlockedPlayerCheck.UserId(value)
+        if userId then
+            BlockedPlayerCheck.Ids[userId] = blocked and true or nil
+            BlockedPlayerCheck.CheckPresent()
+        end
+        BlockedPlayerCheck.NextRefreshAt = 0
+    end)
+end
+
+function BlockedPlayerCheck.StartWorker()
+    if BlockedPlayerCheck.Started or not BlockedPlayerCheck.Enabled or not AutoHopEnabled
+        or not BlockedPlayerCheck.StillCurrent() then
+        return
+    end
+    BlockedPlayerCheck.Started = true
+    connect(Players.PlayerAdded, function()
+        if not BlockedPlayerCheck.StillCurrent() then return end
+        BlockedPlayerCheck.CheckPresent()
+        BlockedPlayerCheck.NextRefreshAt = 0
+    end)
+    task.spawn(function()
+        while BlockedPlayerCheck.StillCurrent() do
+            BlockedPlayerCheck.TryHook("PlayerBlockedEvent", true)
+            BlockedPlayerCheck.TryHook("PlayerUnblockedEvent", false)
+            BlockedPlayerCheck.Refresh()
+            BlockedPlayerCheck.CheckPresent()
+            task.wait(1)
+        end
+    end)
 end
 
 local function getTargetRoute(player, info, preferEntrance)
@@ -8069,11 +8276,17 @@ function ServerTimeout.StartWorker()
                 and not Runtime.LocalDead
                 and not Runtime.WinEntranceAttempt then
 
-                local inCombat, inCombatKnown = readLocalInCombat()
-                if inCombatKnown and inCombat == false then
-                    ServerTimeout.Pending = true
-                    if not requestHop("server-timeout", "5-minute server timeout") then
-                        ServerTimeout.Pending = false
+                if INTERNAL.EmptyServerIdleTime > 0 then
+                    -- Refresh before deciding; this worker can run before the target scan.
+                    EmptyServerIdle.Update(rebuildCandidates())
+                end
+                if not EmptyServerIdle.IsWaiting() then
+                    local inCombat, inCombatKnown = readLocalInCombat()
+                    if inCombatKnown and inCombat == false then
+                        ServerTimeout.Pending = true
+                        if not requestHop("server-timeout", "5-minute server timeout") then
+                            ServerTimeout.Pending = false
+                        end
                     end
                 end
             end
@@ -8098,6 +8311,11 @@ determineHopReason = function()
         return "friend", friend.Name
     end
 
+    local blockedPlayer = BlockedPlayerCheck.FindPresent()
+    if blockedPlayer then
+        return "blocked-player", blockedPlayer.Name .. " (" .. tostring(blockedPlayer.UserId) .. ")"
+    end
+
     local savedAccount = SavedAccountCheck.FindPresent()
     if savedAccount then
         return "saved-account", savedAccount.Name .. " (" .. tostring(savedAccount.UserId) .. ")"
@@ -8107,7 +8325,7 @@ determineHopReason = function()
         return "empty", "Upward escape started; continuing server hop"
     end
 
-    if ServerTimeout.Pending and ServerTimeout.IsDue() then
+    if ServerTimeout.Pending and ServerTimeout.IsDue() and not EmptyServerIdle.IsWaiting() then
         return "server-timeout", "5-minute server timeout"
     end
 
@@ -8128,18 +8346,25 @@ local HOP_PRIORITY = {
     ["server-timeout"] = 1,
     ["saved-account"] = 2,
     friend = 3,
+    ["blocked-player"] = 3,
     ["bounty-loss"] = 4,
 }
 
 local PublicHop = {
     PlaceId = game.PlaceId,
     SourceJobId = game.JobId,
-    SelectionMode = Settings.ServerHopMode or "Populated",
+    UseRobloxTeleport = game.PlaceId == 2753915549,
+    SelectionMode = Settings.ServerHopMode or "Random",
+    PageOrder = Settings.ServerHopPageOrder or "Sequential",
+    ServerRandom = Random.new(),
+    PageRandom = Random.new(),
     Servers = {},
     Cursor = nil,
     SeenCursors = {},
     Finished = false,
     BrowserPage = 1,
+    BrowserPageIndex = 1,
+    BrowserPages = {},
     Regions = {},
     RegionLabel = "",
     RegionFiltered = false,
@@ -8160,7 +8385,24 @@ function PublicHop.ConfigureRegions(value)
     end
     PublicHop.Regions = regions
     PublicHop.RegionLabel = table.concat(labels, ", ")
-    PublicHop.RegionFiltered = #regions > 0
+    -- Roblox's public listing has no region field to apply this filter to.
+    PublicHop.RegionFiltered = not PublicHop.UseRobloxTeleport and #regions > 0
+end
+
+function PublicHop.ResetBrowserPages()
+    local pages = {}
+    for page = 1, INTERNAL.ServerBrowserPages do
+        pages[page] = page
+    end
+    if PublicHop.PageOrder == "Random" then
+        for index = #pages, 2, -1 do
+            local other = PublicHop.PageRandom:NextInteger(1, index)
+            pages[index], pages[other] = pages[other], pages[index]
+        end
+    end
+    PublicHop.BrowserPages = pages
+    PublicHop.BrowserPageIndex = 1
+    PublicHop.BrowserPage = pages[1]
 end
 
 function PublicHop.RegionMatches(region)
@@ -8302,13 +8544,14 @@ function PublicHop.CancelSearch()
     PublicHop.Cursor = nil
     PublicHop.SeenCursors = {}
     PublicHop.Finished = false
-    PublicHop.BrowserPage = 1
+    PublicHop.ResetBrowserPages()
     -- Actual yielding server-list/teleport calls retain their shared locks until they return.
     -- UsedJobs and retry timing also survive cancelled episodes and same-server reloads.
 end
 
 function PublicHop.Initialize()
     PublicHop.ConfigureRegions(Settings.Region)
+    PublicHop.ResetBrowserPages()
     local state = Environment.__AutoBountyPublicHopState
     if type(state) ~= "table"
         or state.PlaceId ~= PublicHop.PlaceId
@@ -8386,6 +8629,7 @@ function PublicHop.BeginPage(context)
         Context = context,
         Cursor = PublicHop.Cursor,
         BrowserPage = browserPage,
+        BrowserPageIndex = browserPage and PublicHop.BrowserPageIndex or nil,
         StartedAt = os.clock(),
         Deadline = os.clock() + INTERNAL.PublicServerRequestTimeout,
         Cancelled = false,
@@ -8394,8 +8638,8 @@ function PublicHop.BeginPage(context)
     Runtime.HopSearch = search
     -- Share the existing lookup lock across HTTP and browser RPCs, including reloads.
     state.HttpCall = search
-    setStatus(browserPage and string.format("Finding regions: %s (%d/%d)",
-        PublicHop.RegionLabel, browserPage, INTERNAL.ServerBrowserPages)
+    setStatus(browserPage and string.format("Finding regions: %s (page %d; %d/%d)",
+        PublicHop.RegionLabel, browserPage, PublicHop.BrowserPageIndex, INTERNAL.ServerBrowserPages)
         or "Finding public servers with available slots")
 
     task.spawn(function()
@@ -8527,7 +8771,7 @@ function PublicHop.AcceptPage(search)
     if PublicHop.SelectionMode == "Random" then
         -- Shuffle only the filtered page; retries consume this order without repeating JobIds.
         for index = #servers, 2, -1 do
-            local other = math.random(1, index)
+            local other = PublicHop.ServerRandom:NextInteger(1, index)
             servers[index], servers[other] = servers[other], servers[index]
         end
     else
@@ -8544,8 +8788,9 @@ function PublicHop.AcceptPage(search)
     PublicHop.Cursor = cursor
     if search.BrowserPage then
         -- Empty buckets are valid; the browser reads all 100, not just until the first empty one.
-        PublicHop.BrowserPage = search.BrowserPage + 1
-        PublicHop.Finished = search.BrowserPage >= INTERNAL.ServerBrowserPages
+        PublicHop.BrowserPageIndex = search.BrowserPageIndex + 1
+        PublicHop.Finished = PublicHop.BrowserPageIndex > #PublicHop.BrowserPages
+        PublicHop.BrowserPage = PublicHop.BrowserPages[PublicHop.BrowserPageIndex]
     else
         PublicHop.Finished = cursor == nil
     end
@@ -8576,7 +8821,7 @@ function PublicHop.Dispatch(server, context)
         or os.clock() < state.NextAttemptAt or not PublicHop.Validate(context) then
         return false
     end
-    if not PublicHop.GetBrowser() then
+    if not PublicHop.UseRobloxTeleport and not PublicHop.GetBrowser() then
         return false
     end
 
@@ -8598,8 +8843,11 @@ function PublicHop.Dispatch(server, context)
         end
 
         -- Resolve again after task scheduling so a replaced remote is not retained.
-        local browser = PublicHop.GetBrowser()
-        if not browser then
+        local browser
+        if not PublicHop.UseRobloxTeleport then
+            browser = PublicHop.GetBrowser()
+        end
+        if not PublicHop.UseRobloxTeleport and not browser then
             attempt.Cancelled = true
             attempt.Returned = true
             if state.TeleportCall == attempt then
@@ -8619,6 +8867,9 @@ function PublicHop.Dispatch(server, context)
             server.Playing, server.MaxPlayers))
 
         local ok, err = pcall(function()
+            if PublicHop.UseRobloxTeleport then
+                return TeleportService:TeleportToPlaceInstance(PublicHop.PlaceId, attempt.JobId, LocalPlayer)
+            end
             return browser:InvokeServer("teleport", attempt.JobId)
         end)
         attempt.Returned = true
@@ -8699,7 +8950,7 @@ function PublicHop.Tick(context)
         PublicHop.Cursor = nil
         PublicHop.SeenCursors = {}
         PublicHop.Finished = false
-        PublicHop.BrowserPage = 1
+        PublicHop.ResetBrowserPages()
         setStatus(PublicHop.RegionFiltered
             and ("No untried matching servers for " .. PublicHop.RegionLabel .. "; refreshing in 5 seconds")
             or "No untried servers in this list; refreshing every 5 seconds")
@@ -8969,21 +9220,7 @@ local function startTargetWorker()
                     end
                 end
 
-                local emptyInputsReady = Runtime.FriendAuditComplete
-                    and Runtime.SafeZonesFolder ~= nil
-                    and Runtime.SafeZonesFolder.Parent ~= nil
-                    and Runtime.SafeZonesReady
-                local listIsEmpty = #candidates == 0
-                    and Runtime.PendingCandidateCount == 0
-
-                if Runtime.CurrentTarget or not emptyInputsReady or not listIsEmpty then
-                    Runtime.EmptySince = nil
-                elseif not Runtime.LocalDead
-                    and not Runtime.SafeMode
-                    and not Runtime.EmptySince then
-
-                    Runtime.EmptySince = os.clock()
-                end
+                EmptyServerIdle.Update(candidates)
 
                 if not Runtime.LocalDead and not Runtime.SafeMode and not Runtime.HopPending
                     and not Runtime.EmptyHopCommitted then
@@ -9005,7 +9242,7 @@ local function startTargetWorker()
                         local elapsed = Runtime.EmptySince
                             and (os.clock() - Runtime.EmptySince)
                             or 0
-                        setStatus(string.format("No eligible players; hop check in %.1fs", math.max(INTERNAL.EmptyListGrace - elapsed, 0)))
+                        setStatus(string.format("No eligible players; hop check in %.1fs", math.max(EmptyServerIdle.Duration() - elapsed, 0)))
 
                         if isEmptyListHopReady() then
                             requestHop("empty", "No eligible players")
@@ -9097,6 +9334,9 @@ function Runtime:Stop(reason)
         self.BountyConnection = nil
     end
 
+    if reason ~= "paused" and self.StatsUI then
+        self.StatsUI.Stop()
+    end
     if self.GUI and reason ~= "paused" then
         pcall(function()
             self.GUI:Destroy()
@@ -9136,6 +9376,7 @@ do
         end
     end
 end
+BlockedPlayerCheck.StartWorker()
 startFriendWorker()
 startMovementWorker()
 startWeaponWorker()
@@ -9181,7 +9422,7 @@ end
 function PauseControl:Render(message)
     if not self:IsCurrent() then return end
     if self.Button and self.Button.Parent then
-        self.Button.Text = self.Paused and "Resume" or "Pause"
+        self.Button.Text = self.Paused and "Resume bounty" or "Pause bounty"
         self.Button.BackgroundColor3 = self.Paused and Color3.fromRGB(45, 120, 80)
             or Color3.fromRGB(125, 70, 45)
     end
@@ -9189,16 +9430,6 @@ function PauseControl:Render(message)
     if runtime and runtime.GUI and runtime.GUI.Parent then
         local status = runtime.Labels.Status
         if status and message then status.Text = "Status: " .. message end
-        local stats = runtime.StatsUI
-        if stats and stats.ApplyButton then
-            local active = runtime.Running and not self.Paused and not self.Starting and not stats.Busy
-            stats.ApplyButton.Active = active
-            stats.ApplyButton.AutoButtonColor = active
-            if not runtime.Running then
-                stats.ApplyButton.Text = "Paused"
-                stats.StatusLabel.Text = "Resume before applying stats. Your inputs are kept."
-            end
-        end
     end
 end
 
@@ -9240,27 +9471,31 @@ function PauseControl:Pause()
     end
     self:CaptureInputs()
     self:StopCurrent("paused")
-    self:Render("Paused — all automation stopped")
+    self:Render("Bounty paused; Stats still available")
 end
 
-function PauseControl:Attach(runtime, generation)
+function PauseControl:Attach(runtime, generation, reuseGUI)
     if not self:IsCurrent(generation) then return end
-    if self.ButtonConnection then self.ButtonConnection:Disconnect() end
     self.Runtime = runtime
     self.DisplayRuntime = runtime
     self.GUI = runtime.GUI
-    if self.Inputs then
+    if reuseGUI and self.Button and self.Button.Parent then
+        self:Render()
+        return
+    end
+    if self.ButtonConnection then self.ButtonConnection:Disconnect() end
+    if self.Inputs and not reuseGUI then
         for index, input in ipairs(runtime.StatsUI.Inputs) do input.Text = self.Inputs[index] or "" end
     end
     local panel = runtime.GUI:FindFirstChild("Panel")
-    runtime.Labels.Title.Size = UDim2.new(1, -112, 0, 22)
+    runtime.Labels.Title.Size = UDim2.new(1, -136, 0, 22)
     local button = Instance.new("TextButton")
     button.Name = "PauseResume"
-    button.Position = UDim2.new(1, -94, 0, 8)
-    button.Size = UDim2.fromOffset(82, 24)
+    button.Position = UDim2.new(1, -118, 0, 8)
+    button.Size = UDim2.fromOffset(106, 24)
     button.BorderSizePixel = 0
     button.Font = Enum.Font.GothamSemibold
-    button.TextSize = 13
+    button.TextSize = 12
     button.TextColor3 = Color3.fromRGB(235, 235, 235)
     button.Parent = panel
     local corner = Instance.new("UICorner")
@@ -9319,6 +9554,7 @@ function PauseControl:Dispose()
     if self.Disposed then return end
     self.Disposed = true
     self.Generation = self.Generation + 1
+    if self.StatsUI then self.StatsUI.Stop() end
     self:StopCurrent("reload")
     if self.ButtonConnection then self.ButtonConnection:Disconnect(); self.ButtonConnection = nil end
     if self.GUI then self.GUI:Destroy(); self.GUI = nil end
