@@ -399,6 +399,7 @@ Combo = {
         ServerHopPageOrder = "Random", -- or "Random"
         HopOnBlockedPlayer = true,
         EmptyServerIdleTime = 60, -- 0 keeps 5-second grace; positive replaces it
+        EmptyServerIdleY = 2000,
         DefaultSkillPressTime = 0,
         SafeModeTweenSpeed = 300,
         SafeModeInitialLift = {
