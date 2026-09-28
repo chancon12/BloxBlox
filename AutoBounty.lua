@@ -26,6 +26,10 @@ local function runAutoBounty(PauseControl, pauseGeneration)
 -- Settings.HopOnBlockedPlayer defaults to true; hop if a locally blocked account is present.
 -- Settings.EmptyServerIdleTime = 0 keeps the normal 5-second empty grace; positive values replace it.
 -- During that wait, eligible players cancel/reset the countdown and can be chased normally.
+-- Settings.EmptyServerIdleY defaults to absolute world Y=2000. Empty idle moves there at TweenSpeed,
+-- keeping its starting X/Z; a returning candidate cancels the idle tween before target preparation.
+-- Invalid/omitted heights use 2000; heights below the sea floor are clamped to that floor (Y=0).
+-- The idle timer runs during the climb. With AutoHop enabled, expiry starts the existing committed hop escape.
 -- With no normally eligible targets and confirmed Character.InCombat=true, chase the nearest living player.
 -- This temporary combat fallback bypasses all target exclusions and distance limits; it requires no
 -- health drop, idle timer, or AutoHop. It ends when combat clears or the target/character changes.
@@ -408,6 +412,7 @@ local INTERNAL = {
     TargetRefreshInterval = 0.25,
     EmptyListGrace = 5,
     EmptyServerIdleTime = 0,
+    EmptyServerIdleY = 2000,
     PendingTargetGrace = 8,
     FriendRefreshInterval = 2,
     NonFriendCacheTTL = 300,
@@ -444,6 +449,10 @@ do
     local seconds = tonumber(Settings.EmptyServerIdleTime)
     if isFiniteNumber(seconds) and seconds > 0 then
         INTERNAL.EmptyServerIdleTime = seconds
+    end
+    local height = tonumber(Settings.EmptyServerIdleY)
+    if isFiniteNumber(height) then
+        INTERNAL.EmptyServerIdleY = math.max(height, INTERNAL.MinimumTweenY)
     end
 end
 
@@ -2073,6 +2082,7 @@ function EmptyServerIdle.Update(candidates)
     if Runtime.CurrentTarget or not EmptyServerIdle.InputsReady()
         or #candidates > 0 or Runtime.PendingCandidateCount > 0 then
         Runtime.EmptySince = nil
+        EmptyServerIdle.StopMovement()
     elseif not Runtime.LocalDead and not Runtime.SafeMode
         and not Runtime.EmptySince then
         Runtime.EmptySince = os.clock()
@@ -3466,6 +3476,20 @@ local function stopEmptyHopMovement()
     end
 end
 
+function EmptyServerIdle.StopMovement()
+    local movement = EmptyServerIdle.Movement
+    EmptyServerIdle.Movement = nil
+    if not movement then return end
+
+    if movement.Tween then
+        movement.Tween:Cancel()
+        if Runtime.ActiveTween == movement.Tween then
+            Runtime.ActiveTween = nil
+        end
+    end
+    restoreLocalCollision()
+end
+
 local function stopSafeModeMovement()
     local entrance = Runtime.SafeModeEntrance
     Runtime.SafeModeEntrance = nil
@@ -3505,6 +3529,7 @@ local function stopSafeModeMovement()
 end
 
 local function resetTargetTimers()
+    EmptyServerIdle.StopMovement()
     if not Runtime.Running or Runtime.LocalDead or not Runtime.HopPending then
         stopEmptyHopMovement()
     end
@@ -4791,6 +4816,58 @@ local function AutoTween(goalCFrame, deltaTime, insideHitbox, timeMultiplier, sp
         { CFrame = safeGoalCFrame }
     )
     Runtime.ActiveTween:Play()
+end
+
+function EmptyServerIdle.CanMove()
+    return Runtime.Running and bootstrapStillCurrent()
+        and not Runtime.CurrentTarget and Runtime.EmptySince ~= nil
+        and not Runtime.LocalDead and not Runtime.SafeMode
+        and not Runtime.HopPending and not Runtime.EmptyHopCommitted and not Runtime.Teleporting
+        and not Runtime.TargetRecoveryState and not Runtime.WinEntranceAttempt
+        and EmptyServerIdle.InputsReady()
+        and #Runtime.Candidates == 0 and Runtime.PendingCandidateCount == 0
+end
+
+function EmptyServerIdle.UpdateMovement(deltaTime)
+    local character, humanoid, root = Runtime.Character, Runtime.Humanoid, Runtime.Root
+    if not EmptyServerIdle.CanMove()
+        or not character or character ~= LocalPlayer.Character or not character.Parent
+        or not humanoid or humanoid.Parent ~= character or humanoid.Health <= 0
+        or not root or not root.Parent or not root:IsA("BasePart")
+        or not root:IsDescendantOf(character) or not isFiniteVector3(root.Position) then
+
+        EmptyServerIdle.StopMovement()
+        return false
+    end
+
+    local movement = EmptyServerIdle.Movement
+    if not movement or movement.Root ~= root or movement.CharacterEpoch ~= Runtime.CharacterEpoch then
+        EmptyServerIdle.StopMovement()
+        stopSeaHeightMovement()
+        if Runtime.ActiveTween then
+            Runtime.ActiveTween:Cancel()
+            Runtime.ActiveTween = nil
+        end
+
+        local position = root.Position
+        local goal = clampCFrameAboveSea(CFrame.new(position.X, INTERNAL.EmptyServerIdleY, position.Z)
+            * root.CFrame.Rotation)
+        if not goal then return false end
+        movement = {Root = root, CharacterEpoch = Runtime.CharacterEpoch, Goal = goal}
+        EmptyServerIdle.Movement = movement
+    end
+
+    applyLocalNoClip()
+    -- One tween owns this fixed goal; avoid cancelling/restarting it every Heartbeat.
+    if movement.Tween and Runtime.ActiveTween == movement.Tween
+        and movement.Tween.PlaybackState == Enum.PlaybackState.Playing then
+        return true
+    end
+    if (root.Position - movement.Goal.Position).Magnitude > 0.5 then
+        AutoTween(movement.Goal, deltaTime, false)
+        movement.Tween = Runtime.ActiveTween
+    end
+    return true
 end
 
 function Runtime.MoveToTargetGoal(goalCFrame, deltaTime, insideHitbox, timeMultiplier, useCFrame)
@@ -7941,8 +8018,13 @@ local function startMovementWorker()
 
     connect(RunService.Heartbeat, function(deltaTime)
         if not Runtime.Running then
+            EmptyServerIdle.StopMovement()
             stopSeaHeightMovement()
             return
+        end
+
+        if EmptyServerIdle.Movement and not EmptyServerIdle.CanMove() then
+            EmptyServerIdle.StopMovement()
         end
 
         local fallbackTarget = CombatFallback.Target
@@ -8025,6 +8107,7 @@ local function startMovementWorker()
 
         if not player then
             stopSeaHeightMovement()
+            EmptyServerIdle.UpdateMovement(deltaTime)
             return
         end
 
@@ -9506,12 +9589,13 @@ local function startTargetWorker()
                     elseif Runtime.PendingCandidateCount > 0 then
                         setStatus("Waiting for player data or respawn")
                     elseif not AutoHopEnabled then
-                        setStatus("No eligible players; AutoHop disabled")
+                        setStatus(string.format("Empty idle: Y %.1f; AutoHop disabled", INTERNAL.EmptyServerIdleY))
                     else
                         local elapsed = Runtime.EmptySince
                             and (os.clock() - Runtime.EmptySince)
                             or 0
-                        setStatus(string.format("No eligible players; hop check in %.1fs", math.max(EmptyServerIdle.Duration() - elapsed, 0)))
+                        setStatus(string.format("Empty idle: Y %.1f; hop check in %.1fs",
+                            INTERNAL.EmptyServerIdleY, math.max(EmptyServerIdle.Duration() - elapsed, 0)))
 
                         if isEmptyListHopReady() then
                             requestHop("empty", "No eligible players")
