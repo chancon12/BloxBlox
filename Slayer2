@@ -258,15 +258,15 @@ local function startAFKResourceMonitor()
     			Icon = "rbxassetid://87183725793362",
     		},
     		{
-    			Name = "Coin Pouch",
+    			Name = "Pouch",
     			Icon = "rbxassetid://126473769642414",
     		},
     		{
-    			Name = "Metal Scraps",
+    			Name = "Metal",
     			Icon = "rbxassetid://129731726532959",
     		},
     		{
-    			Name = "Silk Thread",
+    			Name = "SilK",
     			Icon = "rbxassetid://86755077727133",
     		},
     	},
