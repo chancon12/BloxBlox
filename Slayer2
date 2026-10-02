@@ -250,23 +250,26 @@ local function startAFKResourceMonitor()
     	PlayerName = "",
     	RefreshSeconds = 0.5,
     	DisplayOrder = 2147483647,
-    	RightControlHoldDelay = 60,
 
     	Items = {
     		{
-    			Name = "Ore",
+    			Name = "Ore", -- Exact inventory data name.
+    			DisplayName = "Ore", -- Text shown in the GUI.
     			Icon = "rbxassetid://87183725793362",
     		},
     		{
-    			Name = "Pouch",
+    			Name = "Coin Pouch", -- Exact inventory data name.
+    			DisplayName = "Pounch", -- Text shown in the GUI.
     			Icon = "rbxassetid://126473769642414",
     		},
     		{
-    			Name = "Metal",
+    			Name = "Metal Scraps", -- Exact inventory data name.
+    			DisplayName = "Metal", -- Text shown in the GUI.
     			Icon = "rbxassetid://129731726532959",
     		},
     		{
-    			Name = "SilK",
+    			Name = "Silk Thread", -- Exact inventory data name.
+    			DisplayName = "SilK", -- Text shown in the GUI.
     			Icon = "rbxassetid://86755077727133",
     		},
     	},
@@ -349,7 +352,7 @@ local function startAFKResourceMonitor()
     end
 
     local targetName = CONFIG.PlayerName ~= "" and CONFIG.PlayerName or localPlayer.Name
-    debugPrint("AFK", "Monitoring =", targetName, "RefreshSeconds =", CONFIG.RefreshSeconds, "RightControlHoldDelay =", CONFIG.RightControlHoldDelay)
+    debugPrint("AFK", "Monitoring =", targetName, "RefreshSeconds =", CONFIG.RefreshSeconds)
 
     local function findProfile()
     	local playerService = ReplicatedStorage:FindFirstChild("Player_Service")
@@ -554,6 +557,14 @@ local function startAFKResourceMonitor()
     	VerticalAlignment = Enum.VerticalAlignment.Center,
     }, cardsHolder)
 
+    local function getItemDisplayName(itemConfig)
+        local displayName = itemConfig.DisplayName
+        if type(displayName) == "string" and displayName ~= "" then
+            return displayName
+        end
+        return itemConfig.Name
+    end
+
     local itemLabels = {}
 
     for index, itemConfig in ipairs(CONFIG.Items) do
@@ -600,7 +611,7 @@ local function startAFKResourceMonitor()
     		Font = Enum.Font.GothamBold,
     		Position = UDim2.fromScale(0.5, 0.96),
     		Size = UDim2.fromScale(0.94, 0.21),
-    		Text = itemConfig.Name .. " - x0",
+    		Text = getItemDisplayName(itemConfig) .. " - x0",
     		TextColor3 = COLORS.Cream,
     		TextScaled = true,
     		TextStrokeColor3 = COLORS.Black,
@@ -699,7 +710,7 @@ local function startAFKResourceMonitor()
     	title.Text = targetName .. " - Loading..."
 
     	for index, itemConfig in ipairs(CONFIG.Items) do
-    		itemLabels[index].Text = itemConfig.Name .. " - x0"
+    		itemLabels[index].Text = getItemDisplayName(itemConfig) .. " - x0"
     	end
 
     	wenLabel.Text = "Wen - 0"
@@ -720,7 +731,7 @@ local function startAFKResourceMonitor()
 
     	for index, itemConfig in ipairs(CONFIG.Items) do
     		local total = readItemTotal(slot, itemConfig.Name)
-    		itemLabels[index].Text = itemConfig.Name .. " - x" .. formatNumber(total)
+    		itemLabels[index].Text = getItemDisplayName(itemConfig) .. " - x" .. formatNumber(total)
     	end
 
     	local wen = slot:FindFirstChild("Wen")
@@ -752,47 +763,10 @@ local function startAFKResourceMonitor()
         debugPrint("AFK", "Refresh loop stopped; GUI removed")
     end)
 
-    local rightControlHeld = false
-
-    local function sendRightControl(isPressed)
-        debugPrint("AFK Input", "Sending RightControl; pressed =", isPressed)
-    	local ok, message = pcall(function()
-    		local virtualInputManager = game:GetService("VirtualInputManager")
-    		virtualInputManager:SendKeyEvent(
-    			isPressed,
-    			Enum.KeyCode.RightControl,
-    			false,
-    			game
-    		)
-    	end)
-
-    	if ok then
-    		rightControlHeld = isPressed
-            debugPrint("AFK Input", "SendKeyEvent returned without error; pressed =", isPressed)
-    	else
-    		warn("AFK Resource Monitor could not send RightControl input:", message)
-    	end
-
-    	return ok
-    end
-
-
     screenGui.Destroying:Connect(function()
-        debugPrint("AFK", "GUI destroying; RightControlHeld =", rightControlHeld)
-    	if rightControlHeld then
-    		sendRightControl(false)
-    	end
+        debugPrint("AFK", "GUI destroying")
     end)
 
-    debugPrint("AFK Input", "Scheduling RightControl press in seconds =", math.max(CONFIG.RightControlHoldDelay, 0))
-    task.delay(math.max(CONFIG.RightControlHoldDelay, 0), function()
-        debugPrint("AFK Input", "RightControl delay finished")
-    	if screenGui.Parent then
-    		sendRightControl(true)
-        else
-            debugPrint("AFK Input", "Press skipped; GUI was removed")
-    	end
-    end)
     debugPrint("AFK", "Monitor setup complete")
 end
 
