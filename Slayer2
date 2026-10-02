@@ -1,0 +1,717 @@
+local Config = {
+    ExpectedVersion = 194,
+    FriendName = "FriendUsernameHere", -- Your friend's Roblox username.
+}
+
+local VERSION_PLACE_ID = 16205713724
+local AFK_PLACE_ID = 136406881576517
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local GuiService = game:GetService("GuiService")
+local LocalPlayer = Players.LocalPlayer
+
+assert(LocalPlayer, "Run this on the client")
+
+local triggered = false
+local versionKickRequested = false
+local privateJoinStarted = false
+local disconnectConnection
+local versionLabel
+
+local success, err = pcall(function()
+    disconnectConnection = GuiService.ErrorMessageChanged:Connect(function(message)
+        if versionKickRequested or triggered or type(message) ~= "string" then
+            return
+        end
+
+        local text = message:lower()
+        local isAuthError = text:find("auth error", 1, true) ~= nil
+
+        if game.PlaceId == VERSION_PLACE_ID and not isAuthError then
+            return
+        end
+
+        local disconnected =
+            isAuthError
+            or text:find("kicked", 1, true)
+            or text:find("disconnect", 1, true)
+            or text:find("lost connection", 1, true)
+            or text:find("slayers2: please rejoin for safety", 1, true)
+
+        if not disconnected then
+            return
+        end
+
+        triggered = true
+        warn("Disconnect detected; starting freeze attempt:", message)
+
+        -- Preserves your existing local freeze attempt.
+        while true do
+        end
+    end)
+end)
+
+if not success then
+    warn("Disconnect listener unavailable:", err)
+end
+
+local function canJoinPrivate()
+    if versionKickRequested or triggered then
+        return false
+    end
+
+    if game.PlaceId == VERSION_PLACE_ID then
+        return versionLabel ~= nil
+            and tonumber(versionLabel.Text) == Config.ExpectedVersion
+    end
+
+    return true
+end
+
+local function startPrivateJoin()
+    if privateJoinStarted or not canJoinPrivate() then
+        return
+    end
+
+    privateJoinStarted = true
+
+    task.spawn(function()
+        local joinSuccess, joinError = pcall(function()
+            assert(type(Config.FriendName) == "string" and Config.FriendName ~= "", "Set Config.FriendName at the top")
+            assert(Config.FriendName:lower() ~= LocalPlayer.Name:lower(), "FriendName must be another player")
+
+            local cam = ReplicatedStorage:WaitForChild("CAM")
+            local Teleporter = require(
+                cam:WaitForChild("Client")
+                    :WaitForChild("Modules")
+                    :WaitForChild("Teleporter")
+            )
+
+            local VipAccess = require(
+                cam:WaitForChild("Global"):WaitForChild("VipAccess")
+            )
+
+            if not canJoinPrivate() then
+                return
+            end
+
+            local function joinPrivate(ownerName, subtitle)
+                if not canJoinPrivate() then
+                    return false, "Cancelled"
+                end
+
+                return Teleporter.Request({
+                    placeId = game.PlaceId,
+                    privateOwner = ownerName,
+                }, {
+                    Title = "Joining Private Server",
+                    SubTitle = subtitle,
+                })
+            end
+
+            local ownReason = "Private-server access is not owned"
+
+            if VipAccess.Has(LocalPlayer) then
+                local joinedOwn
+                joinedOwn, ownReason = joinPrivate(
+                    LocalPlayer.Name,
+                    "Trying your private server"
+                )
+
+                if not canJoinPrivate() then
+                    return
+                end
+
+                if joinedOwn then
+                    return
+                elseif ownReason == "Busy" then
+                    warn("Another teleport request is already running")
+                    return
+                end
+            end
+
+            if not canJoinPrivate() then
+                return
+            end
+
+            local joinedFriend, friendReason = joinPrivate(
+                Config.FriendName,
+                "Trying " .. Config.FriendName .. "'s private server"
+            )
+
+            if not joinedFriend and canJoinPrivate() then
+                warn(
+                    "Both private-server attempts failed.",
+                    "Own:", ownReason,
+                    "Friend:", friendReason
+                )
+            end
+        end)
+
+        if not joinSuccess and not versionKickRequested and not triggered then
+            warn("Private-server join failed:", joinError)
+        end
+    end)
+end
+
+local function startAFKResourceMonitor()
+    -- AFK Resource Monitor
+    -- Run from a LocalScript or paste into the Client Command Bar during a playtest.
+
+    local CONFIG = {
+    	-- Exact username. Leave blank to monitor the local player.
+    	PlayerName = "Sateandrei",
+    	RefreshSeconds = 0.5,
+    	DisplayOrder = 2147483647,
+    	RightControlHoldDelay = 30,
+
+    	Items = {
+    		{
+    			Name = "Ore",
+    			Icon = "rbxassetid://87183725793362",
+    		},
+    		{
+    			Name = "Coin Pouch",
+    			Icon = "rbxassetid://126473769642414",
+    		},
+    		{
+    			Name = "Metal Scraps",
+    			Icon = "rbxassetid://129731726532959",
+    		},
+    		{
+    			Name = "Silk Thread",
+    			Icon = "rbxassetid://86755077727133",
+    		},
+    	},
+
+    	WenIcon = "rbxassetid://119954170187936",
+    }
+
+    local Players = game:GetService("Players")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+    local localPlayer = Players.LocalPlayer
+    assert(localPlayer, "AFK Resource Monitor must run on the client")
+
+    local playerGui = localPlayer:WaitForChild("PlayerGui")
+    local oldGui = playerGui:FindFirstChild("AFKResourceMonitor")
+
+    if oldGui then
+    	oldGui:Destroy()
+    end
+
+    local COLORS = {
+    	Gold = Color3.fromRGB(214, 157, 65),
+    	GoldBright = Color3.fromRGB(255, 221, 150),
+    	Cream = Color3.fromRGB(255, 240, 207),
+    	Panel = Color3.fromRGB(13, 13, 15),
+    	Card = Color3.fromRGB(20, 20, 23),
+    	Black = Color3.fromRGB(0, 0, 0),
+    }
+
+    local function make(className, properties, parent)
+    	local instance = Instance.new(className)
+
+    	for property, value in pairs(properties or {}) do
+    		instance[property] = value
+    	end
+
+    	instance.Parent = parent
+    	return instance
+    end
+
+    local function addCorner(parent, radius)
+    	return make("UICorner", {
+    		CornerRadius = UDim.new(0, radius),
+    	}, parent)
+    end
+
+    local function addStroke(parent, color, thickness, transparency)
+    	return make("UIStroke", {
+    		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    		Color = color,
+    		Thickness = thickness,
+    		Transparency = transparency or 0,
+    	}, parent)
+    end
+
+    local function addTextConstraint(parent, minSize, maxSize)
+    	return make("UITextSizeConstraint", {
+    		MinTextSize = minSize,
+    		MaxTextSize = maxSize,
+    	}, parent)
+    end
+
+    local function formatNumber(value)
+    	local number = math.floor(tonumber(value) or 0)
+    	local sign = number < 0 and "-" or ""
+    	local digits = tostring(math.abs(number))
+    	local formatted = digits
+
+    	repeat
+    		local replacements
+    		formatted, replacements = formatted:gsub("^(%d+)(%d%d%d)", "%1,%2")
+    	until replacements == 0
+
+    	return sign .. formatted
+    end
+
+    local function normalizedProfileName(name)
+    	return string.gsub(name, "%-Studio$", "")
+    end
+
+    local targetName = CONFIG.PlayerName ~= "" and CONFIG.PlayerName or localPlayer.Name
+
+    local function findProfile()
+    	local playerService = ReplicatedStorage:FindFirstChild("Player_Service")
+    	local dataRoot = playerService and playerService:FindFirstChild("Data")
+
+    	if not dataRoot then
+    		return nil
+    	end
+
+    	for _, profile in ipairs(dataRoot:GetChildren()) do
+    		if normalizedProfileName(profile.Name):lower() == targetName:lower() then
+    			return profile
+    		end
+    	end
+
+    	return nil
+    end
+
+    local function getActiveSlot(profile)
+    	local equippedSlot = profile and profile:FindFirstChild("slotEquipped")
+    	local slots = profile and profile:FindFirstChild("slots")
+
+    	if not equippedSlot or not slots then
+    		return nil
+    	end
+
+    	return slots:FindFirstChild("Slot" .. tostring(equippedSlot.Value))
+    end
+
+    local expPerLevel = 60
+
+    do
+    	local cam = ReplicatedStorage:FindFirstChild("CAM")
+    	local global = cam and cam:FindFirstChild("Global")
+    	local settingsModule = global and global:FindFirstChild("gameSettings")
+
+    	if settingsModule then
+    		local ok, settings = pcall(require, settingsModule)
+
+    		if ok and type(settings) == "table" and tonumber(settings.expPerLevel) then
+    			expPerLevel = tonumber(settings.expPerLevel)
+    		end
+    	end
+    end
+
+    local function readLevel(slot)
+    	local exp = slot and slot:FindFirstChild("Exp")
+    	local goal = exp and exp:FindFirstChild("Goal")
+
+    	if not goal or expPerLevel <= 0 then
+    		return 0
+    	end
+
+    	return math.floor(goal.Value / expPerLevel)
+    end
+
+    local function readItemTotal(slot, itemName)
+    	local inventoryRoot = slot and slot:FindFirstChild("Inventory")
+    	local inventory = inventoryRoot and inventoryRoot:FindFirstChild("Inventory")
+    	local total = 0
+
+    	if not inventory then
+    		return total
+    	end
+
+    	for _, item in ipairs(inventory:GetChildren()) do
+    		if item.Name == itemName then
+    			local amount = item:FindFirstChild("Amount")
+    			total += amount and tonumber(amount.Value) or 1
+    		end
+    	end
+
+    	return total
+    end
+
+    local screenGui = make("ScreenGui", {
+    	Name = "AFKResourceMonitor",
+    	DisplayOrder = CONFIG.DisplayOrder,
+    	IgnoreGuiInset = true,
+    	ResetOnSpawn = false,
+    	ZIndexBehavior = Enum.ZIndexBehavior.Global,
+    }, playerGui)
+
+    pcall(function()
+    	screenGui.ScreenInsets = Enum.ScreenInsets.None
+    	screenGui.OnTopOfCoreBlur = true
+    end)
+
+    local overlay = make("Frame", {
+    	Name = "Overlay",
+    	BackgroundColor3 = COLORS.Black,
+    	BackgroundTransparency = 0.28,
+    	BorderSizePixel = 0,
+    	Size = UDim2.fromScale(1, 1),
+    	Visible = true,
+    	ZIndex = 100,
+    }, screenGui)
+
+    local panel = make("Frame", {
+    	Name = "MainPanel",
+    	AnchorPoint = Vector2.new(0.5, 0.5),
+    	BackgroundColor3 = COLORS.Panel,
+    	BackgroundTransparency = 0.03,
+    	BorderSizePixel = 0,
+    	Position = UDim2.fromScale(0.5, 0.5),
+    	Size = UDim2.fromScale(0.82, 0.55),
+    	ZIndex = 110,
+    }, overlay)
+
+    addCorner(panel, 18)
+    addStroke(panel, COLORS.Gold, 3, 0.08)
+
+    make("UIGradient", {
+    	Color = ColorSequence.new({
+    		ColorSequenceKeypoint.new(0, Color3.fromRGB(26, 24, 22)),
+    		ColorSequenceKeypoint.new(0.5, Color3.fromRGB(10, 10, 12)),
+    		ColorSequenceKeypoint.new(1, Color3.fromRGB(21, 18, 16)),
+    	}),
+    	Rotation = 90,
+    }, panel)
+
+    local title = make("TextLabel", {
+    	Name = "PlayerTitle",
+    	BackgroundTransparency = 1,
+    	Font = Enum.Font.GothamBold,
+    	Position = UDim2.fromScale(0.08, 0.035),
+    	Size = UDim2.fromScale(0.84, 0.12),
+    	Text = targetName .. " - Level --",
+    	TextColor3 = COLORS.Cream,
+    	TextScaled = true,
+    	TextStrokeColor3 = COLORS.Black,
+    	TextStrokeTransparency = 0.35,
+    	ZIndex = 120,
+    }, panel)
+
+    addTextConstraint(title, 16, 38)
+
+    local titleLine = make("Frame", {
+    	AnchorPoint = Vector2.new(0.5, 0),
+    	BackgroundColor3 = COLORS.Gold,
+    	BackgroundTransparency = 0.1,
+    	BorderSizePixel = 0,
+    	Position = UDim2.fromScale(0.5, 0.17),
+    	Size = UDim2.fromScale(0.45, 0.006),
+    	ZIndex = 120,
+    }, panel)
+
+    make("UIGradient", {
+    	Transparency = NumberSequence.new({
+    		NumberSequenceKeypoint.new(0, 1),
+    		NumberSequenceKeypoint.new(0.5, 0),
+    		NumberSequenceKeypoint.new(1, 1),
+    	}),
+    }, titleLine)
+
+    local closeButton = make("TextButton", {
+    	Name = "Close",
+    	AnchorPoint = Vector2.new(1, 0),
+    	AutoButtonColor = false,
+    	BackgroundColor3 = Color3.fromRGB(18, 18, 20),
+    	BorderSizePixel = 0,
+    	Font = Enum.Font.GothamBold,
+    	Position = UDim2.fromScale(0.975, 0.035),
+    	Size = UDim2.fromScale(0.055, 0.1),
+    	Text = "X",
+    	TextColor3 = Color3.new(1, 1, 1),
+    	TextScaled = true,
+    	ZIndex = 130,
+    }, panel)
+
+    addCorner(closeButton, 10)
+    addStroke(closeButton, COLORS.Gold, 2, 0.15)
+    addTextConstraint(closeButton, 16, 30)
+
+    local cardsHolder = make("Frame", {
+    	Name = "Cards",
+    	AnchorPoint = Vector2.new(0.5, 0),
+    	BackgroundTransparency = 1,
+    	Position = UDim2.fromScale(0.5, 0.22),
+    	Size = UDim2.fromScale(0.94, 0.48),
+    	ZIndex = 120,
+    }, panel)
+
+    make("UIListLayout", {
+    	FillDirection = Enum.FillDirection.Horizontal,
+    	HorizontalAlignment = Enum.HorizontalAlignment.Center,
+    	Padding = UDim.new(0.012, 0),
+    	SortOrder = Enum.SortOrder.LayoutOrder,
+    	VerticalAlignment = Enum.VerticalAlignment.Center,
+    }, cardsHolder)
+
+    local itemLabels = {}
+
+    for index, itemConfig in ipairs(CONFIG.Items) do
+    	local card = make("Frame", {
+    		Name = itemConfig.Name,
+    		BackgroundColor3 = COLORS.Card,
+    		BackgroundTransparency = 0.08,
+    		BorderSizePixel = 0,
+    		LayoutOrder = index,
+    		Size = UDim2.fromScale(0.238, 0.95),
+    		ZIndex = 121,
+    	}, cardsHolder)
+
+    	addCorner(card, 14)
+    	addStroke(card, COLORS.Gold, 2, 0.16)
+
+    	make("UIGradient", {
+    		Color = ColorSequence.new({
+    			ColorSequenceKeypoint.new(0, Color3.fromRGB(34, 31, 27)),
+    			ColorSequenceKeypoint.new(1, Color3.fromRGB(12, 12, 14)),
+    		}),
+    		Rotation = 90,
+    	}, card)
+
+    	local icon = make("ImageLabel", {
+    		Name = "Icon",
+    		AnchorPoint = Vector2.new(0.5, 0.5),
+    		BackgroundTransparency = 1,
+    		Image = itemConfig.Icon,
+    		Position = UDim2.fromScale(0.5, 0.43),
+    		ScaleType = Enum.ScaleType.Fit,
+    		Size = UDim2.fromScale(0.58, 0.58),
+    		ZIndex = 124,
+    	}, card)
+
+    	make("UIAspectRatioConstraint", {
+    		AspectRatio = 1,
+    	}, icon)
+
+    	local label = make("TextLabel", {
+    		Name = "Count",
+    		AnchorPoint = Vector2.new(0.5, 1),
+    		BackgroundTransparency = 1,
+    		Font = Enum.Font.GothamBold,
+    		Position = UDim2.fromScale(0.5, 0.96),
+    		Size = UDim2.fromScale(0.94, 0.21),
+    		Text = itemConfig.Name .. " - x0",
+    		TextColor3 = COLORS.Cream,
+    		TextScaled = true,
+    		TextStrokeColor3 = COLORS.Black,
+    		TextStrokeTransparency = 0.25,
+    		ZIndex = 125,
+    	}, card)
+
+    	addTextConstraint(label, 10, 22)
+    	itemLabels[index] = label
+    end
+
+    local wenFrame = make("Frame", {
+    	Name = "WenFooter",
+    	AnchorPoint = Vector2.new(0.5, 1),
+    	BackgroundColor3 = COLORS.Card,
+    	BackgroundTransparency = 0.08,
+    	BorderSizePixel = 0,
+    	Position = UDim2.fromScale(0.5, 0.94),
+    	Size = UDim2.fromScale(0.7, 0.17),
+    	ZIndex = 121,
+    }, panel)
+
+    addCorner(wenFrame, 14)
+    addStroke(wenFrame, COLORS.Gold, 2, 0.12)
+
+    local wenIcon = make("ImageLabel", {
+    	Name = "Icon",
+    	AnchorPoint = Vector2.new(0, 0.5),
+    	BackgroundTransparency = 1,
+    	Image = CONFIG.WenIcon,
+    	Position = UDim2.fromScale(0.18, 0.5),
+    	ScaleType = Enum.ScaleType.Fit,
+    	Size = UDim2.fromScale(0.16, 0.82),
+    	ZIndex = 124,
+    }, wenFrame)
+
+    make("UIAspectRatioConstraint", {
+    	AspectRatio = 1,
+    }, wenIcon)
+
+    local wenLabel = make("TextLabel", {
+    	Name = "Total",
+    	AnchorPoint = Vector2.new(0, 0.5),
+    	BackgroundTransparency = 1,
+    	Font = Enum.Font.GothamBold,
+    	Position = UDim2.fromScale(0.39, 0.5),
+    	Size = UDim2.fromScale(0.48, 0.58),
+    	Text = "Wen - 0",
+    	TextColor3 = COLORS.Cream,
+    	TextScaled = true,
+    	TextStrokeColor3 = COLORS.Black,
+    	TextStrokeTransparency = 0.25,
+    	TextXAlignment = Enum.TextXAlignment.Left,
+    	ZIndex = 125,
+    }, wenFrame)
+
+    addTextConstraint(wenLabel, 14, 34)
+
+    local openButton = make("TextButton", {
+    	Name = "OpenAFK",
+    	AnchorPoint = Vector2.new(0, 0.5),
+    	AutoButtonColor = false,
+    	BackgroundColor3 = COLORS.Panel,
+    	BorderSizePixel = 0,
+    	Font = Enum.Font.GothamBold,
+    	Position = UDim2.fromScale(0.012, 0.5),
+    	Size = UDim2.fromOffset(72, 78),
+    	Text = "AFK",
+    	TextColor3 = COLORS.GoldBright,
+    	TextScaled = true,
+    	Visible = false,
+    	ZIndex = 200,
+    }, screenGui)
+
+    addCorner(openButton, 18)
+    addStroke(openButton, COLORS.Gold, 2, 0.05)
+    addTextConstraint(openButton, 16, 26)
+
+    local function setOpen(isOpen)
+    	overlay.Visible = isOpen
+    	openButton.Visible = not isOpen
+    end
+
+    closeButton.MouseButton1Click:Connect(function()
+    	setOpen(false)
+    end)
+
+    openButton.MouseButton1Click:Connect(function()
+    	setOpen(true)
+    end)
+
+    local function showWaiting()
+    	title.Text = targetName .. " - Loading..."
+
+    	for index, itemConfig in ipairs(CONFIG.Items) do
+    		itemLabels[index].Text = itemConfig.Name .. " - x0"
+    	end
+
+    	wenLabel.Text = "Wen - 0"
+    end
+
+    local function refresh()
+    	local profile = findProfile()
+    	local slot = getActiveSlot(profile)
+
+    	if not profile or not slot then
+    		showWaiting()
+    		return
+    	end
+
+    	title.Text = targetName .. " - Level " .. formatNumber(readLevel(slot))
+
+    	for index, itemConfig in ipairs(CONFIG.Items) do
+    		local total = readItemTotal(slot, itemConfig.Name)
+    		itemLabels[index].Text = itemConfig.Name .. " - x" .. formatNumber(total)
+    	end
+
+    	local wen = slot:FindFirstChild("Wen")
+    	wenLabel.Text = "Wen - " .. formatNumber(wen and wen.Value or 0)
+    end
+
+    showWaiting()
+
+    task.spawn(function()
+    	while screenGui.Parent do
+    		local ok, message = pcall(refresh)
+
+    		if not ok then
+    			warn("AFK Resource Monitor refresh failed:", message)
+    		end
+
+    		task.wait(math.max(CONFIG.RefreshSeconds, 0.1))
+    	end
+    end)
+
+    local rightControlHeld = false
+
+    local function sendRightControl(isPressed)
+    	local ok, message = pcall(function()
+    		local virtualInputManager = game:GetService("VirtualInputManager")
+    		virtualInputManager:SendKeyEvent(
+    			isPressed,
+    			Enum.KeyCode.RightControl,
+    			false,
+    			game
+    		)
+    	end)
+
+    	if ok then
+    		rightControlHeld = isPressed
+    	else
+    		warn("AFK Resource Monitor could not send RightControl input:", message)
+    	end
+
+    	return ok
+    end
+
+
+    screenGui.Destroying:Connect(function()
+    	if rightControlHeld then
+    		sendRightControl(false)
+    	end
+    end)
+
+    task.delay(math.max(CONFIG.RightControlHoldDelay, 0), function()
+    	if screenGui.Parent then
+    		sendRightControl(true)
+    	end
+    end)
+end
+
+if game.PlaceId == VERSION_PLACE_ID then
+    task.spawn(function()
+        local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+        local versionGui = playerGui:WaitForChild("Version")
+        versionLabel = versionGui:WaitForChild("Label")
+
+        local function checkVersion()
+            if versionKickRequested or triggered or game.PlaceId ~= VERSION_PLACE_ID then
+                return
+            end
+
+            local currentVersion = tonumber(versionLabel.Text)
+
+            -- Wait for the game's displayed version to load.
+            if currentVersion == nil then
+                return
+            end
+
+            if currentVersion == Config.ExpectedVersion then
+                startPrivateJoin()
+                return
+            end
+
+            -- Disable freezing BEFORE kicking for a version mismatch.
+            versionKickRequested = true
+
+            if disconnectConnection then
+                disconnectConnection:Disconnect()
+                disconnectConnection = nil
+            end
+
+            LocalPlayer:Kick("Version change, recheck again.")
+        end
+
+        versionLabel:GetPropertyChangedSignal("Text"):Connect(checkVersion)
+        checkVersion()
+    end)
+elseif game.PlaceId == AFK_PLACE_ID then
+    -- Run the attached monitor here without another private-server join.
+    task.spawn(startAFKResourceMonitor)
+else
+    -- Other places keep the existing disconnect rules without a version gate.
+    startPrivateJoin()
+end
