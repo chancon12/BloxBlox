@@ -583,9 +583,9 @@ local function startAFKResourceMonitor()
     		AnchorPoint = Vector2.new(0.5, 0.5),
     		BackgroundTransparency = 1,
     		Image = itemConfig.Icon,
-    		Position = UDim2.fromScale(0.5, 0.43),
+    		Position = UDim2.fromScale(0.5, 0.29),
     		ScaleType = Enum.ScaleType.Fit,
-    		Size = UDim2.fromScale(0.58, 0.58),
+    		Size = UDim2.fromScale(0.58, 0.48),
     		ZIndex = 124,
     	}, card)
 
@@ -593,14 +593,35 @@ local function startAFKResourceMonitor()
     		AspectRatio = 1,
     	}, icon)
 
+        -- Separate rows keep long item names from displacing their counts.
+        local nameLabel = make("TextLabel", {
+            Name = "ItemName",
+            AnchorPoint = Vector2.new(0.5, 0),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.GothamBold,
+            Position = UDim2.fromScale(0.5, 0.56),
+            Size = UDim2.fromScale(0.94, 0.16),
+            Text = itemConfig.Name,
+            TextColor3 = COLORS.Cream,
+            TextScaled = true,
+            TextTruncate = Enum.TextTruncate.None,
+            TextStrokeColor3 = COLORS.Black,
+            TextStrokeTransparency = 0.25,
+            ZIndex = 125,
+        }, card)
+
+        nameLabel.TextWrapped = false
+        addTextConstraint(nameLabel, 1, 18)
+
     	local label = make("TextLabel", {
     		Name = "Count",
     		AnchorPoint = Vector2.new(0.5, 1),
     		BackgroundTransparency = 1,
     		Font = Enum.Font.GothamBold,
     		Position = UDim2.fromScale(0.5, 0.96),
-    		Size = UDim2.fromScale(0.94, 0.21),
-    		Text = itemConfig.Name .. " - x0",
+    		Size = UDim2.fromScale(0.94, 0.22),
+    		Text = "x0",
+    		TextTruncate = Enum.TextTruncate.None,
     		TextColor3 = COLORS.Cream,
     		TextScaled = true,
     		TextStrokeColor3 = COLORS.Black,
@@ -608,7 +629,8 @@ local function startAFKResourceMonitor()
     		ZIndex = 125,
     	}, card)
 
-    	addTextConstraint(label, 10, 22)
+        label.TextWrapped = false
+    	addTextConstraint(label, 1, 22)
     	itemLabels[index] = label
     end
 
@@ -699,7 +721,7 @@ local function startAFKResourceMonitor()
     	title.Text = targetName .. " - Loading..."
 
     	for index, itemConfig in ipairs(CONFIG.Items) do
-    		itemLabels[index].Text = itemConfig.Name .. " - x0"
+    		itemLabels[index].Text = "x0"
     	end
 
     	wenLabel.Text = "Wen - 0"
@@ -720,7 +742,7 @@ local function startAFKResourceMonitor()
 
     	for index, itemConfig in ipairs(CONFIG.Items) do
     		local total = readItemTotal(slot, itemConfig.Name)
-    		itemLabels[index].Text = itemConfig.Name .. " - x" .. formatNumber(total)
+    		itemLabels[index].Text = "x" .. formatNumber(total)
     	end
 
     	local wen = slot:FindFirstChild("Wen")
@@ -729,8 +751,8 @@ local function startAFKResourceMonitor()
 
         if Config.DebugPrints then
             local values = {title.Text, wenLabel.Text}
-            for _, itemLabel in ipairs(itemLabels) do
-                table.insert(values, itemLabel.Text)
+            for index, itemLabel in ipairs(itemLabels) do
+                table.insert(values, CONFIG.Items[index].Name .. " = " .. itemLabel.Text)
             end
             debugState("AFK Values", table.concat(values, " | "))
         end
