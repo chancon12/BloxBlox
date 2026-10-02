@@ -250,7 +250,7 @@ local function startAFKResourceMonitor()
     	PlayerName = "",
     	RefreshSeconds = 0.5,
     	DisplayOrder = 2147483647,
-    	RightControlHoldDelay = 30,
+    	RightControlHoldDelay = 60,
 
     	Items = {
     		{
