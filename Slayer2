@@ -1,6 +1,6 @@
 local Config = {
     ExpectedVersion = 194,
-    FriendName = "FriendUsernameHere", -- Your friend's Roblox username.
+    FriendName = "Sateandrei", -- Your friend's Roblox username.
 }
 
 local VERSION_PLACE_ID = 16205713724
@@ -161,7 +161,7 @@ local function startAFKResourceMonitor()
 
     local CONFIG = {
     	-- Exact username. Leave blank to monitor the local player.
-    	PlayerName = "Sateandrei",
+    	PlayerName = "",
     	RefreshSeconds = 0.5,
     	DisplayOrder = 2147483647,
     	RightControlHoldDelay = 30,
