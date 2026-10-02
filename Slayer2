@@ -1,6 +1,6 @@
 local Config = {
-    DebugPrints = true, -- Set false to turn off diagnostic prints.
-    ExpectedVersion = 194,
+    DebugPrints = false, -- Set false to turn off diagnostic prints.
+    ExpectedVersion = 195,
     PrivateServerPlaceId = 136406881576517, -- World to join, regardless of the current place.
     FriendName = "Sateandrei", -- Your friend's Roblox username.
 }
