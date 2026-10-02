@@ -1,7 +1,39 @@
 local Config = {
+    DebugPrints = true, -- Set false to turn off diagnostic prints.
     ExpectedVersion = 194,
+    PrivateServerPlaceId = 136406881576517, -- World to join, regardless of the current place.
     FriendName = "Sateandrei", -- Your friend's Roblox username.
 }
+
+local function debugPrint(section, ...)
+    if Config.DebugPrints then
+        print("[PrivateAFK][" .. section .. "]", ...)
+    end
+end
+
+local lastDebugStates = {}
+local function debugState(section, state)
+    if Config.DebugPrints and lastDebugStates[section] ~= state then
+        lastDebugStates[section] = state
+        debugPrint(section, state)
+    end
+end
+
+local function waitForChildDebug(parent, name)
+    debugPrint("Wait", parent:GetFullName() .. "." .. name)
+    local child = parent:WaitForChild(name)
+    debugPrint("Ready", child:GetFullName())
+    return child
+end
+
+local function requireDebug(module)
+    debugPrint("Require", "Loading", module:GetFullName())
+    local result = require(module)
+    debugPrint("Require", "Loaded", module:GetFullName())
+    return result
+end
+
+debugPrint("Startup", "Script started; PlaceId =", game.PlaceId)
 
 local VERSION_PLACE_ID = 16205713724
 local AFK_PLACE_ID = 136406881576517
@@ -12,6 +44,7 @@ local GuiService = game:GetService("GuiService")
 local LocalPlayer = Players.LocalPlayer
 
 assert(LocalPlayer, "Run this on the client")
+debugPrint("Startup", "Player =", LocalPlayer.Name, "ExpectedVersion =", Config.ExpectedVersion, "FriendName =", Config.FriendName)
 
 local triggered = false
 local versionKickRequested = false
@@ -19,9 +52,12 @@ local privateJoinStarted = false
 local disconnectConnection
 local versionLabel
 
+debugPrint("Disconnect", "Installing error-message listener")
 local success, err = pcall(function()
     disconnectConnection = GuiService.ErrorMessageChanged:Connect(function(message)
+        debugPrint("Disconnect", "ErrorMessageChanged =", message)
         if versionKickRequested or triggered or type(message) ~= "string" then
+            debugPrint("Disconnect", "Ignored; versionKick =", versionKickRequested, "alreadyTriggered =", triggered, "messageType =", type(message))
             return
         end
 
@@ -29,6 +65,7 @@ local success, err = pcall(function()
         local isAuthError = text:find("auth error", 1, true) ~= nil
 
         if game.PlaceId == VERSION_PLACE_ID and not isAuthError then
+            debugPrint("Disconnect", "Ignored by main-place exception; not an auth error")
             return
         end
 
@@ -40,10 +77,12 @@ local success, err = pcall(function()
             or text:find("slayers2: please rejoin for safety", 1, true)
 
         if not disconnected then
+            debugPrint("Disconnect", "Ignored; message does not match a disconnect keyword")
             return
         end
 
         triggered = true
+        debugPrint("Disconnect", "Matched disconnect; entering existing freeze attempt")
         warn("Disconnect detected; starting freeze attempt:", message)
 
         -- Preserves your existing local freeze attempt.
@@ -54,6 +93,19 @@ end)
 
 if not success then
     warn("Disconnect listener unavailable:", err)
+else
+    debugPrint("Disconnect", "Listener connected")
+end
+
+local function parseVersion(text)
+    if type(text) ~= "string" then
+        return nil
+    end
+
+    -- The game's label uses "v.194"; plain "194" is also accepted.
+    local cleaned = text:match("^%s*(.-)%s*$")
+    cleaned = cleaned:gsub("^[vV]%.?%s*", "", 1)
+    return tonumber(cleaned)
 end
 
 local function canJoinPrivate()
@@ -63,56 +115,79 @@ local function canJoinPrivate()
 
     if game.PlaceId == VERSION_PLACE_ID then
         return versionLabel ~= nil
-            and tonumber(versionLabel.Text) == Config.ExpectedVersion
+            and parseVersion(versionLabel.Text) == Config.ExpectedVersion
     end
 
     return true
 end
 
+local function logPrivateBlocked(stage)
+    debugPrint("Private", "Stopped at", stage,
+        "versionKick =", versionKickRequested,
+        "disconnectTriggered =", triggered,
+        "versionText =", versionLabel and versionLabel.Text)
+end
+
 local function startPrivateJoin()
-    if privateJoinStarted or not canJoinPrivate() then
+    if privateJoinStarted then
+        debugPrint("Private", "Join flow already started; duplicate start ignored")
+        return
+    end
+
+    if not canJoinPrivate() then
+        logPrivateBlocked("start")
         return
     end
 
     privateJoinStarted = true
+    debugPrint("Private", "Starting own-server / friend-server flow")
 
     task.spawn(function()
         local joinSuccess, joinError = pcall(function()
             assert(type(Config.FriendName) == "string" and Config.FriendName ~= "", "Set Config.FriendName at the top")
             assert(Config.FriendName:lower() ~= LocalPlayer.Name:lower(), "FriendName must be another player")
 
-            local cam = ReplicatedStorage:WaitForChild("CAM")
-            local Teleporter = require(
-                cam:WaitForChild("Client")
-                    :WaitForChild("Modules")
-                    :WaitForChild("Teleporter")
-            )
+            debugPrint("Private", "Friend configuration passed validation")
+            local cam = waitForChildDebug(ReplicatedStorage, "CAM")
+            local client = waitForChildDebug(cam, "Client")
+            local modules = waitForChildDebug(client, "Modules")
+            local teleporterModule = waitForChildDebug(modules, "Teleporter")
+            local Teleporter = requireDebug(teleporterModule)
 
-            local VipAccess = require(
-                cam:WaitForChild("Global"):WaitForChild("VipAccess")
-            )
+            local global = waitForChildDebug(cam, "Global")
+            local vipModule = waitForChildDebug(global, "VipAccess")
+            local VipAccess = requireDebug(vipModule)
 
             if not canJoinPrivate() then
+                logPrivateBlocked("module loading completed")
                 return
             end
 
             local function joinPrivate(ownerName, subtitle)
                 if not canJoinPrivate() then
+                    logPrivateBlocked("request for " .. ownerName)
                     return false, "Cancelled"
                 end
 
-                return Teleporter.Request({
-                    placeId = game.PlaceId,
+                debugPrint("Private", "Calling Teleporter.Request; owner =", ownerName, "PlaceId =", Config.PrivateServerPlaceId)
+                local requestAccepted, requestReason = Teleporter.Request({
+                    placeId = Config.PrivateServerPlaceId,
                     privateOwner = ownerName,
                 }, {
                     Title = "Joining Private Server",
                     SubTitle = subtitle,
                 })
+                debugPrint("Private", "Request returned; owner =", ownerName, "accepted =", requestAccepted, "reason =", requestReason)
+                return requestAccepted, requestReason
             end
 
             local ownReason = "Private-server access is not owned"
 
-            if VipAccess.Has(LocalPlayer) then
+            debugPrint("Private", "Checking VipAccess.Has")
+            local hasVip = VipAccess.Has(LocalPlayer)
+            debugPrint("Private", "VipAccess.Has returned =", hasVip)
+
+            if hasVip then
                 local joinedOwn
                 joinedOwn, ownReason = joinPrivate(
                     LocalPlayer.Name,
@@ -120,25 +195,34 @@ local function startPrivateJoin()
                 )
 
                 if not canJoinPrivate() then
+                    logPrivateBlocked("own request completed")
                     return
                 end
 
                 if joinedOwn then
+                    debugPrint("Private", "Own request accepted; no friend fallback")
                     return
                 elseif ownReason == "Busy" then
+                    debugPrint("Private", "Own request is Busy; stopping fallback")
                     warn("Another teleport request is already running")
                     return
                 end
             end
 
             if not canJoinPrivate() then
+                logPrivateBlocked("before friend fallback")
                 return
             end
 
+            debugPrint("Private", "Trying friend =", Config.FriendName, "Own result =", ownReason)
             local joinedFriend, friendReason = joinPrivate(
                 Config.FriendName,
                 "Trying " .. Config.FriendName .. "'s private server"
             )
+
+            if joinedFriend then
+                debugPrint("Private", "Friend request accepted")
+            end
 
             if not joinedFriend and canJoinPrivate() then
                 warn(
@@ -149,6 +233,7 @@ local function startPrivateJoin()
             end
         end)
 
+        debugPrint("Private", "Join task finished; pcall success =", joinSuccess, "error =", joinError)
         if not joinSuccess and not versionKickRequested and not triggered then
             warn("Private-server join failed:", joinError)
         end
@@ -156,6 +241,7 @@ local function startPrivateJoin()
 end
 
 local function startAFKResourceMonitor()
+    debugPrint("AFK", "Starting resource monitor")
     -- AFK Resource Monitor
     -- Run from a LocalScript or paste into the Client Command Bar during a playtest.
 
@@ -194,10 +280,11 @@ local function startAFKResourceMonitor()
     local localPlayer = Players.LocalPlayer
     assert(localPlayer, "AFK Resource Monitor must run on the client")
 
-    local playerGui = localPlayer:WaitForChild("PlayerGui")
+    local playerGui = waitForChildDebug(localPlayer, "PlayerGui")
     local oldGui = playerGui:FindFirstChild("AFKResourceMonitor")
 
     if oldGui then
+        debugPrint("AFK", "Replacing existing AFKResourceMonitor GUI")
     	oldGui:Destroy()
     end
 
@@ -262,13 +349,14 @@ local function startAFKResourceMonitor()
     end
 
     local targetName = CONFIG.PlayerName ~= "" and CONFIG.PlayerName or localPlayer.Name
+    debugPrint("AFK", "Monitoring =", targetName, "RefreshSeconds =", CONFIG.RefreshSeconds, "RightControlHoldDelay =", CONFIG.RightControlHoldDelay)
 
     local function findProfile()
     	local playerService = ReplicatedStorage:FindFirstChild("Player_Service")
     	local dataRoot = playerService and playerService:FindFirstChild("Data")
 
     	if not dataRoot then
-    		return nil
+            return nil, playerService and "Waiting for Player_Service.Data" or "Waiting for Player_Service"
     	end
 
     	for _, profile in ipairs(dataRoot:GetChildren()) do
@@ -277,18 +365,20 @@ local function startAFKResourceMonitor()
     		end
     	end
 
-    	return nil
+        return nil, "Waiting for profile: " .. targetName
     end
 
     local function getActiveSlot(profile)
     	local equippedSlot = profile and profile:FindFirstChild("slotEquipped")
     	local slots = profile and profile:FindFirstChild("slots")
 
-    	if not equippedSlot or not slots then
-    		return nil
-    	end
+        if not equippedSlot or not slots then
+            return nil, not equippedSlot and "Waiting for slotEquipped" or "Waiting for slots"
+        end
 
-    	return slots:FindFirstChild("Slot" .. tostring(equippedSlot.Value))
+        local slotName = "Slot" .. tostring(equippedSlot.Value)
+        local activeSlot = slots:FindFirstChild(slotName)
+        return activeSlot, not activeSlot and ("Waiting for " .. slotName) or nil
     end
 
     local expPerLevel = 60
@@ -299,7 +389,11 @@ local function startAFKResourceMonitor()
     	local settingsModule = global and global:FindFirstChild("gameSettings")
 
     	if settingsModule then
-    		local ok, settings = pcall(require, settingsModule)
+    		local ok, settings = pcall(requireDebug, settingsModule)
+        debugPrint("AFK", "gameSettings require success =", ok, "resultType =", type(settings))
+        if not ok then
+            debugPrint("AFK", "gameSettings failed; using default expPerLevel; error =", settings)
+        end
 
     		if ok and type(settings) == "table" and tonumber(settings.expPerLevel) then
     			expPerLevel = tonumber(settings.expPerLevel)
@@ -307,14 +401,18 @@ local function startAFKResourceMonitor()
     	end
     end
 
+    debugPrint("AFK", "expPerLevel =", expPerLevel, "Building monitor GUI")
+
     local function readLevel(slot)
     	local exp = slot and slot:FindFirstChild("Exp")
     	local goal = exp and exp:FindFirstChild("Goal")
 
     	if not goal or expPerLevel <= 0 then
+            debugState("AFK Level", not goal and "Waiting for Exp.Goal" or "Invalid expPerLevel")
     		return 0
     	end
 
+        debugState("AFK Level", "Exp.Goal loaded")
     	return math.floor(goal.Value / expPerLevel)
     end
 
@@ -324,8 +422,11 @@ local function startAFKResourceMonitor()
     	local total = 0
 
     	if not inventory then
+            debugState("AFK Inventory", "Waiting for Inventory.Inventory")
     		return total
     	end
+
+        debugState("AFK Inventory", "Inventory loaded")
 
     	for _, item in ipairs(inventory:GetChildren()) do
     		if item.Name == itemName then
@@ -578,7 +679,10 @@ local function startAFKResourceMonitor()
     addStroke(openButton, COLORS.Gold, 2, 0.05)
     addTextConstraint(openButton, 16, 26)
 
+    debugPrint("AFK", "Monitor GUI created")
+
     local function setOpen(isOpen)
+        debugPrint("AFK", "Panel open =", isOpen)
     	overlay.Visible = isOpen
     	openButton.Visible = not isOpen
     end
@@ -602,14 +706,16 @@ local function startAFKResourceMonitor()
     end
 
     local function refresh()
-    	local profile = findProfile()
-    	local slot = getActiveSlot(profile)
+    	local profile, profileReason = findProfile()
+    	local slot, slotReason = getActiveSlot(profile)
 
     	if not profile or not slot then
+            debugState("AFK Data", profileReason or slotReason or "Waiting for data")
     		showWaiting()
     		return
     	end
 
+        debugState("AFK Data", "Profile ready: " .. profile.Name .. " / " .. slot.Name)
     	title.Text = targetName .. " - Level " .. formatNumber(readLevel(slot))
 
     	for index, itemConfig in ipairs(CONFIG.Items) do
@@ -618,10 +724,20 @@ local function startAFKResourceMonitor()
     	end
 
     	local wen = slot:FindFirstChild("Wen")
+        debugState("AFK Wen", wen and "Wen loaded" or "Waiting for Wen")
     	wenLabel.Text = "Wen - " .. formatNumber(wen and wen.Value or 0)
+
+        if Config.DebugPrints then
+            local values = {title.Text, wenLabel.Text}
+            for _, itemLabel in ipairs(itemLabels) do
+                table.insert(values, itemLabel.Text)
+            end
+            debugState("AFK Values", table.concat(values, " | "))
+        end
     end
 
     showWaiting()
+    debugPrint("AFK", "Starting refresh loop")
 
     task.spawn(function()
     	while screenGui.Parent do
@@ -633,11 +749,13 @@ local function startAFKResourceMonitor()
 
     		task.wait(math.max(CONFIG.RefreshSeconds, 0.1))
     	end
+        debugPrint("AFK", "Refresh loop stopped; GUI removed")
     end)
 
     local rightControlHeld = false
 
     local function sendRightControl(isPressed)
+        debugPrint("AFK Input", "Sending RightControl; pressed =", isPressed)
     	local ok, message = pcall(function()
     		local virtualInputManager = game:GetService("VirtualInputManager")
     		virtualInputManager:SendKeyEvent(
@@ -650,6 +768,7 @@ local function startAFKResourceMonitor()
 
     	if ok then
     		rightControlHeld = isPressed
+            debugPrint("AFK Input", "SendKeyEvent returned without error; pressed =", isPressed)
     	else
     		warn("AFK Resource Monitor could not send RightControl input:", message)
     	end
@@ -659,59 +778,77 @@ local function startAFKResourceMonitor()
 
 
     screenGui.Destroying:Connect(function()
+        debugPrint("AFK", "GUI destroying; RightControlHeld =", rightControlHeld)
     	if rightControlHeld then
     		sendRightControl(false)
     	end
     end)
 
+    debugPrint("AFK Input", "Scheduling RightControl press in seconds =", math.max(CONFIG.RightControlHoldDelay, 0))
     task.delay(math.max(CONFIG.RightControlHoldDelay, 0), function()
+        debugPrint("AFK Input", "RightControl delay finished")
     	if screenGui.Parent then
     		sendRightControl(true)
+        else
+            debugPrint("AFK Input", "Press skipped; GUI was removed")
     	end
     end)
+    debugPrint("AFK", "Monitor setup complete")
 end
 
 if game.PlaceId == VERSION_PLACE_ID then
+    debugPrint("Route", "Main place: version check, then private-server flow")
     task.spawn(function()
-        local playerGui = LocalPlayer:WaitForChild("PlayerGui")
-        local versionGui = playerGui:WaitForChild("Version")
-        versionLabel = versionGui:WaitForChild("Label")
+        local playerGui = waitForChildDebug(LocalPlayer, "PlayerGui")
+        local versionGui = waitForChildDebug(playerGui, "Version")
+        versionLabel = waitForChildDebug(versionGui, "Label")
 
         local function checkVersion()
             if versionKickRequested or triggered or game.PlaceId ~= VERSION_PLACE_ID then
+                debugPrint("Version", "Check ignored; versionKick =", versionKickRequested, "disconnect =", triggered, "PlaceId =", game.PlaceId)
                 return
             end
 
-            local currentVersion = tonumber(versionLabel.Text)
+            local currentVersion = parseVersion(versionLabel.Text)
+            debugPrint("Version", "Text =", versionLabel.Text, "Parsed =", currentVersion, "Expected =", Config.ExpectedVersion)
 
             -- Wait for the game's displayed version to load.
             if currentVersion == nil then
+                debugPrint("Version", "Waiting for numeric version text")
                 return
             end
 
             if currentVersion == Config.ExpectedVersion then
+                debugPrint("Version", "Version matched")
                 startPrivateJoin()
                 return
             end
 
             -- Disable freezing BEFORE kicking for a version mismatch.
             versionKickRequested = true
+            debugPrint("Version", "Mismatch; disabling freeze listener before kick")
 
             if disconnectConnection then
                 disconnectConnection:Disconnect()
                 disconnectConnection = nil
             end
 
+            debugPrint("Version", "Kicking: Version change, recheck again.")
             LocalPlayer:Kick("Version change, recheck again.")
         end
 
         versionLabel:GetPropertyChangedSignal("Text"):Connect(checkVersion)
+        debugPrint("Version", "Text-change listener connected; checking current text")
         checkVersion()
     end)
 elseif game.PlaceId == AFK_PLACE_ID then
+    debugPrint("Route", "AFK place: resource monitor")
     -- Run the attached monitor here without another private-server join.
     task.spawn(startAFKResourceMonitor)
 else
+    debugPrint("Route", "Other place: private-server flow without version check")
     -- Other places keep the existing disconnect rules without a version gate.
     startPrivateJoin()
 end
+
+debugPrint("Startup", "Place handler dispatched; listeners/tasks are active")
