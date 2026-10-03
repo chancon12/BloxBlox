@@ -3,8 +3,9 @@ local Config = {
     ExpectedVersion = 195,
     PrivateServerPlaceId = 136406881576517, -- World to join, regardless of the current place.
     FriendName = "Sateandrei", -- Your friend's Roblox username.
-    AFKJoinFriendWhenFriendPresent = false, -- In the AFK place, join FriendName if any Roblox friend is present.
-    AFKReturnEnabled = false, -- false disables the timed AFK return to the main place.
+    FriendPrivateServerJobId = "", -- Optional: known JobId if you joined that friend's server manually.
+    AFKJoinFriendWhenFriendPresent = true, -- In the AFK place, join FriendName if any Roblox friend is present.
+    AFKReturnEnabled = true, -- false disables the timed AFK return to the main place.
     AFKReturnAfterSeconds = 60 * 60, -- Return to the main place after one hour in this script session.
 }
 
@@ -55,6 +56,138 @@ local versionKickRequested = false
 local privateJoinStarted = false
 local disconnectConnection
 local versionLabel
+
+-- These are client-side route records, not authoritative server ownership data.
+-- Teleport settings persist across places within this Roblox experience.
+local PRIVATE_ROUTE_KEY = "PrivateAFK.PrivateRoute.v1"
+local PRIVATE_ROUTE_MAX_AGE = 300
+
+local function readPrivateRoute()
+    local ok, record = pcall(function()
+        return TeleportService:GetTeleportSetting(PRIVATE_ROUTE_KEY)
+    end)
+    if ok and type(record) == "table" then
+        return record
+    end
+    return {}
+end
+
+local function writePrivateRoute(record)
+    local ok, message = pcall(function()
+        TeleportService:SetTeleportSetting(PRIVATE_ROUTE_KEY, record)
+    end)
+    if not ok then
+        warn("Could not save the private-server route guard:", message)
+    end
+    return ok
+end
+
+local function isCurrentPrivateServer(record)
+    return type(record) == "table"
+        and record.UserId == LocalPlayer.UserId
+        and record.PlaceId == game.PlaceId
+        and game.JobId ~= ""
+        and record.JobId == game.JobId
+        and type(record.Owner) == "string"
+end
+
+local privateRoute = readPrivateRoute()
+if not isCurrentPrivateServer(privateRoute.Current) then
+    privateRoute.Current = nil
+end
+do
+    local pending = privateRoute.Pending
+    if type(pending) == "table" then
+        local age = os.time() - (tonumber(pending.RequestedAt) or 0)
+        local fresh = pending.UserId == LocalPlayer.UserId
+            and type(pending.Owner) == "string"
+            and type(pending.SourceJobId) == "string"
+            and pending.SourceJobId ~= ""
+            and age >= 0 and age <= PRIVATE_ROUTE_MAX_AGE
+        if fresh and pending.PlaceId == game.PlaceId and game.JobId ~= ""
+            and pending.SourceJobId ~= game.JobId then
+            privateRoute.Current = {
+                UserId = LocalPlayer.UserId,
+                PlaceId = game.PlaceId,
+                JobId = game.JobId,
+                Owner = pending.Owner,
+            }
+            privateRoute.Pending = nil
+            debugPrint("Private Guard", "Arrived through a recorded private join; owner =", pending.Owner)
+        elseif not fresh or pending.SourceJobId ~= game.JobId then
+            privateRoute.Pending = nil
+        end
+    else
+        privateRoute.Pending = nil
+    end
+end
+writePrivateRoute(privateRoute)
+
+local function isInConfiguredFriendServer()
+    if game.PlaceId ~= AFK_PLACE_ID then
+        return false
+    end
+    local configuredJob = Config.FriendPrivateServerJobId
+    if type(configuredJob) == "string" and configuredJob ~= "" and game.JobId == configuredJob then
+        return true
+    end
+    local current = privateRoute.Current
+    return isCurrentPrivateServer(current)
+        and type(Config.FriendName) == "string"
+        and current.Owner:lower() == Config.FriendName:lower()
+end
+
+local function clearPendingPrivateRoute(token)
+    local record = readPrivateRoute()
+    local pending = record.Pending
+    if type(pending) == "table" and (token == nil or pending.Token == token) then
+        record.Pending = nil
+        writePrivateRoute(record)
+    end
+end
+
+local function requestTrackedPrivateServer(Teleporter, ownerName, placeId, subtitle)
+    local token = game:GetService("HttpService"):GenerateGUID(false)
+    local record = readPrivateRoute()
+    record.Pending = {
+        Token = token,
+        UserId = LocalPlayer.UserId,
+        Owner = ownerName,
+        PlaceId = placeId,
+        SourceJobId = game.JobId,
+        RequestedAt = os.time(),
+    }
+    writePrivateRoute(record)
+
+    -- Scope failure cleanup to this request; late callbacks cannot erase a newer route.
+    local failureConnection = TeleportService.TeleportInitFailed:Connect(function(player, _, _, failedPlaceId)
+        if player == LocalPlayer and failedPlaceId == placeId then
+            clearPendingPrivateRoute(token)
+        end
+    end)
+    task.delay(PRIVATE_ROUTE_MAX_AGE, function()
+        failureConnection:Disconnect()
+        clearPendingPrivateRoute(token)
+    end)
+
+    local ok, accepted, reason = pcall(function()
+        return Teleporter.Request({
+            placeId = placeId,
+            privateOwner = ownerName,
+        }, {
+            Title = "Joining Private Server",
+            SubTitle = subtitle,
+        })
+    end)
+    if not ok or not accepted then
+        failureConnection:Disconnect()
+        clearPendingPrivateRoute(token)
+    end
+    if not ok then
+        error(accepted, 0)
+    end
+    return accepted, reason
+end
 
 debugPrint("Disconnect", "Installing error-message listener")
 local success, err = pcall(function()
@@ -180,13 +313,9 @@ local function startPrivateJoin()
                 end
 
                 debugPrint("Private", "Calling Teleporter.Request; owner =", ownerName, "PlaceId =", Config.PrivateServerPlaceId)
-                local requestAccepted, requestReason = Teleporter.Request({
-                    placeId = Config.PrivateServerPlaceId,
-                    privateOwner = ownerName,
-                }, {
-                    Title = "Joining Private Server",
-                    SubTitle = subtitle,
-                })
+                local requestAccepted, requestReason = requestTrackedPrivateServer(
+                    Teleporter, ownerName, Config.PrivateServerPlaceId, subtitle
+                )
                 debugPrint("Private", "Request returned; owner =", ownerName, "accepted =", requestAccepted, "reason =", requestReason)
                 return requestAccepted, requestReason
             end
@@ -299,6 +428,7 @@ local function startAFKServerRules()
         local transfer = {Kind = "Main return", PlaceId = VERSION_PLACE_ID}
         pendingTransfer = transfer
         debugPrint("AFK Return", "Timer elapsed; teleporting to", VERSION_PLACE_ID)
+        clearPendingPrivateRoute()
         local ok, message = pcall(function()
             TeleportService:Teleport(VERSION_PLACE_ID, LocalPlayer)
         end)
@@ -326,6 +456,10 @@ local function startAFKServerRules()
     end
 
     if not Config.AFKJoinFriendWhenFriendPresent then
+        return
+    end
+    if isInConfiguredFriendServer() then
+        debugPrint("AFK Friend", "Already in the configured friend's server; friend-triggered joins disabled")
         return
     end
 
@@ -384,13 +518,10 @@ local function startAFKServerRules()
                         finishTransfer(transfer)
                     end
                 end)
-                local accepted, reason = Teleporter.Request({
-                    placeId = AFK_PLACE_ID,
-                    privateOwner = Config.FriendName,
-                }, {
-                    Title = "Joining Private Server",
-                    SubTitle = "Joining " .. Config.FriendName .. "'s private server",
-                })
+                local accepted, reason = requestTrackedPrivateServer(
+                    Teleporter, Config.FriendName, AFK_PLACE_ID,
+                    "Joining " .. Config.FriendName .. "'s private server"
+                )
                 debugPrint("AFK Friend", "Request accepted =", accepted, "reason =", reason)
                 if not accepted then
                     warn("AFK friend private-server request failed:", reason)
