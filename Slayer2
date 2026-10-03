@@ -4,6 +4,7 @@ local Config = {
     PrivateServerPlaceId = 136406881576517, -- World to join, regardless of the current place.
     FriendName = "Sateandrei", -- Your friend's Roblox username.
     AFKJoinFriendWhenFriendPresent = true, -- In the AFK place, join FriendName if any Roblox friend is present.
+    AFKReturnEnabled = true, -- false disables the timed AFK return to the main place.
     AFKReturnAfterSeconds = 60 * 60, -- Return to the main place after one hour in this script session.
 }
 
@@ -254,8 +255,9 @@ local function startAFKServerRules()
         return
     end
 
+    local returnEnabled = Config.AFKReturnEnabled == true
     local timeout = math.max(tonumber(Config.AFKReturnAfterSeconds) or 3600, 0)
-    local deadline = os.clock() + timeout
+    local deadline = returnEnabled and (os.clock() + timeout) or math.huge
     local returnDue = false
     local returnStarted = false
     local friendJoinStarted = false
@@ -281,6 +283,9 @@ local function startAFKServerRules()
     end
 
     requestReturnToMain = function()
+        if not returnEnabled then
+            return
+        end
         returnDue = true
         if not isActive() or returnStarted then
             return
@@ -312,9 +317,13 @@ local function startAFKServerRules()
         finishTransfer(transfer)
     end)
 
-    -- Arm this before any friendship/module/GUI waits.
-    debugPrint("AFK Return", "Return timer started; seconds =", timeout)
-    task.delay(timeout, requestReturnToMain)
+    -- Arm this before any friendship/module/GUI waits when enabled.
+    if returnEnabled then
+        debugPrint("AFK Return", "Return timer started; seconds =", timeout)
+        task.delay(timeout, requestReturnToMain)
+    else
+        debugPrint("AFK Return", "Timed return disabled")
+    end
 
     if not Config.AFKJoinFriendWhenFriendPresent then
         return
