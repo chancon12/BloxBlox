@@ -3,6 +3,8 @@ local Config = {
     ExpectedVersion = 195,
     PrivateServerPlaceId = 136406881576517, -- World to join, regardless of the current place.
     FriendName = "Sateandrei", -- Your friend's Roblox username.
+    AFKJoinFriendWhenFriendPresent = true, -- In the AFK place, join FriendName if any Roblox friend is present.
+    AFKReturnAfterSeconds = 60 * 60, -- Return to the main place after one hour in this script session.
 }
 
 local function debugPrint(section, ...)
@@ -41,6 +43,7 @@ local AFK_PLACE_ID = 136406881576517
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local GuiService = game:GetService("GuiService")
+local TeleportService = game:GetService("TeleportService")
 local LocalPlayer = Players.LocalPlayer
 
 assert(LocalPlayer, "Run this on the client")
@@ -56,6 +59,12 @@ debugPrint("Disconnect", "Installing error-message listener")
 local success, err = pcall(function()
     disconnectConnection = GuiService.ErrorMessageChanged:Connect(function(message)
         debugPrint("Disconnect", "ErrorMessageChanged =", message)
+        -- Never run the freeze attempt in the AFK world, including during teleports.
+        if game.PlaceId == AFK_PLACE_ID then
+            debugPrint("Disconnect", "Freeze disabled in the AFK place")
+            return
+        end
+
         if versionKickRequested or triggered or type(message) ~= "string" then
             debugPrint("Disconnect", "Ignored; versionKick =", versionKickRequested, "alreadyTriggered =", triggered, "messageType =", type(message))
             return
@@ -238,6 +247,163 @@ local function startPrivateJoin()
             warn("Private-server join failed:", joinError)
         end
     end)
+end
+
+local function startAFKServerRules()
+    if game.PlaceId ~= AFK_PLACE_ID then
+        return
+    end
+
+    local timeout = math.max(tonumber(Config.AFKReturnAfterSeconds) or 3600, 0)
+    local deadline = os.clock() + timeout
+    local returnDue = false
+    local returnStarted = false
+    local friendJoinStarted = false
+    local pendingTransfer
+    local checkedPlayers = {}
+    local requestReturnToMain
+
+    local function isActive()
+        return game.PlaceId == AFK_PLACE_ID
+            and LocalPlayer.Parent == Players
+            and not versionKickRequested
+            and not triggered
+    end
+
+    local function finishTransfer(transfer)
+        if pendingTransfer ~= transfer then
+            return
+        end
+        pendingTransfer = nil
+        if returnDue and not returnStarted then
+            task.defer(requestReturnToMain)
+        end
+    end
+
+    requestReturnToMain = function()
+        returnDue = true
+        if not isActive() or returnStarted then
+            return
+        end
+        if pendingTransfer then
+            debugPrint("AFK Return", "Timer elapsed; waiting for the pending transfer")
+            return
+        end
+
+        returnStarted = true
+        local transfer = {Kind = "Main return", PlaceId = VERSION_PLACE_ID}
+        pendingTransfer = transfer
+        debugPrint("AFK Return", "Timer elapsed; teleporting to", VERSION_PLACE_ID)
+        local ok, message = pcall(function()
+            TeleportService:Teleport(VERSION_PLACE_ID, LocalPlayer)
+        end)
+        if not ok then
+            warn("AFK return teleport failed:", message)
+            finishTransfer(transfer)
+        end
+    end
+
+    TeleportService.TeleportInitFailed:Connect(function(player, result, message, placeId)
+        local transfer = pendingTransfer
+        if player ~= LocalPlayer or not transfer or placeId ~= transfer.PlaceId then
+            return
+        end
+        warn("AFK teleport failed:", transfer.Kind, result, message)
+        finishTransfer(transfer)
+    end)
+
+    -- Arm this before any friendship/module/GUI waits.
+    debugPrint("AFK Return", "Return timer started; seconds =", timeout)
+    task.delay(timeout, requestReturnToMain)
+
+    if not Config.AFKJoinFriendWhenFriendPresent then
+        return
+    end
+
+    local function checkPlayer(otherPlayer)
+        if otherPlayer == LocalPlayer or checkedPlayers[otherPlayer.UserId]
+            or friendJoinStarted or returnDue or returnStarted or not isActive() then
+            return
+        end
+        checkedPlayers[otherPlayer.UserId] = true
+
+        task.spawn(function()
+            local ok, isFriend = pcall(function()
+                return LocalPlayer:IsFriendsWithAsync(otherPlayer.UserId)
+            end)
+            if not ok then
+                warn("AFK friend check failed for", otherPlayer.Name, isFriend)
+                return
+            end
+            if not isFriend or otherPlayer.Parent ~= Players or not isActive()
+                or friendJoinStarted or returnDue or returnStarted then
+                return
+            end
+            if os.clock() >= deadline then
+                requestReturnToMain()
+                return
+            end
+
+            -- Claim the one friend-join attempt before module loading can yield.
+            friendJoinStarted = true
+            debugPrint("AFK Friend", "Friend detected =", otherPlayer.Name, "Joining owner =", Config.FriendName)
+            local transfer
+            local joinOK, joinError = pcall(function()
+                assert(type(Config.FriendName) == "string" and Config.FriendName ~= "", "Set Config.FriendName")
+                assert(Config.FriendName:lower() ~= LocalPlayer.Name:lower(), "FriendName must be another player")
+
+                local cam = waitForChildDebug(ReplicatedStorage, "CAM")
+                local client = waitForChildDebug(cam, "Client")
+                local modules = waitForChildDebug(client, "Modules")
+                local Teleporter = requireDebug(waitForChildDebug(modules, "Teleporter"))
+
+                if not isActive() or returnStarted or otherPlayer.Parent ~= Players then
+                    return
+                end
+                if returnDue or os.clock() >= deadline then
+                    requestReturnToMain()
+                    return
+                end
+
+                transfer = {Kind = "Friend private server", PlaceId = AFK_PLACE_ID}
+                pendingTransfer = transfer
+                -- A yielding/accepted request is not proof that the player left.
+                -- Release only this attempt if it stalls, so the hourly return can run.
+                task.delay(30, function()
+                    if pendingTransfer == transfer and isActive() then
+                        debugPrint("AFK Friend", "Still here after 30 seconds; releasing the pending transfer")
+                        finishTransfer(transfer)
+                    end
+                end)
+                local accepted, reason = Teleporter.Request({
+                    placeId = AFK_PLACE_ID,
+                    privateOwner = Config.FriendName,
+                }, {
+                    Title = "Joining Private Server",
+                    SubTitle = "Joining " .. Config.FriendName .. "'s private server",
+                })
+                debugPrint("AFK Friend", "Request accepted =", accepted, "reason =", reason)
+                if not accepted then
+                    warn("AFK friend private-server request failed:", reason)
+                    finishTransfer(transfer)
+                    return
+                end
+
+            end)
+            if not joinOK then
+                warn("AFK friend private-server join failed:", joinError)
+                if transfer then
+                    finishTransfer(transfer)
+                end
+            end
+        end)
+    end
+
+    -- Connect first so a player joining during the initial scan is not missed.
+    Players.PlayerAdded:Connect(checkPlayer)
+    for _, otherPlayer in ipairs(Players:GetPlayers()) do
+        checkPlayer(otherPlayer)
+    end
 end
 
 local function startAFKResourceMonitor()
@@ -816,8 +982,8 @@ if game.PlaceId == VERSION_PLACE_ID then
         checkVersion()
     end)
 elseif game.PlaceId == AFK_PLACE_ID then
-    debugPrint("Route", "AFK place: resource monitor")
-    -- Run the attached monitor here without another private-server join.
+    debugPrint("Route", "AFK place: friend check, return timer, and resource monitor")
+    startAFKServerRules()
     task.spawn(startAFKResourceMonitor)
 else
     debugPrint("Route", "Other place: private-server flow without version check")
