@@ -5,7 +5,7 @@ local Config = {
     FriendName = "Sateandrei", -- Your friend's Roblox username.
     FriendPrivateServerJobId = "", -- Optional: known JobId if you joined that friend's server manually.
     AFKJoinFriendWhenFriendPresent = true, -- In the AFK place, join FriendName if any Roblox friend is present.
-    AFKReturnEnabled = true, -- false disables the timed AFK return to the main place.
+    AFKReturnEnabled = false, -- false disables the timed AFK return to the main place.
     AFKReturnAfterSeconds = 60 * 60, -- Return to the main place after one hour in this script session.
 }
 
