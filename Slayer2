@@ -3,9 +3,10 @@ local Config = {
     ExpectedVersion = 2,
     PrivateServerPlaceId = 136406881576517, -- World to join, regardless of the current place.
     FriendName = "Sateandrei", -- Your friend's Roblox username.
+    PassOwnPrivateServer = true, -- true = join FriendName directly; false = try your own server first.
     FriendPrivateServerJobId = "", -- Optional: known JobId if you joined that friend's server manually.
     AFKJoinFriendWhenFriendPresent = true, -- In the AFK place, join FriendName if any Roblox friend is present.
-    AFKReturnEnabled = false, -- false disables the timed AFK return to the main place.
+    AFKReturnEnabled = true, -- false disables the timed AFK return to the main place.
     AFKReturnAfterSeconds = 60 * 60, -- Return to the main place after one hour in this script session.
 }
 
@@ -283,7 +284,7 @@ local function startPrivateJoin()
     end
 
     privateJoinStarted = true
-    debugPrint("Private", "Starting own-server / friend-server flow")
+    debugPrint("Private", "Starting private-server flow; skip own server =", Config.PassOwnPrivateServer == true)
 
     task.spawn(function()
         local joinSuccess, joinError = pcall(function()
@@ -296,10 +297,6 @@ local function startPrivateJoin()
             local modules = waitForChildDebug(client, "Modules")
             local teleporterModule = waitForChildDebug(modules, "Teleporter")
             local Teleporter = requireDebug(teleporterModule)
-
-            local global = waitForChildDebug(cam, "Global")
-            local vipModule = waitForChildDebug(global, "VipAccess")
-            local VipAccess = requireDebug(vipModule)
 
             if not canJoinPrivate() then
                 logPrivateBlocked("module loading completed")
@@ -321,10 +318,25 @@ local function startPrivateJoin()
             end
 
             local ownReason = "Private-server access is not owned"
+            local hasVip = false
 
-            debugPrint("Private", "Checking VipAccess.Has")
-            local hasVip = VipAccess.Has(LocalPlayer)
-            debugPrint("Private", "VipAccess.Has returned =", hasVip)
+            if Config.PassOwnPrivateServer == true then
+                ownReason = "Skipped by PassOwnPrivateServer"
+                debugPrint("Private", "Own server skipped; joining configured friend directly")
+            else
+                local global = waitForChildDebug(cam, "Global")
+                local vipModule = waitForChildDebug(global, "VipAccess")
+                local VipAccess = requireDebug(vipModule)
+
+                if not canJoinPrivate() then
+                    logPrivateBlocked("VIP module loading completed")
+                    return
+                end
+
+                debugPrint("Private", "Checking VipAccess.Has")
+                hasVip = VipAccess.Has(LocalPlayer)
+                debugPrint("Private", "VipAccess.Has returned =", hasVip)
+            end
 
             if hasVip then
                 local joinedOwn
@@ -365,7 +377,7 @@ local function startPrivateJoin()
 
             if not joinedFriend and canJoinPrivate() then
                 warn(
-                    "Both private-server attempts failed.",
+                    "Private-server join flow failed.",
                     "Own:", ownReason,
                     "Friend:", friendReason
                 )
