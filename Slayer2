@@ -1,6 +1,6 @@
 local Config = {
     DebugPrints = false, -- Set false to turn off diagnostic prints.
-    ExpectedVersion = 195,
+    ExpectedVersion = 2,
     PrivateServerPlaceId = 136406881576517, -- World to join, regardless of the current place.
     FriendName = "Sateandrei", -- Your friend's Roblox username.
     PassOwnPrivateServer = true, -- true = join FriendName directly; false = try your own server first.
