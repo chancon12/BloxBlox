@@ -1,0 +1,501 @@
+-- Private Server Control GUI
+-- Run from a client context. Server-side owner/moderator checks still apply.
+
+local MAIN_PLACE_ID = 16205713724
+local PRIVATE_SERVER_PLACE_ID = 136406881576517
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+assert(LocalPlayer, "Run this script on the client")
+
+if game.PlaceId == MAIN_PLACE_ID then
+	-- Only request your own private server from the main place.
+	local ok, message = pcall(function()
+		local cam = ReplicatedStorage:WaitForChild("CAM")
+		local Teleporter = require(
+			cam:WaitForChild("Client")
+				:WaitForChild("Modules")
+				:WaitForChild("Teleporter")
+		)
+		local VipAccess = require(
+			cam:WaitForChild("Global"):WaitForChild("VipAccess")
+		)
+
+		if not VipAccess.Has(LocalPlayer) then
+			warn("[PrivateServerControl] Private-server access is not owned.")
+			return
+		end
+
+		local accepted, reason = Teleporter.Request({
+			placeId = PRIVATE_SERVER_PLACE_ID,
+			privateOwner = LocalPlayer.Name,
+		}, {
+			Title = "Joining Private Server",
+			SubTitle = "Joining your private server",
+		})
+
+		if not accepted then
+			warn("[PrivateServerControl] Own private-server request failed:", reason)
+		end
+	end)
+
+	if not ok then
+		warn("[PrivateServerControl] Own private-server join failed:", message)
+	end
+	return
+elseif game.PlaceId ~= PRIVATE_SERVER_PLACE_ID then
+	return
+end
+
+-- The GUI is created only when this script runs in the private-server place.
+local UserInputService = game:GetService("UserInputService")
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local SignalFunction = require(
+	ReplicatedStorage
+		:WaitForChild("Communication")
+		:WaitForChild("ServerAndClient")
+		:WaitForChild("Signals")
+		:WaitForChild("SignalFunction")
+)
+
+local GuiParent = PlayerGui
+pcall(function()
+	if typeof(gethui) == "function" then
+		GuiParent = gethui()
+	end
+end)
+
+local oldGui = GuiParent:FindFirstChild("PrivateServerControl")
+if oldGui then
+	oldGui:Destroy()
+end
+
+local COLORS = {
+	Panel = Color3.fromRGB(16, 14, 12),
+	PanelBottom = Color3.fromRGB(27, 22, 17),
+	Button = Color3.fromRGB(35, 32, 29),
+	ButtonHover = Color3.fromRGB(52, 45, 35),
+	Input = Color3.fromRGB(28, 26, 24),
+	Gold = Color3.fromRGB(225, 173, 66),
+	GoldBright = Color3.fromRGB(255, 211, 105),
+	Cream = Color3.fromRGB(244, 235, 213),
+	Muted = Color3.fromRGB(157, 148, 132),
+	Error = Color3.fromRGB(255, 105, 105),
+	Success = Color3.fromRGB(117, 225, 144),
+	PvpOff = Color3.fromRGB(143, 54, 54),
+	PvpOn = Color3.fromRGB(45, 130, 72),
+}
+
+local function create(className, properties, parent)
+	local object = Instance.new(className)
+	for property, value in pairs(properties or {}) do
+		object[property] = value
+	end
+	object.Parent = parent
+	return object
+end
+
+local function addCorner(parent, radius)
+	return create("UICorner", { CornerRadius = UDim.new(0, radius) }, parent)
+end
+
+local function addStroke(parent, color, thickness, transparency)
+	return create("UIStroke", {
+		Color = color,
+		Thickness = thickness or 1,
+		Transparency = transparency or 0,
+	}, parent)
+end
+
+local Gui = create("ScreenGui", {
+	Name = "PrivateServerControl",
+	DisplayOrder = 2147483647,
+	IgnoreGuiInset = true,
+	ResetOnSpawn = false,
+	ZIndexBehavior = Enum.ZIndexBehavior.Global,
+}, GuiParent)
+
+local Panel = create("Frame", {
+	Name = "Panel",
+	Active = true,
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(650, 470),
+	BackgroundColor3 = COLORS.Panel,
+	BorderSizePixel = 0,
+	ZIndex = 10,
+}, Gui)
+
+addCorner(Panel, 18)
+addStroke(Panel, COLORS.Gold, 2, 0.05)
+create("UIGradient", {
+	Rotation = 90,
+	Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, COLORS.Panel),
+		ColorSequenceKeypoint.new(1, COLORS.PanelBottom),
+	}),
+}, Panel)
+
+local Camera = workspace.CurrentCamera
+create("UIScale", {
+	Scale = math.clamp(Camera.ViewportSize.X / 1400, 0.58, 1),
+}, Panel)
+
+local Title = create("TextLabel", {
+	Name = "Title",
+	Active = true,
+	BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(30, 10),
+	Size = UDim2.new(1, -90, 0, 48),
+	Font = Enum.Font.GothamBold,
+	Text = "PRIVATE SERVER CONTROL",
+	TextColor3 = COLORS.Cream,
+	TextSize = 25,
+	ZIndex = 12,
+}, Panel)
+
+create("Frame", {
+	BackgroundColor3 = COLORS.Gold,
+	BackgroundTransparency = 0.35,
+	BorderSizePixel = 0,
+	Position = UDim2.fromOffset(25, 62),
+	Size = UDim2.new(1, -50, 0, 1),
+	ZIndex = 11,
+}, Panel)
+
+local CloseButton = create("TextButton", {
+	Name = "Close",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -16, 0, 13),
+	Size = UDim2.fromOffset(42, 42),
+	BackgroundColor3 = COLORS.Button,
+	BorderSizePixel = 0,
+	AutoButtonColor = false,
+	Font = Enum.Font.GothamBold,
+	Text = "X",
+	TextColor3 = COLORS.GoldBright,
+	TextSize = 20,
+	ZIndex = 15,
+}, Panel)
+addCorner(CloseButton, 21)
+addStroke(CloseButton, COLORS.Gold, 1.5, 0)
+
+local TargetBox = create("TextBox", {
+	Name = "TargetName",
+	Position = UDim2.fromOffset(40, 79),
+	Size = UDim2.new(1, -80, 0, 53),
+	BackgroundColor3 = COLORS.Input,
+	BorderSizePixel = 0,
+	ClearTextOnFocus = false,
+	Font = Enum.Font.Gotham,
+	PlaceholderText = "Target player name",
+	PlaceholderColor3 = COLORS.Muted,
+	Text = "",
+	TextColor3 = COLORS.Cream,
+	TextSize = 19,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 12,
+}, Panel)
+addCorner(TargetBox, 11)
+addStroke(TargetBox, COLORS.Gold, 1.3, 0.25)
+create("UIPadding", {
+	PaddingLeft = UDim.new(0, 18),
+	PaddingRight = UDim.new(0, 18),
+}, TargetBox)
+
+create("TextLabel", {
+	BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(40, 144),
+	Size = UDim2.new(1, -80, 0, 30),
+	Font = Enum.Font.GothamBold,
+	Text = "SERVER ACCESS",
+	TextColor3 = COLORS.Cream,
+	TextSize = 20,
+	ZIndex = 12,
+}, Panel)
+
+local AccessStatus = create("TextLabel", {
+	BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(40, 245),
+	Size = UDim2.new(1, -80, 0, 27),
+	Font = Enum.Font.GothamMedium,
+	Text = "Access: Select a mode",
+	TextColor3 = COLORS.GoldBright,
+	TextSize = 17,
+	ZIndex = 12,
+}, Panel)
+
+local Feedback = create("TextLabel", {
+	BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(30, 436),
+	Size = UDim2.new(1, -60, 0, 24),
+	Font = Enum.Font.GothamMedium,
+	Text = "",
+	TextColor3 = COLORS.Muted,
+	TextSize = 15,
+	TextWrapped = true,
+	ZIndex = 12,
+}, Panel)
+
+local busy = false
+local activeMode = nil
+local accessButtons = {}
+
+local function setFeedback(text, kind)
+	Feedback.Text = text or ""
+	Feedback.TextColor3 = kind == "Success" and COLORS.Success
+		or kind == "Error" and COLORS.Error
+		or COLORS.Muted
+end
+
+local function runCommand(commandLine, callback)
+	if busy then
+		setFeedback("Please wait for the current command.", "Error")
+		return
+	end
+
+	busy = true
+	setFeedback("Sending " .. commandLine .. "...", "Normal")
+
+	task.spawn(function()
+		local reachedServer, commandSucceeded, serverMessage =
+			pcall(SignalFunction.ToServer, "PlayerCommands", {
+				action = "run",
+				line = commandLine,
+			})
+
+		busy = false
+
+		if not reachedServer then
+			callback(false, "Could not reach the server.")
+			return
+		end
+
+		local succeeded = commandSucceeded == true
+		local message = serverMessage
+		if message == nil or message == "" then
+			message = succeeded and "Command completed." or "Command was denied."
+		end
+
+		callback(succeeded, tostring(message))
+	end)
+end
+
+local function refreshAccessButtons()
+	for mode, information in pairs(accessButtons) do
+		local selected = mode == activeMode
+		information.Button.BackgroundColor3 = selected and COLORS.Gold or COLORS.Button
+		information.Button.TextColor3 = selected and Color3.fromRGB(28, 22, 12) or COLORS.Cream
+		information.Stroke.Color = selected and COLORS.GoldBright or COLORS.Gold
+		information.Stroke.Thickness = selected and 2 or 1.2
+	end
+end
+
+local accessDefinitions = {
+	{ Mode = "Closed", X = 40 },
+	{ Mode = "Friends", X = 236 },
+	{ Mode = "Everyone", X = 432 },
+}
+
+for _, definition in ipairs(accessDefinitions) do
+	local mode = definition.Mode
+	local button = create("TextButton", {
+		Name = mode,
+		Position = UDim2.fromOffset(definition.X, 181),
+		Size = UDim2.fromOffset(178, 59),
+		BackgroundColor3 = COLORS.Button,
+		BorderSizePixel = 0,
+		AutoButtonColor = false,
+		Font = Enum.Font.GothamBold,
+		Text = string.upper(mode),
+		TextColor3 = COLORS.Cream,
+		TextSize = 18,
+		ZIndex = 12,
+	}, Panel)
+	addCorner(button, 11)
+	local stroke = addStroke(button, COLORS.Gold, 1.2, 0.1)
+	accessButtons[mode] = { Button = button, Stroke = stroke }
+
+	button.MouseEnter:Connect(function()
+		if activeMode ~= mode then
+			button.BackgroundColor3 = COLORS.ButtonHover
+		end
+	end)
+
+	button.MouseLeave:Connect(refreshAccessButtons)
+	button.MouseButton1Click:Connect(function()
+		runCommand("/access " .. string.lower(mode), function(success, message)
+			if success then
+				activeMode = mode
+				AccessStatus.Text = "Access: " .. mode
+				refreshAccessButtons()
+				setFeedback(message, "Success")
+			else
+				setFeedback(message, "Error")
+			end
+		end)
+	end)
+end
+
+-- The game replicates the current setting through workspace.ServerPvP.
+-- Its combat code treats nil as enabled and only explicit false as disabled.
+local pvpEnabled = workspace:GetAttribute("ServerPvP") ~= false
+
+local PvpButton = create("TextButton", {
+	Name = "PvpToggle",
+	Position = UDim2.fromOffset(40, 280),
+	Size = UDim2.new(1, -80, 0, 58),
+	BackgroundColor3 = COLORS.PvpOn,
+	BorderSizePixel = 0,
+	AutoButtonColor = false,
+	Font = Enum.Font.GothamBold,
+	Text = "PLAYER PVP: ON",
+	TextColor3 = COLORS.Cream,
+	TextSize = 20,
+	ZIndex = 12,
+}, Panel)
+addCorner(PvpButton, 11)
+addStroke(PvpButton, COLORS.Gold, 1.5, 0.05)
+
+local function refreshPvpButton()
+	PvpButton.Text = pvpEnabled and "PLAYER PVP: ON" or "PLAYER PVP: OFF"
+	PvpButton.BackgroundColor3 = pvpEnabled and COLORS.PvpOn or COLORS.PvpOff
+end
+
+workspace:GetAttributeChangedSignal("ServerPvP"):Connect(function()
+	pvpEnabled = workspace:GetAttribute("ServerPvP") ~= false
+	refreshPvpButton()
+end)
+
+PvpButton.MouseButton1Click:Connect(function()
+	local requestedState = not pvpEnabled
+	local stateWord = requestedState and "on" or "off"
+
+	runCommand("/pvp " .. stateWord, function(success, message)
+		if success then
+			pvpEnabled = requestedState
+			refreshPvpButton()
+			setFeedback("Player PvP turned " .. string.upper(stateWord) .. ". " .. message, "Success")
+		else
+			setFeedback(message, "Error")
+		end
+	end)
+end)
+
+local WhitelistButton = create("TextButton", {
+	Name = "Whitelist",
+	Position = UDim2.fromOffset(40, 354),
+	Size = UDim2.new(1, -80, 0, 58),
+	BackgroundColor3 = COLORS.Gold,
+	BorderSizePixel = 0,
+	AutoButtonColor = false,
+	Font = Enum.Font.GothamBold,
+	Text = "WHITELIST PLAYER",
+	TextColor3 = Color3.fromRGB(28, 22, 12),
+	TextSize = 21,
+	ZIndex = 12,
+}, Panel)
+addCorner(WhitelistButton, 11)
+addStroke(WhitelistButton, COLORS.GoldBright, 2, 0)
+
+WhitelistButton.MouseEnter:Connect(function()
+	WhitelistButton.BackgroundColor3 = COLORS.GoldBright
+end)
+WhitelistButton.MouseLeave:Connect(function()
+	WhitelistButton.BackgroundColor3 = COLORS.Gold
+end)
+
+WhitelistButton.MouseButton1Click:Connect(function()
+	local target = TargetBox.Text:gsub("^%s+", ""):gsub("%s+$", "")
+
+	if target == "" then
+		setFeedback("Enter the player's Roblox username.", "Error")
+		return
+	end
+
+	if #target > 20 or not target:match("^[%w_]+$") then
+		setFeedback("Enter a valid Roblox username, not a display name.", "Error")
+		return
+	end
+
+	runCommand("/whitelist " .. target, function(success, message)
+		if success then
+			setFeedback("Whitelisted " .. target .. ". " .. message, "Success")
+		else
+			setFeedback(message, "Error")
+		end
+	end)
+end)
+
+local OpenButton = create("TextButton", {
+	Name = "Open",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -24, 0, 75),
+	Size = UDim2.fromOffset(52, 52),
+	BackgroundColor3 = COLORS.Panel,
+	BorderSizePixel = 0,
+	AutoButtonColor = false,
+	Font = Enum.Font.GothamBold,
+	Text = "PS",
+	TextColor3 = COLORS.GoldBright,
+	TextSize = 17,
+	Visible = false,
+	ZIndex = 20,
+}, Gui)
+addCorner(OpenButton, 26)
+addStroke(OpenButton, COLORS.Gold, 2, 0)
+
+CloseButton.MouseButton1Click:Connect(function()
+	Panel.Visible = false
+	OpenButton.Visible = true
+end)
+
+OpenButton.MouseButton1Click:Connect(function()
+	OpenButton.Visible = false
+	Panel.Visible = true
+end)
+
+local dragging = false
+local dragStart
+local startingPosition
+
+Title.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch
+	then
+		dragging = true
+		dragStart = input.Position
+		startingPosition = Panel.Position
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if not dragging then
+		return
+	end
+	if input.UserInputType ~= Enum.UserInputType.MouseMovement
+		and input.UserInputType ~= Enum.UserInputType.Touch
+	then
+		return
+	end
+
+	local delta = input.Position - dragStart
+	Panel.Position = UDim2.new(
+		startingPosition.X.Scale,
+		startingPosition.X.Offset + delta.X,
+		startingPosition.Y.Scale,
+		startingPosition.Y.Offset + delta.Y
+	)
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch
+	then
+		dragging = false
+	end
+end)
+
+refreshAccessButtons()
+refreshPvpButton()
