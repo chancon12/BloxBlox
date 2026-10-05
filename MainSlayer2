@@ -79,7 +79,7 @@ local COLORS = {
 	Input = Color3.fromRGB(28, 26, 24),
 	Gold = Color3.fromRGB(225, 173, 66),
 	GoldBright = Color3.fromRGB(255, 211, 105),
-	Cream = Color3.fromRGB(244, 235, 213),
+	Text = Color3.fromRGB(255, 255, 255),
 	Muted = Color3.fromRGB(157, 148, 132),
 	Error = Color3.fromRGB(255, 105, 105),
 	Success = Color3.fromRGB(117, 225, 144),
@@ -150,7 +150,7 @@ local Title = create("TextLabel", {
 	Size = UDim2.new(1, -90, 0, 48),
 	Font = Enum.Font.GothamBold,
 	Text = "PRIVATE SERVER CONTROL",
-	TextColor3 = COLORS.Cream,
+	TextColor3 = COLORS.Text,
 	TextSize = 25,
 	ZIndex = 12,
 }, Panel)
@@ -174,7 +174,7 @@ local CloseButton = create("TextButton", {
 	AutoButtonColor = false,
 	Font = Enum.Font.GothamBold,
 	Text = "X",
-	TextColor3 = COLORS.GoldBright,
+	TextColor3 = COLORS.Text,
 	TextSize = 20,
 	ZIndex = 15,
 }, Panel)
@@ -192,7 +192,7 @@ local TargetBox = create("TextBox", {
 	PlaceholderText = "Target player name",
 	PlaceholderColor3 = COLORS.Muted,
 	Text = "",
-	TextColor3 = COLORS.Cream,
+	TextColor3 = COLORS.Text,
 	TextSize = 19,
 	TextXAlignment = Enum.TextXAlignment.Left,
 	ZIndex = 12,
@@ -210,7 +210,7 @@ create("TextLabel", {
 	Size = UDim2.new(1, -80, 0, 30),
 	Font = Enum.Font.GothamBold,
 	Text = "SERVER ACCESS",
-	TextColor3 = COLORS.Cream,
+	TextColor3 = COLORS.Text,
 	TextSize = 20,
 	ZIndex = 12,
 }, Panel)
@@ -221,7 +221,7 @@ local AccessStatus = create("TextLabel", {
 	Size = UDim2.new(1, -80, 0, 27),
 	Font = Enum.Font.GothamMedium,
 	Text = "Access: Select a mode",
-	TextColor3 = COLORS.GoldBright,
+	TextColor3 = COLORS.Text,
 	TextSize = 17,
 	ZIndex = 12,
 }, Panel)
@@ -286,7 +286,7 @@ local function refreshAccessButtons()
 	for mode, information in pairs(accessButtons) do
 		local selected = mode == activeMode
 		information.Button.BackgroundColor3 = selected and COLORS.Gold or COLORS.Button
-		information.Button.TextColor3 = selected and Color3.fromRGB(28, 22, 12) or COLORS.Cream
+		information.Button.TextColor3 = selected and Color3.fromRGB(28, 22, 12) or COLORS.Text
 		information.Stroke.Color = selected and COLORS.GoldBright or COLORS.Gold
 		information.Stroke.Thickness = selected and 2 or 1.2
 	end
@@ -309,7 +309,7 @@ for _, definition in ipairs(accessDefinitions) do
 		AutoButtonColor = false,
 		Font = Enum.Font.GothamBold,
 		Text = string.upper(mode),
-		TextColor3 = COLORS.Cream,
+		TextColor3 = COLORS.Text,
 		TextSize = 18,
 		ZIndex = 12,
 	}, Panel)
@@ -351,7 +351,7 @@ local PvpButton = create("TextButton", {
 	AutoButtonColor = false,
 	Font = Enum.Font.GothamBold,
 	Text = "PLAYER PVP: ON",
-	TextColor3 = COLORS.Cream,
+	TextColor3 = COLORS.Text,
 	TextSize = 20,
 	ZIndex = 12,
 }, Panel)
@@ -438,7 +438,7 @@ local OpenButton = create("TextButton", {
 	AutoButtonColor = false,
 	Font = Enum.Font.GothamBold,
 	Text = "PS",
-	TextColor3 = COLORS.GoldBright,
+	TextColor3 = COLORS.Text,
 	TextSize = 17,
 	Visible = false,
 	ZIndex = 20,
