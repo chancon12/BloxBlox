@@ -1890,11 +1890,11 @@ do
         local statusPage = Instance.new("Frame")
         statusPage.Name = "StatusPage"
         statusPage.BackgroundTransparency = 1
-        statusPage.Position = UDim2.fromOffset(0, 74)
-        statusPage.Size = UDim2.new(1, 0, 1, -86)
+        statusPage.Position = UDim2.fromOffset(0, 98)
+        statusPage.Size = UDim2.new(1, 0, 1, -110)
         statusPage.Parent = panel
         for name, label in pairs(Runtime.Labels) do
-            if name ~= "Title" then
+            if name ~= "Title" and name ~= "Username" then
                 label.Position = label.Position - UDim2.fromOffset(0, 36)
                 label.Parent = statusPage
             end
@@ -1903,17 +1903,17 @@ do
         local statsPage = Instance.new("Frame")
         statsPage.Name = "StatsPage"
         statsPage.BackgroundTransparency = 1
-        statsPage.Position = UDim2.fromOffset(12, 74)
-        statsPage.Size = UDim2.new(1, -24, 1, -86)
+        statsPage.Position = UDim2.fromOffset(12, 98)
+        statsPage.Size = UDim2.new(1, -24, 1, -110)
         statsPage.Visible = false
         statsPage.Parent = panel
 
-        local statusTab = button("StatusTab", "Status", UDim2.fromOffset(12, 36), UDim2.fromOffset(139, 28))
-        local statsTab = button("StatsTab", "Stats", UDim2.fromOffset(159, 36), UDim2.fromOffset(139, 28))
+        local statusTab = button("StatusTab", "Status", UDim2.fromOffset(12, 60), UDim2.fromOffset(139, 28))
+        local statsTab = button("StatsTab", "Stats", UDim2.fromOffset(159, 60), UDim2.fromOffset(139, 28))
         local function selectTab(showStats)
             statusPage.Visible = not showStats
             statsPage.Visible = showStats
-            panel.Size = UDim2.fromOffset(310, showStats and 382 or 340)
+            panel.Size = UDim2.fromOffset(310, showStats and 406 or 364)
             statusTab.BackgroundColor3 = Color3.fromRGB(40, 65, 105)
             statsTab.BackgroundColor3 = Color3.fromRGB(40, 65, 105)
             local active = showStats and statsTab or statusTab
@@ -2003,7 +2003,7 @@ local function createGUI()
     frame.Parent = screenGui
     frame.AnchorPoint = Vector2.new(1, 0)
     frame.Position = UDim2.new(1, -18, 0, 18)
-    frame.Size = UDim2.fromOffset(310, 302)
+    frame.Size = UDim2.fromOffset(310, 326)
     frame.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
     frame.BackgroundTransparency = 0.12
     frame.BorderSizePixel = 0
@@ -2026,6 +2026,22 @@ local function createGUI()
         "AUTO BOUNTY",
         16
     )
+    Runtime.Labels.Username = createTextLabel(
+        frame,
+        "Username",
+        UDim2.fromOffset(12, 34),
+        UDim2.new(1, -24, 0, 20),
+        "Player: @" .. LocalPlayer.Name,
+        14
+    )
+    Runtime.Labels.Username.TextColor3 = Color3.fromRGB(255, 255, 255)
+    Runtime.Labels.Username.TextScaled = true
+    Runtime.Labels.Username.TextWrapped = false
+    local usernameTextSize = Instance.new("UITextSizeConstraint")
+    usernameTextSize.MinTextSize = 10
+    usernameTextSize.MaxTextSize = 14
+    usernameTextSize.Parent = Runtime.Labels.Username
+
     Runtime.Labels.Bounty = createTextLabel(frame, "Bounty", UDim2.fromOffset(12, 36), UDim2.new(1, -24, 0, 20), "Bounty/Honor: Loading...", 14)
     Runtime.Labels.Gained = createTextLabel(frame, "Gained", UDim2.fromOffset(12, 58), UDim2.new(1, -24, 0, 40), "Total gained: Loading...", 14)
     Runtime.Labels.Gained.TextWrapped = true
