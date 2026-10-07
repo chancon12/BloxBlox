@@ -1,4 +1,4 @@
--- Compact centered GUI: large username and three totals, with Status/Stats/Accessories tabs.
+-- Compact centered GUI: large username, current Bounty/Honor, and three totals.
 -- Drag the username header to move. X hides the panel; Bounty reopens it without stopping workers.
 -- Pause/Resume stops bounty workers; Stats and Accessories stay available.
 -- Accessories automatically equips the best owned item in the first available priority:
@@ -2005,27 +2005,30 @@ do
         Revision = 0,
         Working = false,
         PriorityOrder = {
-            "Damage", "SwordDamage", "Resistance", "FruitResistance", "GunResistance",
-            "MeleeResistance", "SwordResistance", "Instinct", "Health",
+            "Damage", "Resistance", "Instinct", "Health", "Cooldown",
         },
         PriorityLabels = {
-            Damage = "Overall damage", SwordDamage = "Sword damage",
-            Resistance = "Overall resistance", FruitResistance = "Fruit resistance",
-            GunResistance = "Gun resistance", MeleeResistance = "Melee resistance",
-            SwordResistance = "Sword resistance", Instinct = "Instinct", Health = "Health & recovery",
+            Damage = "Damage", Resistance = "Resistance", Instinct = "Instinct",
+            Health = "Health", Cooldown = "Cooldown",
         },
-        -- General bonuses are separate priorities from weapon-specific bonuses.
-        -- Otherwise a sword-only bonus would already match Overall damage.
+        -- Wearable/Super accessories only; generated Trinkets are excluded.
+        -- The first priority with a positive score wins.
         PriorityWeights = {
-            Damage = {["AllDamage.All"] = 1},
-            SwordDamage = {["AllDamage.Sword"] = 1},
-            Resistance = {["AllResist.All"] = 1},
-            FruitResistance = {["AllResist.Fruit"] = 1},
-            GunResistance = {["AllResist.Gun"] = 1},
-            MeleeResistance = {["AllResist.Melee"] = 1},
-            SwordResistance = {["AllResist.Sword"] = 1},
+            Damage = {
+                ["AllDamage.All"] = 1, ["AllDamage.Fruit"] = 1, ["AllDamage.Gun"] = 1,
+                ["AllDamage.Melee"] = 1, ["AllDamage.Sword"] = 1, ["SeaDamage.All"] = 1,
+            },
+            Resistance = {
+                ["AllResist.All"] = 1, ["AllResist.Fruit"] = 1, ["AllResist.Gun"] = 1,
+                ["AllResist.Melee"] = 1, ["AllResist.Sword"] = 1,
+                ["SeaResist.All"] = 1, SeaDamageReduction = 1,
+            },
             Instinct = {DodgeBoost = 100, ObservationRange = 1},
             Health = {Health = 1, HealthRegen = 1000, ["PveLeech.Melee"] = 1000, ["PvpLeech.Melee"] = 1000},
+            Cooldown = {
+                AllCooldown = 1, FruitCooldown = 1, GunCooldown = 1,
+                MeleeCooldown = 1, SwordCooldown = 1, FlashstepCooldown = 1,
+            },
         },
     }
     Runtime.AccessoryUI = Accessory
@@ -2099,8 +2102,9 @@ do
         if Accessory.Dependencies then return Accessory.Dependencies end
         local deadline = os.clock() + 15
         local paths = {
-            {"Wear", {"Modules", "Asset", "ItemData", "ItemStats", "Wear"}},
-            {"AccessoriesShared", {"AccessoriesShared"}},
+            -- Read the merged parent table instead of the emptied Wear child cache.
+            {"ItemStats", {"Modules", "Asset", "ItemData", "ItemStats"}},
+            {"ItemConfig", {"ItemConfig"}},
             {"ItemReplicationService", {"ItemReplicationService"}},
             {"KEYS", {"ItemReplicationService", "KEYS"}},
             {"ItemId", {"Economy", "ItemId"}},
@@ -2133,7 +2137,7 @@ do
         if not service.IS_CLIENT then return nil, "Accessory inventory is unavailable on this client." end
         if type(service.GetItems) ~= "function" or type(service.ReadItem) ~= "function"
             or type(dependencies.ItemId.getDataFromId) ~= "function"
-            or type(dependencies.AccessoriesShared.getReplicatedAccessoryItem) ~= "function"
+            or type(dependencies.ItemConfig.match) ~= "function"
             or dependencies.KEYS.QUANTITY == nil or dependencies.KEYS.IS_EQUIPPED == nil then
             return nil, "Accessory inventory data is incomplete. Use Rescan to retry."
         end
@@ -2170,57 +2174,67 @@ do
     end
 
     function Accessory.ReadCandidate(dependencies, replicatedItem, revision)
-        local ok, candidate = pcall(function()
-            if type(replicatedItem) ~= "table" or not isFiniteNumber(replicatedItem.Value)
-                or replicatedItem.Value <= 0 then return nil end
-            local itemId, uid = replicatedItem.ItemId, replicatedItem.NetworkedUID
-            if type(itemId) ~= "string" and not isFiniteNumber(itemId) then return nil end
-            if uid ~= nil and type(uid) ~= "string" and not isFiniteNumber(uid) then return nil end
-            local storageOk, storageKey = pcall(function()
-                return dependencies.ItemId.getDataFromId(itemId):unwrap().StorageKey
-            end)
-            if not Accessory.IsRequestCurrent(revision) then return nil end
-            if not storageOk or type(storageKey) ~= "string" or storageKey == "" then storageKey = nil end
-            if uid == nil and storageKey == nil then return nil end
-            local accessory
-            if uid ~= nil then
-                local accessoryOk, replicated = pcall(function()
-                    return dependencies.AccessoriesShared.getReplicatedAccessoryItem(itemId, uid)
-                end)
-                if not Accessory.IsRequestCurrent(revision) then return nil end
-                if accessoryOk then accessory = replicated end
-            end
-            local buffs, name
-            if type(accessory) == "table" then
-                if type(accessory.Name) == "string" and accessory.Name ~= "" then name = accessory.Name end
-                if accessory.Type == "Trinket" then
-                    local buffsOk, trinketBuffs = pcall(function()
-                        return dependencies.AccessoriesShared.GetBuffsForItem(accessory)
-                    end)
-                    if not Accessory.IsRequestCurrent(revision) then return nil end
-                    if buffsOk then buffs = trinketBuffs end
-                    local grade = accessory.Grade
-                    if type(grade) == "string" or isFiniteNumber(grade) then
-                        name = (name or storageKey or tostring(itemId)) .. " [" .. tostring(grade) .. "]"
-                    end
-                elseif accessory.Type == "Super" then
-                    local wear = dependencies.Wear[accessory.Name]
-                    buffs = type(wear) == "table" and type(wear[0]) == "table" and wear[0][2] or nil
-                end
-            end
-            if type(buffs) ~= "table" then
-                local wear = dependencies.Wear[storageKey]
-                buffs = type(wear) == "table" and type(wear[0]) == "table" and wear[0][2] or nil
-            end
-            if type(buffs) ~= "table" then return nil end
-            local result = {ItemId = itemId, NetworkedUID = uid, StorageKey = storageKey,
-                Name = name or storageKey or tostring(itemId), Buffs = buffs}
-            result.IsEquipped = Accessory.IsEquipped(dependencies, result)
-            result.SortKey = result.Name .. "\0" .. tostring(uid or storageKey) .. "\0" .. tostring(itemId)
-            return result
+        if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled", true end
+        if type(replicatedItem) ~= "table" then
+            return nil, "Inventory entry is " .. typeof(replicatedItem), true
+        end
+        if not isFiniteNumber(replicatedItem.Value) or replicatedItem.Value <= 0 then
+            return nil, "Invalid/zero quantity: " .. tostring(replicatedItem.Value), true
+        end
+        local itemId, uid = replicatedItem.ItemId, replicatedItem.NetworkedUID
+        if type(itemId) ~= "string" and not isFiniteNumber(itemId) then
+            return nil, "Unsupported ItemId type: " .. typeof(itemId), true
+        end
+        if uid ~= nil and type(uid) ~= "string" and not isFiniteNumber(uid) then
+            return nil, "Unsupported NetworkedUID type: " .. typeof(uid), true
+        end
+
+        -- Filter out swords, guns, materials, fruit, etc.
+        local configOk, config = pcall(function()
+            return dependencies.ItemConfig.match(itemId):unwrap()
         end)
-        if ok then return candidate end
-        return nil
+        if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled", true end
+        if not configOk or type(config) ~= "table" or type(config.Index) ~= "table"
+            or config.Index.IdType ~= "Accessory" then
+            return nil, "Not a wearable accessory", true
+        end
+
+        if dependencies.KEYS.ACCESSORY_TYPE ~= nil then
+            local typeOk, accessoryType = pcall(function()
+                return dependencies.ItemReplicationService:ReadItem(dependencies.KEYS.ACCESSORY_TYPE, itemId, uid)
+            end)
+            if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled", true end
+            if typeOk and accessoryType == "Trinket" then
+                return nil, "Trinket excluded", true
+            end
+        end
+
+        local storageOk, storageData = pcall(function()
+            return dependencies.ItemId.getDataFromId(itemId):unwrap()
+        end)
+        if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled", true end
+        if not storageOk or type(storageData) ~= "table" then
+            return nil, "Storage lookup failed: " .. tostring(storageData), false
+        end
+        local storageKey = storageData.StorageKey
+        if type(storageKey) ~= "string" or storageKey == "" then
+            return nil, "Missing usable StorageKey", false
+        end
+
+        local definition = dependencies.ItemStats[storageKey]
+        local buffs
+        if type(definition) == "table" and type(definition[0]) == "table" then
+            buffs = definition[0][2]
+        end
+        if type(buffs) ~= "table" then
+            return nil, "No wearable buff table; StorageKey=" .. storageKey, false
+        end
+        local candidate = {ItemId = itemId, NetworkedUID = uid, StorageKey = storageKey,
+            Name = storageKey, Buffs = buffs}
+        candidate.IsEquipped = Accessory.IsEquipped(dependencies, candidate)
+        if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled", true end
+        candidate.SortKey = candidate.Name .. "\0" .. tostring(uid or storageKey) .. "\0" .. tostring(itemId)
+        return candidate
     end
 
     function Accessory.FindBest(dependencies, revision)
@@ -2234,12 +2248,22 @@ do
 
         -- Read inventory and item buffs once, then score the same snapshot in priority order.
         local candidates = {}
-        for _, replicatedItem in pairs(items or {}) do
+        local scanned = 0
+        for index, replicatedItem in pairs(items or {}) do
             if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled" end
-            local candidate = Accessory.ReadCandidate(dependencies, replicatedItem, revision)
+            scanned = scanned + 1
+            local readOk, candidate, reason, expectedSkip = pcall(
+                Accessory.ReadCandidate, dependencies, replicatedItem, revision)
             if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled" end
-            if candidate then table.insert(candidates, candidate) end
+            if readOk and candidate then
+                table.insert(candidates, candidate)
+            elseif not readOk then
+                warn("[AutoAccessory] Entry error:", index, candidate)
+            elseif not expectedSkip then
+                warn("[AutoAccessory] Skipped entry:", index, reason)
+            end
         end
+        print("[AutoAccessory] Inventory entries:", scanned, "| Wearables with buffs:", #candidates)
         for rank, priority in ipairs(Accessory.PriorityOrder) do
             local best, matches = nil, 0
             for _, candidate in ipairs(candidates) do
@@ -2254,9 +2278,13 @@ do
                     end
                 end
             end
-            if best then return best, nil, matches, priority, rank end
+            print("[AutoAccessory] Priority:", priority, "| Matches:", matches)
+            if best then
+                best.Priority = priority
+                return best, nil, matches, priority, rank
+            end
         end
-        return nil, "No owned accessory matches any automatic priority."
+        return nil, "No owned wearable matches any configured priority."
     end
 
     function Accessory.Apply(revision)
@@ -2273,8 +2301,10 @@ do
             Accessory.PriorityLabel.Text = "No available priority"
             Accessory.DetailLabel.Text = "Your current equipment has been kept."
             Accessory.SetStatus(revision, scanError, "error")
+            warn("[AutoAccessory]", scanError)
             return
         end
+        print("[AutoAccessory] Selected:", best.Name, "| Priority:", priority, "| Score:", best.Score)
         Accessory.SelectedPriority = priority
         Accessory.SelectedItemName = best.Name
         Accessory.PriorityLabel.Text = tostring(rank) .. ". " .. Accessory.PriorityLabels[priority]
@@ -2286,6 +2316,7 @@ do
         if not Accessory.IsRequestCurrent(revision) then return end
         if alreadyEquipped then
             Accessory.SetStatus(revision, "The best matching accessory is already equipped.", "success")
+            print("[AutoAccessory] Already equipped:", best.Name, "| Priority:", priority, "| Score:", best.Score)
             return
         end
         Accessory.SetStatus(revision, "Equipping " .. best.Name .. "...", "busy")
@@ -2296,6 +2327,7 @@ do
         if not Accessory.IsRequestCurrent(revision) then return end
         if not requested or result == false then
             Accessory.SetStatus(revision, "The equip request failed. Use Rescan to retry.", "error")
+            warn("[AutoAccessory] Equip request failed for", best.Name, result)
             return
         end
         local verifyBy = os.clock() + 3
@@ -2304,6 +2336,7 @@ do
             if not Accessory.IsRequestCurrent(revision) then return end
             if equipped then
                 Accessory.SetStatus(revision, "Equipped and confirmed by the inventory.", "success")
+                print("[AutoAccessory] Equipped and confirmed:", best.Name, "| Priority:", priority, "| Score:", best.Score)
                 return
             end
             if os.clock() >= verifyBy then break end
@@ -2311,6 +2344,7 @@ do
             if not Accessory.IsRequestCurrent(revision) then return end
         until false
         Accessory.SetStatus(revision, "Request sent; equip not confirmed. Use Rescan to retry.", "error")
+        warn("[AutoAccessory] Equip requested but not confirmed for", best.Name)
     end
 
     function Accessory.RunQueue()
@@ -2330,12 +2364,13 @@ do
                 end
                 if Accessory.IsRequestCurrent(request.Revision) then
                     Environment.__AutoBountyAccessoryRequest = token
-                    local ok = pcall(Accessory.Apply, request.Revision)
+                    local ok, reason = pcall(Accessory.Apply, request.Revision)
                     if Environment.__AutoBountyAccessoryRequest == token then
                         Environment.__AutoBountyAccessoryRequest = nil
                     end
                     if not ok then
                         Accessory.SetStatus(request.Revision, "Accessory data could not be read. Use Rescan to retry.", "error")
+                        warn("[AutoAccessory] Failed:", reason)
                     end
                 end
             end
@@ -2349,7 +2384,7 @@ do
         Accessory.SelectedPriority = nil
         Accessory.SelectedItemName = nil
         Accessory.ItemLabel.Text = "Checking your accessories..."
-        Accessory.PriorityLabel.Text = "Checking from Overall damage..."
+        Accessory.PriorityLabel.Text = "Checking from Damage..."
         Accessory.DetailLabel.Text = "The first available priority is applied automatically."
         Accessory.SetStatus(Accessory.Revision, "Preparing automatic equipment...", "busy")
         Accessory.Pending = {Revision = Accessory.Revision}
@@ -2361,12 +2396,12 @@ do
         Accessory.UI = UI
         PauseControl.AccessoryUI = Accessory
         UI.Text(page, "AccessoryTitle", "Automatic accessory", 24, 18, 610, 30, 24, UI.Colors.Text, true)
-        UI.Text(page, "AccessorySubtitle", "Checks priorities from top to bottom and equips the best owned match.",
+        UI.Text(page, "AccessorySubtitle", "Equips the best wearable by priority. Trinkets are excluded.",
             24, 52, 622, 36, 13, UI.Colors.Muted)
 
         local priorityCard = UI.CreateFrame(page, "AccessoryPriorityCard", 24, 104, 632, 116, UI.Colors.Panel, 12)
         UI.Text(priorityCard, "PriorityCaption", "FIRST AVAILABLE PRIORITY", 18, 12, 596, 20, 11, UI.Colors.Muted, true)
-        Accessory.PriorityLabel = UI.Text(priorityCard, "AutomaticPriority", "Checking from Overall damage...",
+        Accessory.PriorityLabel = UI.Text(priorityCard, "AutomaticPriority", "Checking from Damage...",
             18, 43, 596, 48, 24, UI.Colors.Text, true)
 
         local resultCard = UI.CreateFrame(page, "AccessoryResultCard", 24, 236, 632, 164, UI.Colors.Panel, 12)
@@ -2557,7 +2592,7 @@ local function createGUI()
         UI.Pages[name] = page
     end
 
-    -- Retain the worker-facing labels invisibly. Only the three totals have visible mirrors.
+    -- Retain the worker-facing labels invisibly; current Bounty/Honor and the three totals have visible mirrors.
     local bindings = Instance.new("Frame")
     bindings.Name = "ValueBindings"
     bindings.Visible = false
@@ -2598,7 +2633,7 @@ local function createGUI()
     end
 
     for _, entry in ipairs({
-        {"Title", "AUTO BOUNTY"}, {"Bounty", "Bounty/Honor: Loading..."},
+        {"Title", "AUTO BOUNTY"},
         {"Team", "Team: " .. Config.Team}, {"Target", "Target: None"},
         {"Candidates", "Eligible players: 0"}, {"Combo", "Combo: Initializing"},
         {"Status", "Status: Initializing"},
@@ -2607,6 +2642,8 @@ local function createGUI()
     end
 
     local metrics = {
+        {Name = "Bounty", Title = "CURRENT\nBOUNTY/HONOR", Prefix = "Bounty/Honor: ",
+            Color = UI.Colors.Text},
         {Name = "Gained", Title = "TOTAL GAINED", Prefix = "Total gained: ",
             Color = UI.Colors.Positive, Signed = true},
         {Name = "Lost", Title = "TOTAL LOST", Prefix = "Total lost: ",
@@ -2615,16 +2652,18 @@ local function createGUI()
             Color = UI.Colors.Positive, Signed = true},
     }
     for index, metric in ipairs(metrics) do
-        local card = UI.CreateFrame(UI.Pages.Status, metric.Name .. "Card", 0, (index - 1) * 106, 680, 100)
-        UI.Text(card, "Caption", metric.Title, 16, 0, 192, 100, 22, UI.Colors.Text, true)
-        local value = UI.Text(card, "Value", "", 214, 10, 450, 80, 68, metric.Color, true)
+        local card = UI.CreateFrame(UI.Pages.Status, metric.Name .. "Card", 0, (index - 1) * 80, 680, 72)
+        local caption = UI.Text(card, "Caption", metric.Title, 16, 0, 192, 72, 22, UI.Colors.Text, true)
+        caption.TextWrapped = true
+        caption.TextTruncate = Enum.TextTruncate.None
+        local value = UI.Text(card, "Value", "", 214, 4, 450, 64, 60, metric.Color, true)
         value.TextScaled = true
         value.TextWrapped = false
         value.TextTruncate = Enum.TextTruncate.None
         value.TextXAlignment = Enum.TextXAlignment.Right
         local textSize = Instance.new("UITextSizeConstraint")
         textSize.MinTextSize = 16
-        textSize.MaxTextSize = 68
+        textSize.MaxTextSize = 60
         textSize.Parent = value
         UI.BindValue(metric.Name, value, metric.Prefix, metric.Prefix .. "Loading...", metric.Signed)
     end
