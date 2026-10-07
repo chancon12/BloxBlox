@@ -1,4 +1,8 @@
--- Pause/Resume stops bounty workers; the Stats GUI and manual requests remain active.
+-- Centered sidebar: Status, Stats, and Accessories.
+-- Pause/Resume stops bounty workers; Stats and Accessories stay available.
+-- Accessories automatically applies the selected preset (Damage by default).
+-- Optional Settings.Accessories = {Preset = "Damage", CustomWeights = {["AllDamage.All"] = 1}}.
+-- In-game profile: slot 1 Bounty, slot 2 Honor; no Profile panel.
 -- Resume starts fresh bounty workers while reusing the existing GUI and stat transaction.
 -- Skipped targets and stat input drafts survive; paused time does not count toward the server timeout.
 local function runAutoBounty(PauseControl, pauseGeneration)
@@ -1694,11 +1698,13 @@ local function createTextLabel(parent, name, position, size, text, textSize)
     label.BackgroundTransparency = 1
     label.Position = position
     label.Size = size
-    label.Font = Enum.Font.GothamSemibold
+    label.Font = Enum.Font.GothamMedium
     label.Text = text
-    label.TextColor3 = Color3.fromRGB(235, 235, 235)
+    label.TextColor3 = Color3.fromRGB(245, 247, 252)
     label.TextSize = textSize or 14
     label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Center
+    label.TextTruncate = Enum.TextTruncate.AtEnd
     return label
 end
 
@@ -1869,94 +1875,610 @@ do
     function Stats.Build(panel)
         Stats.GUI = Runtime.GUI
         PauseControl.StatsUI = Stats
-        local function button(name, text, position, size)
-            local control = Instance.new("TextButton")
-            control.Name = name
-            control.Position = position
-            control.Size = size
-            control.BackgroundColor3 = Color3.fromRGB(40, 65, 105)
-            control.BorderSizePixel = 0
-            control.Font = Enum.Font.GothamSemibold
-            control.TextSize = 14
-            control.TextColor3 = Color3.fromRGB(235, 235, 235)
-            control.Text = text
-            control.Parent = panel
-            local corner = Instance.new("UICorner")
-            corner.CornerRadius = UDim.new(0, 6)
-            corner.Parent = control
-            return control
-        end
+        local UI = Runtime.PanelUI
+        local statsPage = UI.Pages.Stats
+        local tabs = {}
+        local tabNames = {"Status", "Stats", "Accessories"}
+        local headers = {
+            Status = "HUNT OPERATIONS",
+            Stats = "STAT ALLOCATION",
+            Accessories = "ACCESSORY LOADOUT",
+        }
 
-        local statusPage = Instance.new("Frame")
-        statusPage.Name = "StatusPage"
-        statusPage.BackgroundTransparency = 1
-        statusPage.Position = UDim2.fromOffset(0, 98)
-        statusPage.Size = UDim2.new(1, 0, 1, -110)
-        statusPage.Parent = panel
-        for name, label in pairs(Runtime.Labels) do
-            if name ~= "Title" and name ~= "Username" then
-                label.Position = label.Position - UDim2.fromOffset(0, 36)
-                label.Parent = statusPage
+        function UI.SelectTab(name)
+            if not UI.Pages[name] then return end
+            UI.SelectedTab = name
+            UI.Heading.Text = headers[name]
+            for pageName, page in pairs(UI.Pages) do
+                page.Visible = pageName == name
             end
+            for tabName, tab in pairs(tabs) do
+                local active = tabName == name
+                tab.BackgroundColor3 = active and Color3.fromRGB(31, 64, 94) or UI.Colors.Raised
+                tab.TextColor3 = active and UI.Colors.Text or UI.Colors.Muted
+                tab.SelectionBar.Visible = active
+                tab.UIStroke.Color = active and Color3.fromRGB(63, 124, 173) or UI.Colors.Stroke
+            end
+            if name == "Stats" then Stats.RefreshPoints() end
         end
 
-        local statsPage = Instance.new("Frame")
-        statsPage.Name = "StatsPage"
-        statsPage.BackgroundTransparency = 1
-        statsPage.Position = UDim2.fromOffset(12, 98)
-        statsPage.Size = UDim2.new(1, -24, 1, -110)
-        statsPage.Visible = false
-        statsPage.Parent = panel
-
-        local statusTab = button("StatusTab", "Status", UDim2.fromOffset(12, 60), UDim2.fromOffset(139, 28))
-        local statsTab = button("StatsTab", "Stats", UDim2.fromOffset(159, 60), UDim2.fromOffset(139, 28))
-        local function selectTab(showStats)
-            statusPage.Visible = not showStats
-            statsPage.Visible = showStats
-            panel.Size = UDim2.fromOffset(310, showStats and 406 or 364)
-            statusTab.BackgroundColor3 = Color3.fromRGB(40, 65, 105)
-            statsTab.BackgroundColor3 = Color3.fromRGB(40, 65, 105)
-            local active = showStats and statsTab or statusTab
-            active.BackgroundColor3 = Color3.fromRGB(55, 95, 155)
-            if showStats then Stats.RefreshPoints() end
+        for index, name in ipairs(tabNames) do
+            local tabName = name
+            local tab = UI.Button(UI.Sidebar, name .. "Tab", "    " .. name,
+                12, 112 + (index - 1) * 56, 186, 44, function()
+                    UI.SelectTab(tabName)
+                end)
+            tab.TextSize = 17
+            tab.TextXAlignment = Enum.TextXAlignment.Left
+            local bar = UI.CreateFrame(tab, "SelectionBar", 0, 0, 5, 44, UI.Colors.Accent, 4)
+            bar.Visible = false
+            tabs[name] = tab
         end
-        Stats.Connect(statusTab.Activated, function() selectTab(false) end)
-        Stats.Connect(statsTab.Activated, function() selectTab(true) end)
+        UI.Tabs = tabs
 
-        Stats.PointsLabel = createTextLabel(statsPage, "Points", UDim2.fromOffset(0, 0),
-            UDim2.new(1, 0, 0, 20), "Unspent points: Loading...", 14)
+        local pointsCard = UI.CreateFrame(statsPage, "PointsCard", 0, 0, 680, 88)
+        UI.Text(pointsCard, "Caption", "AVAILABLE POINTS", 18, 12, 644, 20, 13, UI.Colors.Muted)
+        Stats.PointsLabel = UI.Text(pointsCard, "Points", "Unspent points: Loading...",
+            18, 35, 644, 38, 25, UI.Colors.Text, true)
+        UI.Text(statsPage, "Instructions",
+            "Enter a whole number for each stat. Blank or 0 keeps those points unspent.",
+            2, 102, 676, 30, 14, UI.Colors.Muted)
         for index, field in ipairs(Stats.Fields) do
-            local y = 28 + (index - 1) * 32
-            createTextLabel(statsPage, field.Stat .. "Label", UDim2.fromOffset(0, y),
-                UDim2.fromOffset(126, 26), field.Label, 14)
+            local y = 144 + (index - 1) * 52
+            local row = UI.CreateFrame(statsPage, field.Stat .. "Row", 0, y, 680, 44)
+            UI.Text(row, field.Stat .. "Label", field.Label, 18, 0, 368, 44, 17, UI.Colors.Text, true)
             local input = Instance.new("TextBox")
             input.Name = field.Stat .. "Points"
-            input.Position = UDim2.fromOffset(138, y)
-            input.Size = UDim2.new(1, -138, 0, 26)
-            input.BackgroundColor3 = Color3.fromRGB(35, 39, 48)
+            input.Position = UDim2.fromOffset(448, 6)
+            input.Size = UDim2.fromOffset(214, 32)
+            input.BackgroundColor3 = UI.Colors.Panel
             input.BorderSizePixel = 0
             input.Font = Enum.Font.Gotham
-            input.TextSize = 14
-            input.TextColor3 = Color3.fromRGB(235, 235, 235)
+            input.TextSize = 16
+            input.TextColor3 = UI.Colors.Text
+            input.PlaceholderColor3 = UI.Colors.Muted
             input.PlaceholderText = "0"
             input.Text = ""
             input.ClearTextOnFocus = false
             input.MultiLine = false
-            input.Parent = statsPage
+            input.Parent = row
+            local corner = Instance.new("UICorner")
+            corner.CornerRadius = UDim.new(0, 6)
+            corner.Parent = input
+            local stroke = Instance.new("UIStroke")
+            stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+            stroke.Color = UI.Colors.Stroke
+            stroke.Parent = input
             Stats.Inputs[index] = input
         end
 
-        Stats.ApplyButton = button("ApplyStats", "Reset & Add Stats", UDim2.fromOffset(0, 194),
-            UDim2.new(1, 0, 0, 32))
-        Stats.ApplyButton.Parent = statsPage
-        Stats.StatusLabel = createTextLabel(statsPage, "StatStatus", UDim2.fromOffset(0, 234),
-            UDim2.new(1, 0, 0, 62), "Refunds stats, waits 0.2s, then adds your entries. Blank or 0 leaves points unspent.", 12)
+        Stats.ApplyButton = UI.Button(statsPage, "ApplyStats", "Reset & Add Stats",
+            0, 422, 680, 44, Stats.Apply)
+        Stats.ApplyButton.BackgroundColor3 = Color3.fromRGB(33, 92, 139)
+        Stats.ApplyButton.TextSize = 16
+        Stats.StatusLabel = UI.Text(statsPage, "StatStatus",
+            "Refunds stats, waits 0.2s, then adds your entries. Blank or 0 leaves points unspent.",
+            2, 480, 676, 40, 13, UI.Colors.Accent)
         Stats.StatusLabel.TextWrapped = true
         Stats.StatusLabel.TextTruncate = Enum.TextTruncate.AtEnd
         Stats.StatusLabel.TextYAlignment = Enum.TextYAlignment.Top
-        Stats.StatusLabel.TextColor3 = Color3.fromRGB(130, 200, 255)
-        Stats.Connect(Stats.ApplyButton.Activated, Stats.Apply)
-        selectTab(false)
+
+        -- These listeners belong to the GUI, so available points remain live while paused.
+        local dataAdded, dataRemoved, pointsChanged
+        local function bindPoints()
+            if pointsChanged then pointsChanged:Disconnect(); pointsChanged = nil end
+            local data = LocalPlayer:FindFirstChild("Data")
+            local points = data and data:FindFirstChild("Points")
+            if points and (points:IsA("IntValue") or points:IsA("NumberValue")) then
+                pointsChanged = Stats.Connect(points:GetPropertyChangedSignal("Value"), Stats.RefreshPoints)
+            end
+            Stats.RefreshPoints()
+        end
+        local function bindData()
+            if dataAdded then dataAdded:Disconnect(); dataAdded = nil end
+            if dataRemoved then dataRemoved:Disconnect(); dataRemoved = nil end
+            local data = LocalPlayer:FindFirstChild("Data")
+            if data then
+                dataAdded = Stats.Connect(data.ChildAdded, function(child)
+                    if child.Name == "Points" then bindPoints() end
+                end)
+                dataRemoved = Stats.Connect(data.ChildRemoved, function(child)
+                    if child.Name == "Points" then bindPoints() end
+                end)
+            end
+            bindPoints()
+        end
+        Stats.Connect(LocalPlayer.ChildAdded, function(child)
+            if child.Name == "Data" then bindData() end
+        end)
+        Stats.Connect(LocalPlayer.ChildRemoved, function(child)
+            if child.Name == "Data" then bindData() end
+        end)
+        bindData()
+        UI.SelectTab("Status")
+    end
+end
+
+do
+    -- This controller belongs to the GUI. Bounty pause/resume must not cancel it.
+    local Accessory = {
+        Connections = {},
+        Stopped = false,
+        Revision = 0,
+        Working = false,
+        PresetOrder = {
+            "Damage", "FruitDamage", "GunDamage", "MeleeDamage", "SwordDamage",
+            "Resistance", "FruitResistance", "GunResistance", "MeleeResistance", "SwordResistance",
+            "Instinct", "Health", "Cooldown", "FruitCooldown", "GunCooldown",
+            "MeleeCooldown", "SwordCooldown", "Custom",
+        },
+        PresetLabels = {
+            Damage = "Overall damage", FruitDamage = "Fruit damage", GunDamage = "Gun damage",
+            MeleeDamage = "Melee damage", SwordDamage = "Sword damage",
+            Resistance = "Overall resistance", FruitResistance = "Fruit resistance",
+            GunResistance = "Gun resistance", MeleeResistance = "Melee resistance",
+            SwordResistance = "Sword resistance", Instinct = "Instinct", Health = "Health & recovery",
+            Cooldown = "All cooldowns", FruitCooldown = "Fruit cooldown", GunCooldown = "Gun cooldown",
+            MeleeCooldown = "Melee cooldown", SwordCooldown = "Sword cooldown", Custom = "Custom weights",
+        },
+        Presets = {
+            Damage = {["AllDamage.All"] = 1, ["AllDamage.Fruit"] = 1, ["AllDamage.Gun"] = 1,
+                ["AllDamage.Melee"] = 1, ["AllDamage.Sword"] = 1},
+            FruitDamage = {["AllDamage.All"] = 1, ["AllDamage.Fruit"] = 1},
+            GunDamage = {["AllDamage.All"] = 1, ["AllDamage.Gun"] = 1},
+            MeleeDamage = {["AllDamage.All"] = 1, ["AllDamage.Melee"] = 1},
+            SwordDamage = {["AllDamage.All"] = 1, ["AllDamage.Sword"] = 1},
+            Resistance = {["AllResist.All"] = 1, ["AllResist.Fruit"] = 1, ["AllResist.Gun"] = 1,
+                ["AllResist.Melee"] = 1, ["AllResist.Sword"] = 1},
+            FruitResistance = {["AllResist.All"] = 1, ["AllResist.Fruit"] = 1},
+            GunResistance = {["AllResist.All"] = 1, ["AllResist.Gun"] = 1},
+            MeleeResistance = {["AllResist.All"] = 1, ["AllResist.Melee"] = 1},
+            SwordResistance = {["AllResist.All"] = 1, ["AllResist.Sword"] = 1},
+            Instinct = {DodgeBoost = 100, ObservationRange = 1},
+            Health = {Health = 1, HealthRegen = 1000, ["PveLeech.Melee"] = 1000, ["PvpLeech.Melee"] = 1000},
+            Cooldown = {AllCooldown = 1, FruitCooldown = 1, GunCooldown = 1,
+                MeleeCooldown = 1, SwordCooldown = 1, FlashstepCooldown = 1},
+            FruitCooldown = {AllCooldown = 1, FruitCooldown = 1},
+            GunCooldown = {AllCooldown = 1, GunCooldown = 1},
+            MeleeCooldown = {AllCooldown = 1, MeleeCooldown = 1},
+            SwordCooldown = {AllCooldown = 1, SwordCooldown = 1},
+        },
+    }
+    Runtime.AccessoryUI = Accessory
+
+    if type(Settings.Accessories) ~= "table" then Settings.Accessories = {} end
+    if Settings.Accessories.Preset == nil then Settings.Accessories.Preset = "Damage" end
+    if type(Settings.Accessories.CustomWeights) ~= "table" then
+        Settings.Accessories.CustomWeights = {["AllDamage.All"] = 1, ["AllDamage.Fruit"] = 1}
+    end
+
+    function Accessory.IsCurrent()
+        return not Accessory.Stopped and PauseControl:IsCurrent()
+            and PauseControl.AccessoryUI == Accessory
+            and Accessory.GUI ~= nil and Accessory.GUI.Parent ~= nil
+    end
+
+    function Accessory.IsRequestCurrent(revision)
+        return Accessory.IsCurrent() and Accessory.Revision == revision
+    end
+
+    function Accessory.Connect(signal, callback)
+        local connection = signal:Connect(function(...)
+            if Accessory.IsCurrent() then callback(...) end
+        end)
+        table.insert(Accessory.Connections, connection)
+        return connection
+    end
+
+    function Accessory.Stop()
+        Accessory.Stopped = true
+        Accessory.Revision = Accessory.Revision + 1
+        Accessory.Pending = nil
+        disconnectConnections(Accessory.Connections)
+        -- An in-flight remote owns the global lock until it returns.
+        -- Releasing it here could let a replacement GUI equip concurrently.
+    end
+
+    function Accessory.SetStatus(revision, text, state)
+        if not Accessory.IsRequestCurrent(revision) then return end
+        Accessory.StatusLabel.Text = text
+        local color = Accessory.UI.Colors.Muted
+        if state == "success" then color = Accessory.UI.Colors.Positive end
+        if state == "error" then color = Accessory.UI.Colors.Negative end
+        if state == "busy" then color = Accessory.UI.Colors.Accent end
+        Accessory.StatusLabel.TextColor3 = color
+        Accessory.StateDot.BackgroundColor3 = color
+        Accessory.Badge.Text = state == "success" and "EQUIPPED" or "WAITING"
+        if state == "error" then Accessory.Badge.Text = "CHECK STATUS" end
+        if state == "busy" then Accessory.Badge.Text = "APPLYING" end
+        Accessory.Badge.TextColor3 = color
+    end
+
+    function Accessory.WaitChild(parent, name, deadline, revision)
+        while Accessory.IsRequestCurrent(revision) do
+            local child = parent:FindFirstChild(name)
+            if child then return child end
+            if os.clock() >= deadline then
+                return nil, "Accessory data is not ready: " .. name .. ". Select a preset to retry."
+            end
+            task.wait(0.1)
+            if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled" end
+        end
+        return nil, "cancelled"
+    end
+
+    function Accessory.ResolvePath(path, deadline, revision)
+        local parent = ReplicatedStorage
+        for _, name in ipairs(path) do
+            local child, reason = Accessory.WaitChild(parent, name, deadline, revision)
+            if not child then return nil, reason end
+            parent = child
+        end
+        return parent
+    end
+
+    function Accessory.LoadDependencies(revision)
+        if Accessory.Dependencies then return Accessory.Dependencies end
+        local deadline = os.clock() + 15
+        local paths = {
+            {"Wear", {"Modules", "Asset", "ItemData", "ItemStats", "Wear"}},
+            {"AccessoriesShared", {"AccessoriesShared"}},
+            {"ItemReplicationService", {"ItemReplicationService"}},
+            {"KEYS", {"ItemReplicationService", "KEYS"}},
+            {"ItemId", {"Economy", "ItemId"}},
+        }
+        local dependencies = {}
+        for _, entry in ipairs(paths) do
+            local module, reason = Accessory.ResolvePath(entry[2], deadline, revision)
+            if not module then return nil, reason end
+            if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled" end
+            local ok, result = pcall(require, module)
+            if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled" end
+            if not ok or type(result) ~= "table" then
+                return nil, "Cannot load accessory data: " .. entry[1] .. ". Select a preset to retry."
+            end
+            dependencies[entry[1]] = result
+        end
+        local remote, reason = Accessory.ResolvePath({"Remotes", "CommF_"}, deadline, revision)
+        if not remote then return nil, reason end
+        dependencies.Remote = remote
+        local service = dependencies.ItemReplicationService
+        local initializedBy = os.clock() + 15
+        while not service.IsInitialized and os.clock() < initializedBy do
+            task.wait(0.1)
+            if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled" end
+        end
+        if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled" end
+        if not service.IsInitialized then
+            return nil, "Inventory is still initializing. Select a preset to retry."
+        end
+        if not service.IS_CLIENT then return nil, "Accessory inventory is unavailable on this client." end
+        if type(service.GetItems) ~= "function" or type(service.ReadItem) ~= "function"
+            or type(dependencies.ItemId.getDataFromId) ~= "function"
+            or type(dependencies.AccessoriesShared.getReplicatedAccessoryItem) ~= "function"
+            or dependencies.KEYS.QUANTITY == nil or dependencies.KEYS.IS_EQUIPPED == nil then
+            return nil, "Accessory inventory data is incomplete. Select a preset to retry."
+        end
+        Accessory.Dependencies = dependencies
+        return dependencies
+    end
+
+    function Accessory.Score(buffs, weights)
+        if type(buffs) ~= "table" then return 0 end
+        local score = 0
+        for path, weight in pairs(weights) do
+            if type(path) == "string" and isFiniteNumber(weight) then
+                local value = buffs
+                for segment in string.gmatch(path, "[^%.]+") do
+                    if type(value) ~= "table" then value = nil; break end
+                    value = value[segment]
+                end
+                if isFiniteNumber(value) then
+                    local weighted = value * weight
+                    if isFiniteNumber(weighted) then score = score + weighted end
+                end
+            end
+        end
+        if not isFiniteNumber(score) then return 0 end
+        return score
+    end
+
+    function Accessory.IsEquipped(dependencies, candidate)
+        local ok, equipped = pcall(function()
+            return dependencies.ItemReplicationService:ReadItem(dependencies.KEYS.IS_EQUIPPED,
+                candidate.ItemId, candidate.NetworkedUID)
+        end)
+        return ok and equipped == true
+    end
+
+    function Accessory.ReadCandidate(dependencies, replicatedItem, weights, revision)
+        local ok, candidate = pcall(function()
+            if type(replicatedItem) ~= "table" or not isFiniteNumber(replicatedItem.Value)
+                or replicatedItem.Value <= 0 then return nil end
+            local itemId, uid = replicatedItem.ItemId, replicatedItem.NetworkedUID
+            if type(itemId) ~= "string" and not isFiniteNumber(itemId) then return nil end
+            if uid ~= nil and type(uid) ~= "string" and not isFiniteNumber(uid) then return nil end
+            local storageOk, storageKey = pcall(function()
+                return dependencies.ItemId.getDataFromId(itemId):unwrap().StorageKey
+            end)
+            if not Accessory.IsRequestCurrent(revision) then return nil end
+            if not storageOk or type(storageKey) ~= "string" or storageKey == "" then storageKey = nil end
+            if uid == nil and storageKey == nil then return nil end
+            local accessory
+            if uid ~= nil then
+                local accessoryOk, replicated = pcall(function()
+                    return dependencies.AccessoriesShared.getReplicatedAccessoryItem(itemId, uid)
+                end)
+                if not Accessory.IsRequestCurrent(revision) then return nil end
+                if accessoryOk then accessory = replicated end
+            end
+            local buffs, name
+            if type(accessory) == "table" then
+                if type(accessory.Name) == "string" and accessory.Name ~= "" then name = accessory.Name end
+                if accessory.Type == "Trinket" then
+                    local buffsOk, trinketBuffs = pcall(function()
+                        return dependencies.AccessoriesShared.GetBuffsForItem(accessory)
+                    end)
+                    if not Accessory.IsRequestCurrent(revision) then return nil end
+                    if buffsOk then buffs = trinketBuffs end
+                    local grade = accessory.Grade
+                    if type(grade) == "string" or isFiniteNumber(grade) then
+                        name = (name or storageKey or tostring(itemId)) .. " [" .. tostring(grade) .. "]"
+                    end
+                elseif accessory.Type == "Super" then
+                    local wear = dependencies.Wear[accessory.Name]
+                    buffs = type(wear) == "table" and type(wear[0]) == "table" and wear[0][2] or nil
+                end
+            end
+            if type(buffs) ~= "table" then
+                local wear = dependencies.Wear[storageKey]
+                buffs = type(wear) == "table" and type(wear[0]) == "table" and wear[0][2] or nil
+            end
+            local score = Accessory.Score(buffs, weights)
+            if score <= 0 then return nil end
+            local result = {ItemId = itemId, NetworkedUID = uid, StorageKey = storageKey,
+                Name = name or storageKey or tostring(itemId), Score = score}
+            result.IsEquipped = Accessory.IsEquipped(dependencies, result)
+            result.SortKey = result.Name .. "\0" .. tostring(uid or storageKey) .. "\0" .. tostring(itemId)
+            return result
+        end)
+        if ok then return candidate end
+        return nil
+    end
+
+    function Accessory.FindBest(dependencies, weights, revision)
+        local ok, items = pcall(function()
+            return dependencies.ItemReplicationService:GetItems(dependencies.KEYS.QUANTITY)
+        end)
+        if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled" end
+        if not ok or (items ~= nil and type(items) ~= "table") then
+            return nil, "Could not read the accessory inventory. Select a preset to retry."
+        end
+        local best, matches = nil, 0
+        for _, replicatedItem in pairs(items or {}) do
+            if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled" end
+            local candidate = Accessory.ReadCandidate(dependencies, replicatedItem, weights, revision)
+            if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled" end
+            if candidate then
+                matches = matches + 1
+                if not best or candidate.Score > best.Score
+                    or (candidate.Score == best.Score and candidate.IsEquipped and not best.IsEquipped)
+                    or (candidate.Score == best.Score and candidate.IsEquipped == best.IsEquipped
+                        and candidate.SortKey < best.SortKey) then
+                    best = candidate
+                end
+            end
+        end
+        if not best then return nil, "No owned accessory has a positive score for this preset." end
+        return best, nil, matches
+    end
+
+    function Accessory.Apply(revision, preset)
+        if not Accessory.IsRequestCurrent(revision) then return end
+        local weights = Accessory.Presets[preset]
+        if preset == "Custom" then weights = Settings.Accessories.CustomWeights end
+        if type(weights) ~= "table" then
+            Accessory.SetStatus(revision, "Unknown preset: " .. tostring(preset) .. ". Choose one from the list.", "error")
+            return
+        end
+        Accessory.SetStatus(revision, "Waiting for the accessory inventory...", "busy")
+        local dependencies, reason = Accessory.LoadDependencies(revision)
+        if not Accessory.IsRequestCurrent(revision) then return end
+        if not dependencies then Accessory.SetStatus(revision, reason, "error"); return end
+        Accessory.SetStatus(revision, "Finding the best owned accessory...", "busy")
+        local best, scanError, matches = Accessory.FindBest(dependencies, weights, revision)
+        if not Accessory.IsRequestCurrent(revision) then return end
+        if not best then
+            Accessory.ItemLabel.Text = "No matching accessory"
+            Accessory.DetailLabel.Text = "Try another preset or change your custom weights."
+            Accessory.SetStatus(revision, scanError, "error")
+            return
+        end
+        Accessory.ItemLabel.Text = best.Name
+        Accessory.DetailLabel.Text = string.format("Score %.3f  /  %d matching item%s", best.Score,
+            matches, matches == 1 and "" or "s")
+        -- Recheck immediately before equipping: the inventory can change during a scan.
+        local alreadyEquipped = Accessory.IsEquipped(dependencies, best)
+        if not Accessory.IsRequestCurrent(revision) then return end
+        if alreadyEquipped then
+            Accessory.SetStatus(revision, "The best matching accessory is already equipped.", "success")
+            return
+        end
+        Accessory.SetStatus(revision, "Equipping " .. best.Name .. "...", "busy")
+        if not Accessory.IsRequestCurrent(revision) then return end
+        local requested, result = pcall(function()
+            return dependencies.Remote:InvokeServer("LoadItem", best.NetworkedUID or best.StorageKey)
+        end)
+        if not Accessory.IsRequestCurrent(revision) then return end
+        if not requested or result == false then
+            Accessory.SetStatus(revision, "The equip request failed. Select a preset to retry.", "error")
+            return
+        end
+        local verifyBy = os.clock() + 3
+        repeat
+            local equipped = Accessory.IsEquipped(dependencies, best)
+            if not Accessory.IsRequestCurrent(revision) then return end
+            if equipped then
+                Accessory.SetStatus(revision, "Equipped and confirmed by the inventory.", "success")
+                return
+            end
+            if os.clock() >= verifyBy then break end
+            task.wait(0.1)
+            if not Accessory.IsRequestCurrent(revision) then return end
+        until false
+        Accessory.SetStatus(revision, "Request sent; equip not confirmed. Select a preset to retry.", "error")
+    end
+
+    function Accessory.RunQueue()
+        if Accessory.Working or not Accessory.IsCurrent() then return end
+        Accessory.Working = true
+        task.spawn(function()
+            while Accessory.IsCurrent() and Accessory.Pending do
+                local request = Accessory.Pending
+                Accessory.Pending = nil
+                local token = {Owner = Accessory, Revision = request.Revision}
+                -- The global lock survives script reloads and stays held while a remote yields.
+                while Environment.__AutoBountyAccessoryRequest ~= nil
+                    and Accessory.IsRequestCurrent(request.Revision) do
+                    Accessory.SetStatus(request.Revision, "Waiting for the previous accessory request...", "busy")
+                    task.wait(0.1)
+                    if not Accessory.IsRequestCurrent(request.Revision) then break end
+                end
+                if Accessory.IsRequestCurrent(request.Revision) then
+                    Environment.__AutoBountyAccessoryRequest = token
+                    local ok = pcall(Accessory.Apply, request.Revision, request.Preset)
+                    if Environment.__AutoBountyAccessoryRequest == token then
+                        Environment.__AutoBountyAccessoryRequest = nil
+                    end
+                    if not ok then
+                        Accessory.SetStatus(request.Revision, "Accessory data could not be read. Select a preset to retry.", "error")
+                    end
+                end
+            end
+            Accessory.Working = false
+        end)
+    end
+
+    function Accessory.Select(preset)
+        if not Accessory.IsCurrent() then return end
+        Accessory.Revision = Accessory.Revision + 1
+        Accessory.Selected = preset
+        PauseControl.AccessoryPreset = preset
+        Settings.Accessories.Preset = preset
+        Accessory.PresetButton.Text = Accessory.PresetLabels[preset] or tostring(preset)
+        Accessory.Dropdown.Visible = false
+        for name, button in pairs(Accessory.OptionButtons) do
+            button.BackgroundColor3 = name == preset and Accessory.UI.Colors.Accent or Accessory.UI.Colors.Raised
+            button.TextColor3 = name == preset and Accessory.UI.Colors.Panel or Accessory.UI.Colors.Text
+        end
+        Accessory.ItemLabel.Text = "Checking your accessories..."
+        Accessory.DetailLabel.Text = "Selection applies automatically."
+        Accessory.SetStatus(Accessory.Revision, "Preparing accessory selection...", "busy")
+        Accessory.Pending = {Revision = Accessory.Revision, Preset = preset}
+        Accessory.RunQueue()
+    end
+
+    function Accessory.Build(page, UI)
+        Accessory.GUI = Runtime.GUI
+        Accessory.UI = UI
+        PauseControl.AccessoryUI = Accessory
+        Accessory.OptionButtons = {}
+        UI.Text(page, "AccessoryTitle", "Accessory", 24, 18, 610, 30, 24, UI.Colors.Text, true)
+        UI.Text(page, "AccessorySubtitle", "Choose a priority. The best owned accessory applies automatically.",
+            24, 52, 622, 36, 13, UI.Colors.Muted)
+
+        local presetCard = UI.CreateFrame(page, "AccessoryPresetCard", 24, 104, 632, 116, UI.Colors.Panel, 12)
+        UI.Text(presetCard, "PresetLabel", "OPTIMIZATION PRESET", 18, 12, 570, 20, 11, UI.Colors.Muted, true)
+        Accessory.PresetButton = UI.Button(presetCard, "AccessoryPreset", "Overall damage", 18, 44, 596, 50)
+        Accessory.PresetButton.TextXAlignment = Enum.TextXAlignment.Left
+        Accessory.PresetButton.TextSize = 15
+        Accessory.PresetButton.BackgroundColor3 = UI.Colors.Raised
+        local padding = Instance.new("UIPadding")
+        padding.PaddingLeft = UDim.new(0, 14)
+        padding.PaddingRight = UDim.new(0, 42)
+        padding.Parent = Accessory.PresetButton
+        local arrow = UI.Text(Accessory.PresetButton, "Arrow", "v", 550, 10, 26, 28, 15, UI.Colors.Muted, true)
+        arrow.TextXAlignment = Enum.TextXAlignment.Center
+        arrow.Active = false
+
+        local resultCard = UI.CreateFrame(page, "AccessoryResultCard", 24, 236, 632, 164, UI.Colors.Panel, 12)
+        UI.Text(resultCard, "BestMatchLabel", "BEST OWNED MATCH", 18, 14, 370, 20, 11, UI.Colors.Muted, true)
+        Accessory.Badge = UI.Text(resultCard, "EquipState", "WAITING", 400, 14, 212, 20, 10, UI.Colors.Muted, true)
+        Accessory.Badge.TextXAlignment = Enum.TextXAlignment.Right
+        Accessory.ItemLabel = UI.Text(resultCard, "AccessoryItem", "Checking your accessories...",
+            18, 46, 590, 34, 21, UI.Colors.Text, true)
+        Accessory.ItemLabel.TextTruncate = Enum.TextTruncate.AtEnd
+        Accessory.DetailLabel = UI.Text(resultCard, "AccessoryDetail", "Selection applies automatically.",
+            18, 85, 590, 26, 12, UI.Colors.Muted)
+        Accessory.StateDot = UI.CreateFrame(resultCard, "AccessoryStatusDot", 18, 128, 7, 7, UI.Colors.Muted, 4)
+        Accessory.StatusLabel = UI.Text(resultCard, "AccessoryStatus", "Preparing accessory selection...",
+            34, 116, 574, 39, 12, UI.Colors.Muted)
+        Accessory.StatusLabel.TextWrapped = true
+        Accessory.StatusLabel.TextYAlignment = Enum.TextYAlignment.Center
+
+        local rescan = UI.Button(page, "AccessoryRescan", "Rescan & apply", 24, 418, 178, 42)
+        rescan.BackgroundColor3 = UI.Colors.Accent
+        rescan.TextSize = 13
+        local note = UI.Text(page, "AccessoryNote", "You can change accessories while bounty hunting is paused.",
+            218, 417, 438, 46, 12, UI.Colors.Muted)
+        note.TextWrapped = true
+        UI.Text(page, "AccessoryWeightsHint", "Custom uses Settings.Accessories.CustomWeights from your configuration.",
+            24, 478, 630, 25, 11, UI.Colors.Muted)
+
+        -- A scrolling overlay keeps all 18 options reachable within the 520 px page.
+        Accessory.Dropdown = UI.CreateFrame(page, "AccessoryPresetDropdown", 42, 204, 596, 288, UI.Colors.Raised, 10)
+        Accessory.Dropdown.Visible = false
+        Accessory.Dropdown.ZIndex = 20
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = UI.Colors.Stroke
+        stroke.Thickness = 1
+        stroke.Parent = Accessory.Dropdown
+        local list = Instance.new("ScrollingFrame")
+        list.Name = "PresetOptions"
+        list.BackgroundTransparency = 1
+        list.BorderSizePixel = 0
+        list.Position = UDim2.fromOffset(6, 6)
+        list.Size = UDim2.new(1, -12, 1, -12)
+        list.CanvasSize = UDim2.fromOffset(0, #Accessory.PresetOrder * 36)
+        list.ScrollBarThickness = 4
+        list.ScrollBarImageColor3 = UI.Colors.Accent
+        list.ScrollingDirection = Enum.ScrollingDirection.Y
+        list.ZIndex = 21
+        list.Parent = Accessory.Dropdown
+        for index, name in ipairs(Accessory.PresetOrder) do
+            local preset = name
+            local option = UI.Button(list, "Preset" .. preset, Accessory.PresetLabels[preset],
+                2, (index - 1) * 36, 574, 32)
+            option.ZIndex = 22
+            option.TextSize = 13
+            option.TextXAlignment = Enum.TextXAlignment.Left
+            option.BackgroundColor3 = UI.Colors.Raised
+            local optionPadding = Instance.new("UIPadding")
+            optionPadding.PaddingLeft = UDim.new(0, 12)
+            optionPadding.Parent = option
+            Accessory.OptionButtons[preset] = option
+            Accessory.Connect(option.Activated, function() Accessory.Select(preset) end)
+        end
+        Accessory.Connect(Accessory.PresetButton.Activated, function()
+            Accessory.Dropdown.Visible = not Accessory.Dropdown.Visible
+            if Accessory.Dropdown.Visible then
+                for index, preset in ipairs(Accessory.PresetOrder) do
+                    if preset == Accessory.Selected then
+                        list.CanvasPosition = Vector2.new(0, math.max(0, math.min((index - 1) * 36, 372)))
+                        break
+                    end
+                end
+            end
+        end)
+        Accessory.Connect(rescan.Activated, function() Accessory.Select(Accessory.Selected or "Damage") end)
+        if not Accessory.InitialApplyScheduled then
+            Accessory.InitialApplyScheduled = true
+            local initialPreset = PauseControl.AccessoryPreset or Settings.Accessories.Preset or "Damage"
+            local initialRevision = Accessory.Revision
+            task.spawn(function()
+                if Accessory.IsRequestCurrent(initialRevision) then Accessory.Select(initialPreset) end
+            end)
+        end
     end
 end
 
@@ -1972,100 +2494,239 @@ local function createGUI()
         return false
     end
 
-    -- The Stats controller belongs to the GUI, not to a bounty-worker generation.
-    -- Reuse it so pausing/resuming cannot cancel or duplicate a manual stat request.
+    -- The pages and their connections belong to the GUI, not a bounty-worker generation.
+    -- Reusing them preserves the selected tab and any pending manual action on resume.
     local displayed = PauseControl.DisplayRuntime
     if displayed and PauseControl.GUI and PauseControl.GUI.Parent == playerGui
         and PauseControl.StatsUI and PauseControl.StatsUI.IsCurrent() then
         Runtime.GUI = PauseControl.GUI
         Runtime.Labels = displayed.Labels
         Runtime.StatsUI = PauseControl.StatsUI
+        Runtime.PanelUI = displayed.PanelUI
+        Runtime.AccessoryUI = PauseControl.AccessoryUI
         PauseControl:Attach(Runtime, pauseGeneration, true)
         SavedBounty.UpdateGUI()
         return true
     end
     if PauseControl.StatsUI then PauseControl.StatsUI.Stop() end
+    if PauseControl.AccessoryUI then PauseControl.AccessoryUI.Stop() end
     local oldGui = playerGui:FindFirstChild("AutoBountyStatus")
-
-    if oldGui then
-        oldGui:Destroy()
-    end
+    if oldGui then oldGui:Destroy() end
 
     local screenGui = Instance.new("ScreenGui")
     screenGui.Name = "AutoBountyStatus"
     screenGui.ResetOnSpawn = false
-    screenGui.IgnoreGuiInset = false
+    screenGui.IgnoreGuiInset = true
     screenGui.DisplayOrder = 50
     screenGui.Parent = playerGui
-
-    local frame = Instance.new("Frame")
-    frame.Name = "Panel"
-    frame.Parent = screenGui
-    frame.AnchorPoint = Vector2.new(1, 0)
-    frame.Position = UDim2.new(1, -18, 0, 18)
-    frame.Size = UDim2.fromOffset(310, 326)
-    frame.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
-    frame.BackgroundTransparency = 0.12
-    frame.BorderSizePixel = 0
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 8)
-    corner.Parent = frame
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = Color3.fromRGB(75, 110, 180)
-    stroke.Transparency = 0.25
-    stroke.Thickness = 1
-    stroke.Parent = frame
-
-    Runtime.Labels.Title = createTextLabel(
-        frame,
-        "Title",
-        UDim2.fromOffset(12, 8),
-        UDim2.new(1, -24, 0, 22),
-        "AUTO BOUNTY",
-        16
-    )
-    Runtime.Labels.Username = createTextLabel(
-        frame,
-        "Username",
-        UDim2.fromOffset(12, 34),
-        UDim2.new(1, -24, 0, 20),
-        "Player: @" .. LocalPlayer.Name,
-        14
-    )
-    Runtime.Labels.Username.TextColor3 = Color3.fromRGB(255, 255, 255)
-    Runtime.Labels.Username.TextScaled = true
-    Runtime.Labels.Username.TextWrapped = false
-    local usernameTextSize = Instance.new("UITextSizeConstraint")
-    usernameTextSize.MinTextSize = 10
-    usernameTextSize.MaxTextSize = 14
-    usernameTextSize.Parent = Runtime.Labels.Username
-
-    Runtime.Labels.Bounty = createTextLabel(frame, "Bounty", UDim2.fromOffset(12, 36), UDim2.new(1, -24, 0, 20), "Bounty/Honor: Loading...", 14)
-    Runtime.Labels.Gained = createTextLabel(frame, "Gained", UDim2.fromOffset(12, 58), UDim2.new(1, -24, 0, 40), "Total gained: Loading...", 14)
-    Runtime.Labels.Gained.TextWrapped = true
-    Runtime.Labels.Gained.TextTruncate = Enum.TextTruncate.AtEnd
-    Runtime.Labels.Gained.TextYAlignment = Enum.TextYAlignment.Top
-    Runtime.Labels.Gained.TextColor3 = Color3.fromRGB(135, 225, 160)
-    Runtime.Labels.Lost = createTextLabel(frame, "Lost", UDim2.fromOffset(12, 100), UDim2.new(1, -24, 0, 40), "Total lost: Loading...", 14)
-    Runtime.Labels.Lost.TextWrapped = true
-    Runtime.Labels.Lost.TextTruncate = Enum.TextTruncate.AtEnd
-    Runtime.Labels.Lost.TextYAlignment = Enum.TextYAlignment.Top
-    Runtime.Labels.Lost.TextColor3 = Color3.fromRGB(245, 145, 145)
-    Runtime.Labels.Net = createTextLabel(frame, "Net", UDim2.fromOffset(12, 142), UDim2.new(1, -24, 0, 20), "Net change: Loading...", 14)
-    Runtime.Labels.Team = createTextLabel(frame, "Team", UDim2.fromOffset(12, 166), UDim2.new(1, -24, 0, 20), "Team: " .. Config.Team, 14)
-    Runtime.Labels.Target = createTextLabel(frame, "Target", UDim2.fromOffset(12, 188), UDim2.new(1, -24, 0, 20), "Target: None", 14)
-    Runtime.Labels.Candidates = createTextLabel(frame, "Candidates", UDim2.fromOffset(12, 210), UDim2.new(1, -24, 0, 20), "Eligible players: 0", 14)
-    Runtime.Labels.Combo = createTextLabel(frame, "Combo", UDim2.fromOffset(12, 232), UDim2.new(1, -24, 0, 40), "Combo: Initializing", 13)
-    Runtime.Labels.Combo.TextWrapped = true
-    Runtime.Labels.Combo.TextTruncate = Enum.TextTruncate.AtEnd
-    Runtime.Labels.Combo.TextYAlignment = Enum.TextYAlignment.Top
-    Runtime.Labels.Status = createTextLabel(frame, "Status", UDim2.fromOffset(12, 276), UDim2.new(1, -24, 0, 20), "Status: Initializing", 13)
-    Runtime.Labels.Status.TextColor3 = Color3.fromRGB(130, 200, 255)
-
     Runtime.GUI = screenGui
+
+    local guiStats = Runtime.StatsUI
+    local UI = {
+        Colors = {
+            Panel = Color3.fromRGB(14, 25, 38),
+            Raised = Color3.fromRGB(23, 37, 54),
+            Stroke = Color3.fromRGB(45, 69, 94),
+            Text = Color3.fromRGB(245, 247, 252),
+            Muted = Color3.fromRGB(146, 169, 197),
+            Accent = Color3.fromRGB(86, 183, 255),
+            Positive = Color3.fromRGB(71, 235, 140),
+            Negative = Color3.fromRGB(255, 93, 104),
+        },
+        Pages = {},
+        Values = {},
+        SelectedTab = "Status",
+    }
+    Runtime.PanelUI = UI
+
+    function UI.CreateFrame(parent, name, x, y, width, height, color, radius)
+        local control = Instance.new("Frame")
+        control.Name = name
+        control.Position = UDim2.fromOffset(x, y)
+        control.Size = UDim2.fromOffset(width, height)
+        control.BackgroundColor3 = color or UI.Colors.Raised
+        control.BorderSizePixel = 0
+        control.Parent = parent
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, radius or 10)
+        corner.Parent = control
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = UI.Colors.Stroke
+        stroke.Thickness = 1
+        stroke.Parent = control
+        return control
+    end
+
+    function UI.Text(parent, name, text, x, y, width, height, size, color, bold)
+        local label = createTextLabel(parent, name, UDim2.fromOffset(x, y),
+            UDim2.fromOffset(width, height), text, size)
+        label.TextColor3 = color or UI.Colors.Text
+        label.Font = bold and Enum.Font.GothamBold or Enum.Font.GothamMedium
+        return label
+    end
+
+    function UI.Button(parent, name, text, x, y, width, height, callback)
+        local control = Instance.new("TextButton")
+        control.Name = name
+        control.Position = UDim2.fromOffset(x, y)
+        control.Size = UDim2.fromOffset(width, height)
+        control.BackgroundColor3 = UI.Colors.Raised
+        control.BorderSizePixel = 0
+        control.Font = Enum.Font.GothamBold
+        control.TextSize = 14
+        control.TextColor3 = UI.Colors.Text
+        control.Text = text
+        control.AutoButtonColor = true
+        control.Parent = parent
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 7)
+        corner.Parent = control
+        local stroke = Instance.new("UIStroke")
+        stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+        stroke.Color = UI.Colors.Stroke
+        stroke.Parent = control
+        if callback then guiStats.Connect(control.Activated, callback) end
+        return control
+    end
+
+    local frame = UI.CreateFrame(screenGui, "Panel", 0, 0, 940, 590, UI.Colors.Panel, 13)
+    frame.AnchorPoint = Vector2.new(0.5, 0.5)
+    frame.Position = UDim2.fromScale(0.5, 0.5)
+    UI.Frame = frame
+    local scale = Instance.new("UIScale")
+    scale.Name = "ViewportScale"
+    scale.Parent = frame
+    UI.Scale = scale
+
+    UI.Sidebar = UI.CreateFrame(frame, "Sidebar", 14, 14, 210, 562)
+    Runtime.Labels.Title = UI.Text(UI.Sidebar, "Title", "AUTO BOUNTY",
+        16, 16, 178, 32, 22, UI.Colors.Text, true)
+    Runtime.Labels.Username = UI.Text(UI.Sidebar, "Username", "Player: @" .. LocalPlayer.Name,
+        16, 57, 178, 26, 13, UI.Colors.Muted)
+    Runtime.Labels.Username.TextScaled = true
+    local usernameTextSize = Instance.new("UITextSizeConstraint")
+    usernameTextSize.MinTextSize = 9
+    usernameTextSize.MaxTextSize = 13
+    usernameTextSize.Parent = Runtime.Labels.Username
+    local divider = UI.CreateFrame(UI.Sidebar, "Divider", 16, 94, 178, 1, UI.Colors.Stroke, 0)
+    divider.UIStroke.Enabled = false
+
+    UI.Heading = UI.Text(frame, "PageHeading", "HUNT OPERATIONS",
+        246, 18, 280, 26, 15, UI.Colors.Muted, true)
+    local headingLine = UI.CreateFrame(frame, "HeadingLine", 505, 31, 417, 1, UI.Colors.Stroke, 0)
+    headingLine.UIStroke.Enabled = false
+    for _, name in ipairs({"Status", "Stats", "Accessories"}) do
+        local page = Instance.new("Frame")
+        page.Name = name .. "Page"
+        page.Position = UDim2.fromOffset(242, 56)
+        page.Size = UDim2.fromOffset(680, 520)
+        page.BackgroundTransparency = 1
+        page.Visible = name == "Status"
+        page.Parent = frame
+        UI.Pages[name] = page
+    end
+
+    -- Preserve the existing worker label contract; only these display mirrors strip prefixes.
+    -- Property-change listeners keep every page live without a rendering loop or polling.
+    local bindings = Instance.new("Frame")
+    bindings.Name = "ValueBindings"
+    bindings.Visible = false
+    bindings.Size = UDim2.fromOffset(0, 0)
+    bindings.Parent = frame
+
+    function UI.BindValue(name, target, prefix, initial, signed)
+        local source = createTextLabel(bindings, name, UDim2.fromOffset(0, 0),
+            UDim2.fromOffset(0, 0), initial, 14)
+        Runtime.Labels[name] = source
+        UI.Values[name] = target
+        local baseColor = target.TextColor3
+        local function refresh()
+            local value = source.Text
+            if value:sub(1, #prefix) == prefix then value = value:sub(#prefix + 1) end
+            if signed and value:match("^%d") then value = "+" .. value end
+            target.Text = value
+            target.TextColor3 = name == "Net"
+                and (value:sub(1, 1) == "-" and UI.Colors.Negative or UI.Colors.Positive)
+                or baseColor
+        end
+        guiStats.Connect(source:GetPropertyChangedSignal("Text"), refresh)
+        refresh()
+        return source
+    end
+
+    local statusPage = UI.Pages.Status
+    local bountyCard = UI.CreateFrame(statusPage, "BountyCard", 0, 0, 680, 92)
+    UI.Text(bountyCard, "Caption", "Bounty/Honor", 16, 10, 648, 22, 16, UI.Colors.Muted)
+    UI.BindValue("Bounty", UI.Text(bountyCard, "Value", "", 16, 32, 648, 50, 42, nil, true),
+        "Bounty/Honor: ", "Bounty/Honor: Loading...")
+
+    local metrics = {
+        {Name = "Gained", Title = "Total gained", Prefix = "Total gained: ", X = 0,
+            Width = 219, Color = UI.Colors.Positive, Signed = true},
+        {Name = "Lost", Title = "Total lost", Prefix = "Total lost: ", X = 231,
+            Width = 218, Color = UI.Colors.Negative},
+        {Name = "Net", Title = "Net change", Prefix = "Net change: ", X = 461,
+            Width = 219, Color = UI.Colors.Positive, Signed = true},
+    }
+    for _, metric in ipairs(metrics) do
+        local card = UI.CreateFrame(statusPage, metric.Name .. "Card", metric.X, 104, metric.Width, 88)
+        UI.Text(card, "Caption", metric.Title, 16, 9, metric.Width - 32, 22, 14, UI.Colors.Muted)
+        local value = UI.Text(card, "Value", "", 16, 31, metric.Width - 32, 48, 27, metric.Color, true)
+        value.TextScaled = true
+        value.TextWrapped = true
+        local textSize = Instance.new("UITextSizeConstraint")
+        textSize.MinTextSize = 12
+        textSize.MaxTextSize = 27
+        textSize.Parent = value
+        UI.BindValue(metric.Name, value, metric.Prefix, metric.Prefix .. "Loading...", metric.Signed)
+    end
+
+    local targetCard = UI.CreateFrame(statusPage, "TargetCard", 0, 204, 348, 92)
+    UI.Text(targetCard, "Caption", "Target", 16, 10, 316, 22, 14, UI.Colors.Muted)
+    UI.BindValue("Target", UI.Text(targetCard, "Value", "", 16, 36, 316, 42, 25, nil, true),
+        "Target: ", "Target: None")
+    local teamCard = UI.CreateFrame(statusPage, "TeamCard", 360, 204, 320, 92)
+    UI.Text(teamCard, "Caption", "Team", 16, 10, 288, 22, 14, UI.Colors.Muted)
+    UI.BindValue("Team", UI.Text(teamCard, "Value", "", 16, 36, 288, 42, 25, nil, true),
+        "Team: ", "Team: " .. Config.Team)
+
+    local statusCard = UI.CreateFrame(statusPage, "StatusCard", 0, 308, 680, 48)
+    UI.Text(statusCard, "Caption", "Status", 16, 0, 104, 48, 14, UI.Colors.Muted)
+    local statusValue = UI.Text(statusCard, "Value", "", 120, 5, 544, 38, 15, UI.Colors.Accent, true)
+    statusValue.TextWrapped = true
+    UI.BindValue("Status", statusValue, "Status: ", "Status: Initializing")
+    local candidatesCard = UI.CreateFrame(statusPage, "CandidatesCard", 0, 368, 680, 48)
+    UI.Text(candidatesCard, "Caption", "Eligible players", 16, 0, 148, 48, 14, UI.Colors.Muted)
+    UI.BindValue("Candidates", UI.Text(candidatesCard, "Value", "", 164, 0, 500, 48, 17, nil, true),
+        "Eligible players: ", "Eligible players: 0")
+    local comboCard = UI.CreateFrame(statusPage, "ComboCard", 0, 428, 680, 92)
+    UI.Text(comboCard, "Caption", "Combo", 16, 9, 648, 22, 14, UI.Colors.Muted)
+    local comboValue = UI.Text(comboCard, "Value", "", 16, 34, 648, 46, 19, nil, true)
+    comboValue.TextWrapped = true
+    UI.BindValue("Combo", comboValue, "Combo: ", "Combo: Initializing")
+
     Runtime.StatsUI.Build(frame)
+    if Runtime.AccessoryUI then Runtime.AccessoryUI.Build(UI.Pages.Accessories, UI) end
+
+    local cameraConnection
+    local function fitViewport()
+        local camera = Workspace.CurrentCamera
+        if not camera then return end
+        local viewport = camera.ViewportSize
+        if viewport.X <= 0 or viewport.Y <= 0 then return end
+        scale.Scale = math.max(0.01, math.min(1, (viewport.X - 32) / 940, (viewport.Y - 32) / 590))
+    end
+    local function bindCamera()
+        if cameraConnection then cameraConnection:Disconnect(); cameraConnection = nil end
+        local camera = Workspace.CurrentCamera
+        if camera then
+            cameraConnection = guiStats.Connect(camera:GetPropertyChangedSignal("ViewportSize"), fitViewport)
+        end
+        fitViewport()
+    end
+    guiStats.Connect(Workspace:GetPropertyChangedSignal("CurrentCamera"), bindCamera)
+    bindCamera()
+
     PauseControl:Attach(Runtime, pauseGeneration)
     SavedBounty.UpdateGUI()
     return true
@@ -9705,6 +10366,9 @@ function Runtime:Stop(reason)
         self.BountyConnection = nil
     end
 
+    if reason ~= "paused" and self.AccessoryUI then
+        self.AccessoryUI.Stop()
+    end
     if reason ~= "paused" and self.StatsUI then
         self.StatsUI.Stop()
     end
@@ -9795,8 +10459,13 @@ function PauseControl:Render(message)
     if not self:IsCurrent() then return end
     if self.Button and self.Button.Parent then
         self.Button.Text = self.Paused and "Resume bounty" or "Pause bounty"
-        self.Button.BackgroundColor3 = self.Paused and Color3.fromRGB(45, 120, 80)
-            or Color3.fromRGB(125, 70, 45)
+        self.Button.BackgroundColor3 = self.Paused and Color3.fromRGB(35, 108, 76)
+            or Color3.fromRGB(155, 49, 63)
+        local stroke = self.Button:FindFirstChildOfClass("UIStroke")
+        if stroke then
+            stroke.Color = self.Paused and Color3.fromRGB(74, 195, 128)
+                or Color3.fromRGB(255, 93, 104)
+        end
     end
     local runtime = self.DisplayRuntime or self.Runtime
     if runtime and runtime.GUI and runtime.GUI.Parent then
@@ -9843,7 +10512,7 @@ function PauseControl:Pause()
     end
     self:CaptureInputs()
     self:StopCurrent("paused")
-    self:Render("Bounty paused; Stats still available")
+    self:Render("Bounty paused; Stats and Accessories still available")
 end
 
 function PauseControl:Attach(runtime, generation, reuseGUI)
@@ -9851,6 +10520,7 @@ function PauseControl:Attach(runtime, generation, reuseGUI)
     self.Runtime = runtime
     self.DisplayRuntime = runtime
     self.GUI = runtime.GUI
+    self:StartProfileStats()
     if reuseGUI and self.Button and self.Button.Parent then
         self:Render()
         return
@@ -9860,19 +10530,23 @@ function PauseControl:Attach(runtime, generation, reuseGUI)
         for index, input in ipairs(runtime.StatsUI.Inputs) do input.Text = self.Inputs[index] or "" end
     end
     local panel = runtime.GUI:FindFirstChild("Panel")
-    runtime.Labels.Title.Size = UDim2.new(1, -136, 0, 22)
+    local sidebar = runtime.PanelUI and runtime.PanelUI.Sidebar or panel
     local button = Instance.new("TextButton")
     button.Name = "PauseResume"
-    button.Position = UDim2.new(1, -118, 0, 8)
-    button.Size = UDim2.fromOffset(106, 24)
+    button.Position = UDim2.fromOffset(20, 500)
+    button.Size = UDim2.fromOffset(170, 44)
     button.BorderSizePixel = 0
-    button.Font = Enum.Font.GothamSemibold
-    button.TextSize = 12
-    button.TextColor3 = Color3.fromRGB(235, 235, 235)
-    button.Parent = panel
+    button.Font = Enum.Font.GothamBold
+    button.TextSize = 16
+    button.TextColor3 = Color3.fromRGB(245, 247, 252)
+    button.Parent = sidebar
     local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 6)
+    corner.CornerRadius = UDim.new(0, 8)
     corner.Parent = button
+    local stroke = Instance.new("UIStroke")
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Thickness = 1
+    stroke.Parent = button
     self.Button = button
     self.ButtonConnection = button.Activated:Connect(function()
         if not self:IsCurrent() then return end
@@ -9883,6 +10557,97 @@ function PauseControl:Attach(runtime, generation, reuseGUI)
         end
     end)
     self:Render()
+end
+
+-- Profile slots belong to this controller session, so pausing does not restart them.
+function PauseControl:StartProfileStats()
+    if self.ProfileStarted or not self:IsCurrent() then return end
+    self.ProfileStarted = true
+    self.ProfileSlots = {}
+    self.ProfileWarnings = {}
+
+    task.spawn(function()
+        local environment = self.Environment
+        local request
+        local function profileWarn(key, message)
+            if self.ProfileWarnings[key] then return end
+            self.ProfileWarnings[key] = true
+            warn("[AutoBounty][Profile] " .. message)
+        end
+
+        local ok, failure = pcall(function()
+            local replicatedStorage = game:GetService("ReplicatedStorage")
+            local deadline = os.clock() + 30
+            local getStats, updateProfile
+
+            -- Never replace an older invocation's lock: InvokeServer can outlive
+            -- its controller, and the owner releases it only after returning.
+            while self:IsCurrent() and os.clock() < deadline do
+                local remotes = replicatedStorage:FindFirstChild("Remotes")
+                getStats = remotes and remotes:FindFirstChild("GetPlayerStats")
+                updateProfile = remotes and remotes:FindFirstChild("UpdatePlayerProfileValue")
+                if getStats and getStats:IsA("RemoteFunction")
+                    and updateProfile and updateProfile:IsA("RemoteFunction")
+                    and not environment.__AutoBountyProfileRequest then
+                    break
+                end
+                getStats, updateProfile = nil, nil
+                task.wait(math.min(0.25, math.max(0, deadline - os.clock())))
+            end
+            if not self:IsCurrent() then return end
+            if not getStats or not updateProfile then
+                profileWarn("readiness", "Profile remotes or an earlier request were not ready within 30 seconds; profile setup skipped.")
+                return
+            end
+
+            request = {}
+            environment.__AutoBountyProfileRequest = request
+            if not self:IsCurrent() then return end
+            local readOK, records = pcall(function()
+                return getStats:InvokeServer()
+            end)
+            if not self:IsCurrent() then return end
+            if not readOK or type(records) ~= "table" then
+                profileWarn("lookup", "Could not read profile stats: " .. tostring(records))
+                return
+            end
+
+            local ids = {}
+            for _, record in pairs(records) do
+                if type(record) == "table" and record.StatId ~= nil then
+                    if record.DisplayName == "Bounty" then ids[1] = record.StatId end
+                    if record.DisplayName == "Honor" then ids[2] = record.StatId end
+                end
+            end
+            if ids[1] == nil or ids[2] == nil then
+                profileWarn("missing-stats", "Bounty and Honor profile stats were not both available; profile setup skipped.")
+                return
+            end
+
+            -- Attempt both slots even when the first is rejected. Only the
+            -- server's explicit true result confirms that a slot was changed.
+            for slot = 1, 2 do
+                if not self:IsCurrent() then return end
+                local callOK, success, message = pcall(function()
+                    return updateProfile:InvokeServer("Stat", slot, ids[slot])
+                end)
+                if not self:IsCurrent() then return end
+                if callOK and success == true then
+                    self.ProfileSlots[slot] = true
+                else
+                    profileWarn("slot:" .. tostring(slot), "Could not set profile slot " .. tostring(slot)
+                        .. ": " .. tostring(callOK and (message or success) or success))
+                end
+            end
+        end)
+
+        if request and environment.__AutoBountyProfileRequest == request then
+            environment.__AutoBountyProfileRequest = nil
+        end
+        if not ok and self:IsCurrent() then
+            profileWarn("worker", "Profile setup failed: " .. tostring(failure))
+        end
+    end)
 end
 
 function PauseControl:Run()
@@ -9927,6 +10692,7 @@ function PauseControl:Dispose()
     self.Disposed = true
     self.Generation = self.Generation + 1
     if self.StatsUI then self.StatsUI.Stop() end
+    if self.AccessoryUI then self.AccessoryUI.Stop() end
     self:StopCurrent("reload")
     if self.ButtonConnection then self.ButtonConnection:Disconnect(); self.ButtonConnection = nil end
     if self.GUI then self.GUI:Destroy(); self.GUI = nil end
