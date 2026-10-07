@@ -1,7 +1,9 @@
 -- Centered sidebar: Status, Stats, and Accessories.
 -- Pause/Resume stops bounty workers; Stats and Accessories stay available.
--- Accessories automatically applies the selected preset (Damage by default).
--- Optional Settings.Accessories = {Preset = "Damage", CustomWeights = {["AllDamage.All"] = 1}}.
+-- Accessories automatically equips the best owned item in the first available priority:
+-- Overall damage, Sword damage, Overall resistance, Fruit/Gun/Melee/Sword resistance,
+-- Instinct, Health & recovery. Overall uses only the All bonus; typed bonuses are separate.
+-- Runs once on GUI creation; Rescan repeats it. No preset selection or background scanning.
 -- In-game profile: slot 1 Bounty, slot 2 Honor; no Profile panel.
 -- Resume starts fresh bounty workers while reusing the existing GUI and stat transaction.
 -- Skipped targets and stat input drafts survive; paused time does not count toward the server timeout.
@@ -2006,51 +2008,31 @@ do
         Stopped = false,
         Revision = 0,
         Working = false,
-        PresetOrder = {
-            "Damage", "FruitDamage", "GunDamage", "MeleeDamage", "SwordDamage",
-            "Resistance", "FruitResistance", "GunResistance", "MeleeResistance", "SwordResistance",
-            "Instinct", "Health", "Cooldown", "FruitCooldown", "GunCooldown",
-            "MeleeCooldown", "SwordCooldown", "Custom",
+        PriorityOrder = {
+            "Damage", "SwordDamage", "Resistance", "FruitResistance", "GunResistance",
+            "MeleeResistance", "SwordResistance", "Instinct", "Health",
         },
-        PresetLabels = {
-            Damage = "Overall damage", FruitDamage = "Fruit damage", GunDamage = "Gun damage",
-            MeleeDamage = "Melee damage", SwordDamage = "Sword damage",
+        PriorityLabels = {
+            Damage = "Overall damage", SwordDamage = "Sword damage",
             Resistance = "Overall resistance", FruitResistance = "Fruit resistance",
             GunResistance = "Gun resistance", MeleeResistance = "Melee resistance",
             SwordResistance = "Sword resistance", Instinct = "Instinct", Health = "Health & recovery",
-            Cooldown = "All cooldowns", FruitCooldown = "Fruit cooldown", GunCooldown = "Gun cooldown",
-            MeleeCooldown = "Melee cooldown", SwordCooldown = "Sword cooldown", Custom = "Custom weights",
         },
-        Presets = {
-            Damage = {["AllDamage.All"] = 1, ["AllDamage.Fruit"] = 1, ["AllDamage.Gun"] = 1,
-                ["AllDamage.Melee"] = 1, ["AllDamage.Sword"] = 1},
-            FruitDamage = {["AllDamage.All"] = 1, ["AllDamage.Fruit"] = 1},
-            GunDamage = {["AllDamage.All"] = 1, ["AllDamage.Gun"] = 1},
-            MeleeDamage = {["AllDamage.All"] = 1, ["AllDamage.Melee"] = 1},
-            SwordDamage = {["AllDamage.All"] = 1, ["AllDamage.Sword"] = 1},
-            Resistance = {["AllResist.All"] = 1, ["AllResist.Fruit"] = 1, ["AllResist.Gun"] = 1,
-                ["AllResist.Melee"] = 1, ["AllResist.Sword"] = 1},
-            FruitResistance = {["AllResist.All"] = 1, ["AllResist.Fruit"] = 1},
-            GunResistance = {["AllResist.All"] = 1, ["AllResist.Gun"] = 1},
-            MeleeResistance = {["AllResist.All"] = 1, ["AllResist.Melee"] = 1},
-            SwordResistance = {["AllResist.All"] = 1, ["AllResist.Sword"] = 1},
+        -- General bonuses are separate priorities from weapon-specific bonuses.
+        -- Otherwise a sword-only bonus would already match Overall damage.
+        PriorityWeights = {
+            Damage = {["AllDamage.All"] = 1},
+            SwordDamage = {["AllDamage.Sword"] = 1},
+            Resistance = {["AllResist.All"] = 1},
+            FruitResistance = {["AllResist.Fruit"] = 1},
+            GunResistance = {["AllResist.Gun"] = 1},
+            MeleeResistance = {["AllResist.Melee"] = 1},
+            SwordResistance = {["AllResist.Sword"] = 1},
             Instinct = {DodgeBoost = 100, ObservationRange = 1},
             Health = {Health = 1, HealthRegen = 1000, ["PveLeech.Melee"] = 1000, ["PvpLeech.Melee"] = 1000},
-            Cooldown = {AllCooldown = 1, FruitCooldown = 1, GunCooldown = 1,
-                MeleeCooldown = 1, SwordCooldown = 1, FlashstepCooldown = 1},
-            FruitCooldown = {AllCooldown = 1, FruitCooldown = 1},
-            GunCooldown = {AllCooldown = 1, GunCooldown = 1},
-            MeleeCooldown = {AllCooldown = 1, MeleeCooldown = 1},
-            SwordCooldown = {AllCooldown = 1, SwordCooldown = 1},
         },
     }
     Runtime.AccessoryUI = Accessory
-
-    if type(Settings.Accessories) ~= "table" then Settings.Accessories = {} end
-    if Settings.Accessories.Preset == nil then Settings.Accessories.Preset = "Damage" end
-    if type(Settings.Accessories.CustomWeights) ~= "table" then
-        Settings.Accessories.CustomWeights = {["AllDamage.All"] = 1, ["AllDamage.Fruit"] = 1}
-    end
 
     function Accessory.IsCurrent()
         return not Accessory.Stopped and PauseControl:IsCurrent()
@@ -2099,7 +2081,7 @@ do
             local child = parent:FindFirstChild(name)
             if child then return child end
             if os.clock() >= deadline then
-                return nil, "Accessory data is not ready: " .. name .. ". Select a preset to retry."
+                return nil, "Accessory data is not ready: " .. name .. ". Use Rescan to retry."
             end
             task.wait(0.1)
             if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled" end
@@ -2135,7 +2117,7 @@ do
             local ok, result = pcall(require, module)
             if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled" end
             if not ok or type(result) ~= "table" then
-                return nil, "Cannot load accessory data: " .. entry[1] .. ". Select a preset to retry."
+                return nil, "Cannot load accessory data: " .. entry[1] .. ". Use Rescan to retry."
             end
             dependencies[entry[1]] = result
         end
@@ -2150,14 +2132,14 @@ do
         end
         if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled" end
         if not service.IsInitialized then
-            return nil, "Inventory is still initializing. Select a preset to retry."
+            return nil, "Inventory is still initializing. Use Rescan to retry."
         end
         if not service.IS_CLIENT then return nil, "Accessory inventory is unavailable on this client." end
         if type(service.GetItems) ~= "function" or type(service.ReadItem) ~= "function"
             or type(dependencies.ItemId.getDataFromId) ~= "function"
             or type(dependencies.AccessoriesShared.getReplicatedAccessoryItem) ~= "function"
             or dependencies.KEYS.QUANTITY == nil or dependencies.KEYS.IS_EQUIPPED == nil then
-            return nil, "Accessory inventory data is incomplete. Select a preset to retry."
+            return nil, "Accessory inventory data is incomplete. Use Rescan to retry."
         end
         Accessory.Dependencies = dependencies
         return dependencies
@@ -2191,7 +2173,7 @@ do
         return ok and equipped == true
     end
 
-    function Accessory.ReadCandidate(dependencies, replicatedItem, weights, revision)
+    function Accessory.ReadCandidate(dependencies, replicatedItem, revision)
         local ok, candidate = pcall(function()
             if type(replicatedItem) ~= "table" or not isFiniteNumber(replicatedItem.Value)
                 or replicatedItem.Value <= 0 then return nil end
@@ -2234,10 +2216,9 @@ do
                 local wear = dependencies.Wear[storageKey]
                 buffs = type(wear) == "table" and type(wear[0]) == "table" and wear[0][2] or nil
             end
-            local score = Accessory.Score(buffs, weights)
-            if score <= 0 then return nil end
+            if type(buffs) ~= "table" then return nil end
             local result = {ItemId = itemId, NetworkedUID = uid, StorageKey = storageKey,
-                Name = name or storageKey or tostring(itemId), Score = score}
+                Name = name or storageKey or tostring(itemId), Buffs = buffs}
             result.IsEquipped = Accessory.IsEquipped(dependencies, result)
             result.SortKey = result.Name .. "\0" .. tostring(uid or storageKey) .. "\0" .. tostring(itemId)
             return result
@@ -2246,54 +2227,61 @@ do
         return nil
     end
 
-    function Accessory.FindBest(dependencies, weights, revision)
+    function Accessory.FindBest(dependencies, revision)
         local ok, items = pcall(function()
             return dependencies.ItemReplicationService:GetItems(dependencies.KEYS.QUANTITY)
         end)
         if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled" end
         if not ok or (items ~= nil and type(items) ~= "table") then
-            return nil, "Could not read the accessory inventory. Select a preset to retry."
+            return nil, "Could not read the accessory inventory. Use Rescan to retry."
         end
-        local best, matches = nil, 0
+
+        -- Read inventory and item buffs once, then score the same snapshot in priority order.
+        local candidates = {}
         for _, replicatedItem in pairs(items or {}) do
             if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled" end
-            local candidate = Accessory.ReadCandidate(dependencies, replicatedItem, weights, revision)
+            local candidate = Accessory.ReadCandidate(dependencies, replicatedItem, revision)
             if not Accessory.IsRequestCurrent(revision) then return nil, "cancelled" end
-            if candidate then
-                matches = matches + 1
-                if not best or candidate.Score > best.Score
-                    or (candidate.Score == best.Score and candidate.IsEquipped and not best.IsEquipped)
-                    or (candidate.Score == best.Score and candidate.IsEquipped == best.IsEquipped
-                        and candidate.SortKey < best.SortKey) then
-                    best = candidate
+            if candidate then table.insert(candidates, candidate) end
+        end
+        for rank, priority in ipairs(Accessory.PriorityOrder) do
+            local best, matches = nil, 0
+            for _, candidate in ipairs(candidates) do
+                candidate.Score = Accessory.Score(candidate.Buffs, Accessory.PriorityWeights[priority])
+                if candidate.Score > 0 then
+                    matches = matches + 1
+                    if not best or candidate.Score > best.Score
+                        or (candidate.Score == best.Score and candidate.IsEquipped and not best.IsEquipped)
+                        or (candidate.Score == best.Score and candidate.IsEquipped == best.IsEquipped
+                            and candidate.SortKey < best.SortKey) then
+                        best = candidate
+                    end
                 end
             end
+            if best then return best, nil, matches, priority, rank end
         end
-        if not best then return nil, "No owned accessory has a positive score for this preset." end
-        return best, nil, matches
+        return nil, "No owned accessory matches any automatic priority."
     end
 
-    function Accessory.Apply(revision, preset)
+    function Accessory.Apply(revision)
         if not Accessory.IsRequestCurrent(revision) then return end
-        local weights = Accessory.Presets[preset]
-        if preset == "Custom" then weights = Settings.Accessories.CustomWeights end
-        if type(weights) ~= "table" then
-            Accessory.SetStatus(revision, "Unknown preset: " .. tostring(preset) .. ". Choose one from the list.", "error")
-            return
-        end
         Accessory.SetStatus(revision, "Waiting for the accessory inventory...", "busy")
         local dependencies, reason = Accessory.LoadDependencies(revision)
         if not Accessory.IsRequestCurrent(revision) then return end
         if not dependencies then Accessory.SetStatus(revision, reason, "error"); return end
-        Accessory.SetStatus(revision, "Finding the best owned accessory...", "busy")
-        local best, scanError, matches = Accessory.FindBest(dependencies, weights, revision)
+        Accessory.SetStatus(revision, "Checking owned accessories in priority order...", "busy")
+        local best, scanError, matches, priority, rank = Accessory.FindBest(dependencies, revision)
         if not Accessory.IsRequestCurrent(revision) then return end
         if not best then
             Accessory.ItemLabel.Text = "No matching accessory"
-            Accessory.DetailLabel.Text = "Try another preset or change your custom weights."
+            Accessory.PriorityLabel.Text = "No available priority"
+            Accessory.DetailLabel.Text = "Your current equipment has been kept."
             Accessory.SetStatus(revision, scanError, "error")
             return
         end
+        Accessory.SelectedPriority = priority
+        Accessory.SelectedItemName = best.Name
+        Accessory.PriorityLabel.Text = tostring(rank) .. ". " .. Accessory.PriorityLabels[priority]
         Accessory.ItemLabel.Text = best.Name
         Accessory.DetailLabel.Text = string.format("Score %.3f  /  %d matching item%s", best.Score,
             matches, matches == 1 and "" or "s")
@@ -2311,7 +2299,7 @@ do
         end)
         if not Accessory.IsRequestCurrent(revision) then return end
         if not requested or result == false then
-            Accessory.SetStatus(revision, "The equip request failed. Select a preset to retry.", "error")
+            Accessory.SetStatus(revision, "The equip request failed. Use Rescan to retry.", "error")
             return
         end
         local verifyBy = os.clock() + 3
@@ -2326,7 +2314,7 @@ do
             task.wait(0.1)
             if not Accessory.IsRequestCurrent(revision) then return end
         until false
-        Accessory.SetStatus(revision, "Request sent; equip not confirmed. Select a preset to retry.", "error")
+        Accessory.SetStatus(revision, "Request sent; equip not confirmed. Use Rescan to retry.", "error")
     end
 
     function Accessory.RunQueue()
@@ -2346,12 +2334,12 @@ do
                 end
                 if Accessory.IsRequestCurrent(request.Revision) then
                     Environment.__AutoBountyAccessoryRequest = token
-                    local ok = pcall(Accessory.Apply, request.Revision, request.Preset)
+                    local ok = pcall(Accessory.Apply, request.Revision)
                     if Environment.__AutoBountyAccessoryRequest == token then
                         Environment.__AutoBountyAccessoryRequest = nil
                     end
                     if not ok then
-                        Accessory.SetStatus(request.Revision, "Accessory data could not be read. Select a preset to retry.", "error")
+                        Accessory.SetStatus(request.Revision, "Accessory data could not be read. Use Rescan to retry.", "error")
                     end
                 end
             end
@@ -2359,22 +2347,16 @@ do
         end)
     end
 
-    function Accessory.Select(preset)
+    function Accessory.Refresh()
         if not Accessory.IsCurrent() then return end
         Accessory.Revision = Accessory.Revision + 1
-        Accessory.Selected = preset
-        PauseControl.AccessoryPreset = preset
-        Settings.Accessories.Preset = preset
-        Accessory.PresetButton.Text = Accessory.PresetLabels[preset] or tostring(preset)
-        Accessory.Dropdown.Visible = false
-        for name, button in pairs(Accessory.OptionButtons) do
-            button.BackgroundColor3 = name == preset and Accessory.UI.Colors.Accent or Accessory.UI.Colors.Raised
-            button.TextColor3 = name == preset and Accessory.UI.Colors.Panel or Accessory.UI.Colors.Text
-        end
+        Accessory.SelectedPriority = nil
+        Accessory.SelectedItemName = nil
         Accessory.ItemLabel.Text = "Checking your accessories..."
-        Accessory.DetailLabel.Text = "Selection applies automatically."
-        Accessory.SetStatus(Accessory.Revision, "Preparing accessory selection...", "busy")
-        Accessory.Pending = {Revision = Accessory.Revision, Preset = preset}
+        Accessory.PriorityLabel.Text = "Checking from Overall damage..."
+        Accessory.DetailLabel.Text = "The first available priority is applied automatically."
+        Accessory.SetStatus(Accessory.Revision, "Preparing automatic equipment...", "busy")
+        Accessory.Pending = {Revision = Accessory.Revision}
         Accessory.RunQueue()
     end
 
@@ -2382,24 +2364,14 @@ do
         Accessory.GUI = Runtime.GUI
         Accessory.UI = UI
         PauseControl.AccessoryUI = Accessory
-        Accessory.OptionButtons = {}
-        UI.Text(page, "AccessoryTitle", "Accessory", 24, 18, 610, 30, 24, UI.Colors.Text, true)
-        UI.Text(page, "AccessorySubtitle", "Choose a priority. The best owned accessory applies automatically.",
+        UI.Text(page, "AccessoryTitle", "Automatic accessory", 24, 18, 610, 30, 24, UI.Colors.Text, true)
+        UI.Text(page, "AccessorySubtitle", "Checks priorities from top to bottom and equips the best owned match.",
             24, 52, 622, 36, 13, UI.Colors.Muted)
 
-        local presetCard = UI.CreateFrame(page, "AccessoryPresetCard", 24, 104, 632, 116, UI.Colors.Panel, 12)
-        UI.Text(presetCard, "PresetLabel", "OPTIMIZATION PRESET", 18, 12, 570, 20, 11, UI.Colors.Muted, true)
-        Accessory.PresetButton = UI.Button(presetCard, "AccessoryPreset", "Overall damage", 18, 44, 596, 50)
-        Accessory.PresetButton.TextXAlignment = Enum.TextXAlignment.Left
-        Accessory.PresetButton.TextSize = 15
-        Accessory.PresetButton.BackgroundColor3 = UI.Colors.Raised
-        local padding = Instance.new("UIPadding")
-        padding.PaddingLeft = UDim.new(0, 14)
-        padding.PaddingRight = UDim.new(0, 42)
-        padding.Parent = Accessory.PresetButton
-        local arrow = UI.Text(Accessory.PresetButton, "Arrow", "v", 550, 10, 26, 28, 15, UI.Colors.Muted, true)
-        arrow.TextXAlignment = Enum.TextXAlignment.Center
-        arrow.Active = false
+        local priorityCard = UI.CreateFrame(page, "AccessoryPriorityCard", 24, 104, 632, 116, UI.Colors.Panel, 12)
+        UI.Text(priorityCard, "PriorityCaption", "FIRST AVAILABLE PRIORITY", 18, 12, 596, 20, 11, UI.Colors.Muted, true)
+        Accessory.PriorityLabel = UI.Text(priorityCard, "AutomaticPriority", "Checking from Overall damage...",
+            18, 43, 596, 48, 24, UI.Colors.Text, true)
 
         local resultCard = UI.CreateFrame(page, "AccessoryResultCard", 24, 236, 632, 164, UI.Colors.Panel, 12)
         UI.Text(resultCard, "BestMatchLabel", "BEST OWNED MATCH", 18, 14, 370, 20, 11, UI.Colors.Muted, true)
@@ -2408,10 +2380,10 @@ do
         Accessory.ItemLabel = UI.Text(resultCard, "AccessoryItem", "Checking your accessories...",
             18, 46, 590, 34, 21, UI.Colors.Text, true)
         Accessory.ItemLabel.TextTruncate = Enum.TextTruncate.AtEnd
-        Accessory.DetailLabel = UI.Text(resultCard, "AccessoryDetail", "Selection applies automatically.",
+        Accessory.DetailLabel = UI.Text(resultCard, "AccessoryDetail", "Applies automatically on startup.",
             18, 85, 590, 26, 12, UI.Colors.Muted)
         Accessory.StateDot = UI.CreateFrame(resultCard, "AccessoryStatusDot", 18, 128, 7, 7, UI.Colors.Muted, 4)
-        Accessory.StatusLabel = UI.Text(resultCard, "AccessoryStatus", "Preparing accessory selection...",
+        Accessory.StatusLabel = UI.Text(resultCard, "AccessoryStatus", "Preparing automatic equipment...",
             34, 116, 574, 39, 12, UI.Colors.Muted)
         Accessory.StatusLabel.TextWrapped = true
         Accessory.StatusLabel.TextYAlignment = Enum.TextYAlignment.Center
@@ -2419,64 +2391,15 @@ do
         local rescan = UI.Button(page, "AccessoryRescan", "Rescan & apply", 24, 418, 178, 42)
         rescan.BackgroundColor3 = UI.Colors.Accent
         rescan.TextSize = 13
-        local note = UI.Text(page, "AccessoryNote", "You can change accessories while bounty hunting is paused.",
+        local note = UI.Text(page, "AccessoryNote", "Rescan after your inventory changes. Also works while hunting is paused.",
             218, 417, 438, 46, 12, UI.Colors.Muted)
         note.TextWrapped = true
-        UI.Text(page, "AccessoryWeightsHint", "Custom uses Settings.Accessories.CustomWeights from your configuration.",
-            24, 478, 630, 25, 11, UI.Colors.Muted)
-
-        -- A scrolling overlay keeps all 18 options reachable within the 520 px page.
-        Accessory.Dropdown = UI.CreateFrame(page, "AccessoryPresetDropdown", 42, 204, 596, 288, UI.Colors.Raised, 10)
-        Accessory.Dropdown.Visible = false
-        Accessory.Dropdown.ZIndex = 20
-        local stroke = Instance.new("UIStroke")
-        stroke.Color = UI.Colors.Stroke
-        stroke.Thickness = 1
-        stroke.Parent = Accessory.Dropdown
-        local list = Instance.new("ScrollingFrame")
-        list.Name = "PresetOptions"
-        list.BackgroundTransparency = 1
-        list.BorderSizePixel = 0
-        list.Position = UDim2.fromOffset(6, 6)
-        list.Size = UDim2.new(1, -12, 1, -12)
-        list.CanvasSize = UDim2.fromOffset(0, #Accessory.PresetOrder * 36)
-        list.ScrollBarThickness = 4
-        list.ScrollBarImageColor3 = UI.Colors.Accent
-        list.ScrollingDirection = Enum.ScrollingDirection.Y
-        list.ZIndex = 21
-        list.Parent = Accessory.Dropdown
-        for index, name in ipairs(Accessory.PresetOrder) do
-            local preset = name
-            local option = UI.Button(list, "Preset" .. preset, Accessory.PresetLabels[preset],
-                2, (index - 1) * 36, 574, 32)
-            option.ZIndex = 22
-            option.TextSize = 13
-            option.TextXAlignment = Enum.TextXAlignment.Left
-            option.BackgroundColor3 = UI.Colors.Raised
-            local optionPadding = Instance.new("UIPadding")
-            optionPadding.PaddingLeft = UDim.new(0, 12)
-            optionPadding.Parent = option
-            Accessory.OptionButtons[preset] = option
-            Accessory.Connect(option.Activated, function() Accessory.Select(preset) end)
-        end
-        Accessory.Connect(Accessory.PresetButton.Activated, function()
-            Accessory.Dropdown.Visible = not Accessory.Dropdown.Visible
-            if Accessory.Dropdown.Visible then
-                for index, preset in ipairs(Accessory.PresetOrder) do
-                    if preset == Accessory.Selected then
-                        list.CanvasPosition = Vector2.new(0, math.max(0, math.min((index - 1) * 36, 372)))
-                        break
-                    end
-                end
-            end
-        end)
-        Accessory.Connect(rescan.Activated, function() Accessory.Select(Accessory.Selected or "Damage") end)
+        Accessory.Connect(rescan.Activated, Accessory.Refresh)
         if not Accessory.InitialApplyScheduled then
             Accessory.InitialApplyScheduled = true
-            local initialPreset = PauseControl.AccessoryPreset or Settings.Accessories.Preset or "Damage"
             local initialRevision = Accessory.Revision
             task.spawn(function()
-                if Accessory.IsRequestCurrent(initialRevision) then Accessory.Select(initialPreset) end
+                if Accessory.IsRequestCurrent(initialRevision) then Accessory.Refresh() end
             end)
         end
     end
