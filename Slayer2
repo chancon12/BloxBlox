@@ -1157,6 +1157,40 @@ local function startAFKResourceMonitor()
     debugPrint("AFK", "Monitor setup complete")
 end
 
+local function applyAFKLowLagSettings()
+    if game.PlaceId ~= AFK_PLACE_ID then
+        return
+    end
+
+    local success, err = pcall(function()
+        local communication = waitForChildDebug(ReplicatedStorage, "Communication")
+        local serverAndClient = waitForChildDebug(communication, "ServerAndClient")
+        local signals = waitForChildDebug(serverAndClient, "Signals")
+        local SignalEvent = requireDebug(waitForChildDebug(signals, "SignalEvent"))
+
+        local settings = {
+            {"ParticleQuality", 0},
+            {"ParticleQualityMine", 0},
+            {"ParticleQualityAllies", 0},
+            {"ParticleQualityOthers", 0},
+            {"ScreenShakeStrength", 0},
+            {"MaterialQuality", false},
+            {"ShadowQuality", false},
+        }
+
+        for _, setting in ipairs(settings) do
+            SignalEvent.ToServer(setting[1], setting[2])
+            task.wait(0.05)
+        end
+
+        print("Low-lag settings applied")
+    end)
+
+    if not success then
+        warn("Low-lag settings failed:", err)
+    end
+end
+
 if game.PlaceId == VERSION_PLACE_ID then
     debugPrint("Route", "Main place: version check, then private-server flow")
     task.spawn(function()
@@ -1203,7 +1237,8 @@ if game.PlaceId == VERSION_PLACE_ID then
         checkVersion()
     end)
 elseif game.PlaceId == AFK_PLACE_ID then
-    debugPrint("Route", "AFK place: friend check, return timer, and resource monitor")
+    debugPrint("Route", "AFK place: low-lag settings, friend check, return timer, and resource monitor")
+    task.spawn(applyAFKLowLagSettings)
     startAFKServerRules()
     task.spawn(startAFKResourceMonitor)
 else
