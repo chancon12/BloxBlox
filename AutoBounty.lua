@@ -1,4 +1,5 @@
--- Centered sidebar: Status, Stats, and Accessories.
+-- Compact centered GUI: large username and three totals, with Status/Stats/Accessories tabs.
+-- Drag the username header to move. X hides the panel; Bounty reopens it without stopping workers.
 -- Pause/Resume stops bounty workers; Stats and Accessories stay available.
 -- Accessories automatically equips the best owned item in the first available priority:
 -- Overall damage, Sword damage, Overall resistance, Fruit/Gun/Melee/Sword resistance,
@@ -1881,16 +1882,9 @@ do
         local statsPage = UI.Pages.Stats
         local tabs = {}
         local tabNames = {"Status", "Stats", "Accessories"}
-        local headers = {
-            Status = "HUNT OPERATIONS",
-            Stats = "STAT ALLOCATION",
-            Accessories = "ACCESSORY LOADOUT",
-        }
-
         function UI.SelectTab(name)
             if not UI.Pages[name] then return end
             UI.SelectedTab = name
-            UI.Heading.Text = headers[name]
             for pageName, page in pairs(UI.Pages) do
                 page.Visible = pageName == name
             end
@@ -1906,13 +1900,15 @@ do
 
         for index, name in ipairs(tabNames) do
             local tabName = name
-            local tab = UI.Button(UI.Sidebar, name .. "Tab", "    " .. name,
-                12, 112 + (index - 1) * 56, 186, 44, function()
+            local width = index == 3 and 228 or 218
+            local tab = UI.Button(UI.Frame, name .. "Tab", name,
+                20 + (index - 1) * 226, 88, width, 44, function()
                     UI.SelectTab(tabName)
                 end)
-            tab.TextSize = 17
-            tab.TextXAlignment = Enum.TextXAlignment.Left
-            local bar = UI.CreateFrame(tab, "SelectionBar", 0, 0, 5, 44, UI.Colors.Accent, 4)
+            tab.TextSize = 24
+            tab.TextXAlignment = Enum.TextXAlignment.Center
+            local bar = UI.CreateFrame(tab, "SelectionBar", 8, 40, width - 16, 3, UI.Colors.Accent, 2)
+            bar.UIStroke.Enabled = false
             bar.Visible = false
             tabs[name] = tab
         end
@@ -2440,6 +2436,7 @@ local function createGUI()
     screenGui.Name = "AutoBountyStatus"
     screenGui.ResetOnSpawn = false
     screenGui.IgnoreGuiInset = true
+    screenGui.ScreenInsets = Enum.ScreenInsets.None
     screenGui.DisplayOrder = 50
     screenGui.Parent = playerGui
     Runtime.GUI = screenGui
@@ -2512,45 +2509,55 @@ local function createGUI()
         return control
     end
 
-    local frame = UI.CreateFrame(screenGui, "Panel", 0, 0, 940, 590, UI.Colors.Panel, 13)
+    UI.Width, UI.Height = 720, 540
+    local frame = UI.CreateFrame(screenGui, "Panel", 0, 0, UI.Width, UI.Height, UI.Colors.Panel, 13)
     frame.AnchorPoint = Vector2.new(0.5, 0.5)
     frame.Position = UDim2.fromScale(0.5, 0.5)
     UI.Frame = frame
+    UI.Offset = Vector2.new(0, 0)
     local scale = Instance.new("UIScale")
     scale.Name = "ViewportScale"
     scale.Parent = frame
     UI.Scale = scale
 
-    UI.Sidebar = UI.CreateFrame(frame, "Sidebar", 14, 14, 210, 562)
-    Runtime.Labels.Title = UI.Text(UI.Sidebar, "Title", "AUTO BOUNTY",
-        16, 16, 178, 32, 22, UI.Colors.Text, true)
-    Runtime.Labels.Username = UI.Text(UI.Sidebar, "Username", "Player: @" .. LocalPlayer.Name,
-        16, 57, 178, 26, 13, UI.Colors.Muted)
-    Runtime.Labels.Username.TextScaled = true
+    -- A TextButton makes the whole username header a clear mouse/touch drag handle.
+    local header = UI.Button(frame, "Username", "@" .. LocalPlayer.Name, 60, 8, 600, 72)
+    header.BackgroundTransparency = 1
+    header.AutoButtonColor = false
+    header.UIStroke.Enabled = false
+    header.TextSize = 64
+    header.TextScaled = true
+    header.TextWrapped = false
+    header.TextTruncate = Enum.TextTruncate.None
+    header.TextXAlignment = Enum.TextXAlignment.Center
     local usernameTextSize = Instance.new("UITextSizeConstraint")
-    usernameTextSize.MinTextSize = 9
-    usernameTextSize.MaxTextSize = 13
-    usernameTextSize.Parent = Runtime.Labels.Username
-    local divider = UI.CreateFrame(UI.Sidebar, "Divider", 16, 94, 178, 1, UI.Colors.Stroke, 0)
-    divider.UIStroke.Enabled = false
+    usernameTextSize.MinTextSize = 16
+    usernameTextSize.MaxTextSize = 64
+    usernameTextSize.Parent = header
+    Runtime.Labels.Username = header
+    UI.DragHandle = header
 
-    UI.Heading = UI.Text(frame, "PageHeading", "HUNT OPERATIONS",
-        246, 18, 280, 26, 15, UI.Colors.Muted, true)
-    local headingLine = UI.CreateFrame(frame, "HeadingLine", 505, 31, 417, 1, UI.Colors.Stroke, 0)
-    headingLine.UIStroke.Enabled = false
     for _, name in ipairs({"Status", "Stats", "Accessories"}) do
-        local page = Instance.new("Frame")
+        -- The detail tabs scroll so their controls stay reachable without shrinking the totals.
+        local page = Instance.new(name == "Status" and "Frame" or "ScrollingFrame")
         page.Name = name .. "Page"
-        page.Position = UDim2.fromOffset(242, 56)
-        page.Size = UDim2.fromOffset(680, 520)
+        page.Position = UDim2.fromOffset(20, 146)
+        page.Size = UDim2.fromOffset(680, 312)
         page.BackgroundTransparency = 1
+        page.BorderSizePixel = 0
         page.Visible = name == "Status"
+        if name ~= "Status" then
+            page.CanvasSize = UDim2.fromOffset(0, 536)
+            page.ScrollBarThickness = 5
+            page.ScrollBarImageColor3 = UI.Colors.Accent
+            page.ScrollingDirection = Enum.ScrollingDirection.Y
+            page.ClipsDescendants = true
+        end
         page.Parent = frame
         UI.Pages[name] = page
     end
 
-    -- Preserve the existing worker label contract; only these display mirrors strip prefixes.
-    -- Property-change listeners keep every page live without a rendering loop or polling.
+    -- Retain the worker-facing labels invisibly. Only the three totals have visible mirrors.
     local bindings = Instance.new("Frame")
     bindings.Name = "ValueBindings"
     bindings.Visible = false
@@ -2561,75 +2568,126 @@ local function createGUI()
         local source = createTextLabel(bindings, name, UDim2.fromOffset(0, 0),
             UDim2.fromOffset(0, 0), initial, 14)
         Runtime.Labels[name] = source
+        if not target then return source end
         UI.Values[name] = target
         local baseColor = target.TextColor3
         local function refresh()
             local value = source.Text
             if value:sub(1, #prefix) == prefix then value = value:sub(#prefix + 1) end
-            if signed and value:match("^%d") then value = "+" .. value end
+            value = value:match("^[^\r\n]*") or value
+            -- Saving/pending annotations stay in the binding and never shrink the main number.
+            local digits = value:match("^([+-]?%d[%d,]*)")
+            local amount = digits and tonumber((digits:gsub(",", "")))
+            if digits then
+                value = digits
+                if signed and amount and amount > 0 and value:sub(1, 1) ~= "+" then
+                    value = "+" .. value
+                end
+            end
             target.Text = value
-            target.TextColor3 = name == "Net"
-                and (value:sub(1, 1) == "-" and UI.Colors.Negative or UI.Colors.Positive)
-                or baseColor
+            if name == "Net" then
+                target.TextColor3 = amount and amount < 0 and UI.Colors.Negative
+                    or amount and amount > 0 and UI.Colors.Positive or UI.Colors.Muted
+            else
+                target.TextColor3 = baseColor
+            end
         end
         guiStats.Connect(source:GetPropertyChangedSignal("Text"), refresh)
         refresh()
         return source
     end
 
-    local statusPage = UI.Pages.Status
-    local bountyCard = UI.CreateFrame(statusPage, "BountyCard", 0, 0, 680, 92)
-    UI.Text(bountyCard, "Caption", "Bounty/Honor", 16, 10, 648, 22, 16, UI.Colors.Muted)
-    UI.BindValue("Bounty", UI.Text(bountyCard, "Value", "", 16, 32, 648, 50, 42, nil, true),
-        "Bounty/Honor: ", "Bounty/Honor: Loading...")
+    for _, entry in ipairs({
+        {"Title", "AUTO BOUNTY"}, {"Bounty", "Bounty/Honor: Loading..."},
+        {"Team", "Team: " .. Config.Team}, {"Target", "Target: None"},
+        {"Candidates", "Eligible players: 0"}, {"Combo", "Combo: Initializing"},
+        {"Status", "Status: Initializing"},
+    }) do
+        UI.BindValue(entry[1], nil, "", entry[2])
+    end
 
     local metrics = {
-        {Name = "Gained", Title = "Total gained", Prefix = "Total gained: ", X = 0,
-            Width = 219, Color = UI.Colors.Positive, Signed = true},
-        {Name = "Lost", Title = "Total lost", Prefix = "Total lost: ", X = 231,
-            Width = 218, Color = UI.Colors.Negative},
-        {Name = "Net", Title = "Net change", Prefix = "Net change: ", X = 461,
-            Width = 219, Color = UI.Colors.Positive, Signed = true},
+        {Name = "Gained", Title = "TOTAL GAINED", Prefix = "Total gained: ",
+            Color = UI.Colors.Positive, Signed = true},
+        {Name = "Lost", Title = "TOTAL LOST", Prefix = "Total lost: ",
+            Color = UI.Colors.Negative},
+        {Name = "Net", Title = "NET CHANGE", Prefix = "Net change: ",
+            Color = UI.Colors.Positive, Signed = true},
     }
-    for _, metric in ipairs(metrics) do
-        local card = UI.CreateFrame(statusPage, metric.Name .. "Card", metric.X, 104, metric.Width, 88)
-        UI.Text(card, "Caption", metric.Title, 16, 9, metric.Width - 32, 22, 14, UI.Colors.Muted)
-        local value = UI.Text(card, "Value", "", 16, 31, metric.Width - 32, 48, 27, metric.Color, true)
+    for index, metric in ipairs(metrics) do
+        local card = UI.CreateFrame(UI.Pages.Status, metric.Name .. "Card", 0, (index - 1) * 106, 680, 100)
+        UI.Text(card, "Caption", metric.Title, 16, 0, 192, 100, 22, UI.Colors.Text, true)
+        local value = UI.Text(card, "Value", "", 214, 10, 450, 80, 68, metric.Color, true)
         value.TextScaled = true
-        value.TextWrapped = true
+        value.TextWrapped = false
+        value.TextTruncate = Enum.TextTruncate.None
+        value.TextXAlignment = Enum.TextXAlignment.Right
         local textSize = Instance.new("UITextSizeConstraint")
-        textSize.MinTextSize = 12
-        textSize.MaxTextSize = 27
+        textSize.MinTextSize = 16
+        textSize.MaxTextSize = 68
         textSize.Parent = value
         UI.BindValue(metric.Name, value, metric.Prefix, metric.Prefix .. "Loading...", metric.Signed)
     end
 
-    local targetCard = UI.CreateFrame(statusPage, "TargetCard", 0, 204, 348, 92)
-    UI.Text(targetCard, "Caption", "Target", 16, 10, 316, 22, 14, UI.Colors.Muted)
-    UI.BindValue("Target", UI.Text(targetCard, "Value", "", 16, 36, 316, 42, 25, nil, true),
-        "Target: ", "Target: None")
-    local teamCard = UI.CreateFrame(statusPage, "TeamCard", 360, 204, 320, 92)
-    UI.Text(teamCard, "Caption", "Team", 16, 10, 288, 22, 14, UI.Colors.Muted)
-    UI.BindValue("Team", UI.Text(teamCard, "Value", "", 16, 36, 288, 42, 25, nil, true),
-        "Team: ", "Team: " .. Config.Team)
-
-    local statusCard = UI.CreateFrame(statusPage, "StatusCard", 0, 308, 680, 48)
-    UI.Text(statusCard, "Caption", "Status", 16, 0, 104, 48, 14, UI.Colors.Muted)
-    local statusValue = UI.Text(statusCard, "Value", "", 120, 5, 544, 38, 15, UI.Colors.Accent, true)
-    statusValue.TextWrapped = true
-    UI.BindValue("Status", statusValue, "Status: ", "Status: Initializing")
-    local candidatesCard = UI.CreateFrame(statusPage, "CandidatesCard", 0, 368, 680, 48)
-    UI.Text(candidatesCard, "Caption", "Eligible players", 16, 0, 148, 48, 14, UI.Colors.Muted)
-    UI.BindValue("Candidates", UI.Text(candidatesCard, "Value", "", 164, 0, 500, 48, 17, nil, true),
-        "Eligible players: ", "Eligible players: 0")
-    local comboCard = UI.CreateFrame(statusPage, "ComboCard", 0, 428, 680, 92)
-    UI.Text(comboCard, "Caption", "Combo", 16, 9, 648, 22, 14, UI.Colors.Muted)
-    local comboValue = UI.Text(comboCard, "Value", "", 16, 34, 648, 46, 19, nil, true)
-    comboValue.TextWrapped = true
-    UI.BindValue("Combo", comboValue, "Combo: ", "Combo: Initializing")
-
     Runtime.StatsUI.Build(frame)
     if Runtime.AccessoryUI then Runtime.AccessoryUI.Build(UI.Pages.Accessories, UI) end
+
+    function UI.CancelDrag()
+        UI.DragInput, UI.DragStart, UI.DragOffset = nil, nil, nil
+    end
+
+    function UI.ClampPosition()
+        local viewport = UI.Viewport
+        if not viewport then return end
+        local maxX = math.max(0, (viewport.X - UI.Width * scale.Scale) / 2 - 8)
+        local maxY = math.max(0, (viewport.Y - UI.Height * scale.Scale) / 2 - 8)
+        UI.Offset = Vector2.new(math.clamp(UI.Offset.X, -maxX, maxX), math.clamp(UI.Offset.Y, -maxY, maxY))
+        frame.Position = UDim2.new(0.5, UI.Offset.X, 0.5, UI.Offset.Y)
+    end
+
+    function UI.SetVisible(visible)
+        UI.CancelDrag()
+        frame.Visible = visible
+        UI.ReopenButton.Visible = not visible
+        if visible then UI.ClampPosition() end
+    end
+
+    UI.HideButton = UI.Button(frame, "HidePanel", "X", 664, 12, 40, 40, function()
+        UI.SetVisible(false)
+    end)
+    UI.HideButton.TextSize = 24
+    UI.ReopenButton = UI.Button(screenGui, "ReopenPanel", "Bounty", 0, 0, 100, 32, function()
+        UI.SetVisible(true)
+    end)
+    UI.ReopenButton.AnchorPoint = Vector2.new(1, 1)
+    UI.ReopenButton.Position = UDim2.new(1, -8, 1, -8)
+    UI.ReopenButton.TextSize = 16
+    UI.ReopenButton.Visible = false
+
+    -- Position offsets are screen pixels, independent of the panel's UIScale.
+    guiStats.Connect(header.InputBegan, function(input)
+        if not frame.Visible or UI.DragInput then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        UI.DragInput = input
+        UI.DragStart = Vector2.new(input.Position.X, input.Position.Y)
+        UI.DragOffset = UI.Offset
+    end)
+    guiStats.Connect(UserInputService.InputChanged, function(input)
+        local active = UI.DragInput
+        if not active or not frame.Visible then return end
+        local isMouse = active.UserInputType == Enum.UserInputType.MouseButton1
+        if (isMouse and input.UserInputType ~= Enum.UserInputType.MouseMovement)
+            or (not isMouse and input ~= active) then return end
+        UI.Offset = UI.DragOffset + Vector2.new(input.Position.X, input.Position.Y) - UI.DragStart
+        UI.ClampPosition()
+    end)
+    guiStats.Connect(UserInputService.InputEnded, function(input)
+        local active = UI.DragInput
+        if active and (input == active or (active.UserInputType == Enum.UserInputType.MouseButton1
+            and input.UserInputType == Enum.UserInputType.MouseButton1)) then UI.CancelDrag() end
+    end)
+    guiStats.Connect(UserInputService.WindowFocusReleased, UI.CancelDrag)
 
     local cameraConnection
     local function fitViewport()
@@ -2637,7 +2695,10 @@ local function createGUI()
         if not camera then return end
         local viewport = camera.ViewportSize
         if viewport.X <= 0 or viewport.Y <= 0 then return end
-        scale.Scale = math.max(0.01, math.min(1, (viewport.X - 32) / 940, (viewport.Y - 32) / 590))
+        UI.CancelDrag()
+        UI.Viewport = viewport
+        scale.Scale = math.max(0.01, math.min(1, (viewport.X - 16) / UI.Width, (viewport.Y - 16) / UI.Height))
+        UI.ClampPosition()
     end
     local function bindCamera()
         if cameraConnection then cameraConnection:Disconnect(); cameraConnection = nil end
@@ -10453,16 +10514,15 @@ function PauseControl:Attach(runtime, generation, reuseGUI)
         for index, input in ipairs(runtime.StatsUI.Inputs) do input.Text = self.Inputs[index] or "" end
     end
     local panel = runtime.GUI:FindFirstChild("Panel")
-    local sidebar = runtime.PanelUI and runtime.PanelUI.Sidebar or panel
     local button = Instance.new("TextButton")
     button.Name = "PauseResume"
-    button.Position = UDim2.fromOffset(20, 500)
-    button.Size = UDim2.fromOffset(170, 44)
+    button.Position = UDim2.fromOffset(20, 470)
+    button.Size = UDim2.fromOffset(680, 50)
     button.BorderSizePixel = 0
     button.Font = Enum.Font.GothamBold
-    button.TextSize = 16
+    button.TextSize = 28
     button.TextColor3 = Color3.fromRGB(245, 247, 252)
-    button.Parent = sidebar
+    button.Parent = panel
     local corner = Instance.new("UICorner")
     corner.CornerRadius = UDim.new(0, 8)
     corner.Parent = button
