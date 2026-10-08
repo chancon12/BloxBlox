@@ -1,6 +1,6 @@
 local Config = {
     DebugPrints = false, -- Set false to turn off diagnostic prints.
-    ExpectedVersion = 245,
+    ExpectedVersion = 246,
     MainAutomationEnabled = true,
     RedeemLiveCodes = true, -- Pull every unexpired code exposed by the live Codes config.
     CodeFallback = { -- Used only when the live config is unavailable.
