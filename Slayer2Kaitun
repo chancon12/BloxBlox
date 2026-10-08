@@ -1,0 +1,1250 @@
+local Config = {
+    DebugPrints = false, -- Set false to turn off diagnostic prints.
+    ExpectedVersion = 24,
+    PrivateServerPlaceId = 136406881576517, -- World to join, regardless of the current place.
+    FriendName = "lmTheOneJames", -- Your friend's Roblox username.
+    PassOwnPrivateServer = true, -- true = join FriendName directly; false = try your own server first.
+    FriendPrivateServerJobId = "", -- Optional: known JobId if you joined that friend's server manually.
+    AFKJoinFriendWhenFriendPresent = true, -- In the AFK place, join FriendName if any Roblox friend is present.
+    AFKReturnEnabled = false, -- false disables the timed AFK return to the main place.
+    AFKReturnAfterSeconds = 60 * 60, -- Return to the main place after one hour in this script session.
+}
+
+local function debugPrint(section, ...)
+    if Config.DebugPrints then
+        print("[PrivateAFK][" .. section .. "]", ...)
+    end
+end
+
+local lastDebugStates = {}
+local function debugState(section, state)
+    if Config.DebugPrints and lastDebugStates[section] ~= state then
+        lastDebugStates[section] = state
+        debugPrint(section, state)
+    end
+end
+
+local function waitForChildDebug(parent, name)
+    debugPrint("Wait", parent:GetFullName() .. "." .. name)
+    local child = parent:WaitForChild(name)
+    debugPrint("Ready", child:GetFullName())
+    return child
+end
+
+local function requireDebug(module)
+    debugPrint("Require", "Loading", module:GetFullName())
+    local result = require(module)
+    debugPrint("Require", "Loaded", module:GetFullName())
+    return result
+end
+
+debugPrint("Startup", "Script started; PlaceId =", game.PlaceId)
+
+local VERSION_PLACE_ID = 16205713724
+local AFK_PLACE_ID = 136406881576517
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local GuiService = game:GetService("GuiService")
+local TeleportService = game:GetService("TeleportService")
+local LocalPlayer = Players.LocalPlayer
+
+assert(LocalPlayer, "Run this on the client")
+debugPrint("Startup", "Player =", LocalPlayer.Name, "ExpectedVersion =", Config.ExpectedVersion, "FriendName =", Config.FriendName)
+
+local triggered = false
+local versionKickRequested = false
+local privateJoinStarted = false
+local disconnectConnection
+local versionLabel
+
+-- These are client-side route records, not authoritative server ownership data.
+-- Teleport settings persist across places within this Roblox experience.
+local PRIVATE_ROUTE_KEY = "PrivateAFK.PrivateRoute.v1"
+local PRIVATE_ROUTE_MAX_AGE = 300
+
+local function readPrivateRoute()
+    local ok, record = pcall(function()
+        return TeleportService:GetTeleportSetting(PRIVATE_ROUTE_KEY)
+    end)
+    if ok and type(record) == "table" then
+        return record
+    end
+    return {}
+end
+
+local function writePrivateRoute(record)
+    local ok, message = pcall(function()
+        TeleportService:SetTeleportSetting(PRIVATE_ROUTE_KEY, record)
+    end)
+    if not ok then
+        warn("Could not save the private-server route guard:", message)
+    end
+    return ok
+end
+
+local function isCurrentPrivateServer(record)
+    return type(record) == "table"
+        and record.UserId == LocalPlayer.UserId
+        and record.PlaceId == game.PlaceId
+        and game.JobId ~= ""
+        and record.JobId == game.JobId
+        and type(record.Owner) == "string"
+end
+
+local privateRoute = readPrivateRoute()
+if not isCurrentPrivateServer(privateRoute.Current) then
+    privateRoute.Current = nil
+end
+do
+    local pending = privateRoute.Pending
+    if type(pending) == "table" then
+        local age = os.time() - (tonumber(pending.RequestedAt) or 0)
+        local fresh = pending.UserId == LocalPlayer.UserId
+            and type(pending.Owner) == "string"
+            and type(pending.SourceJobId) == "string"
+            and pending.SourceJobId ~= ""
+            and age >= 0 and age <= PRIVATE_ROUTE_MAX_AGE
+        if fresh and pending.PlaceId == game.PlaceId and game.JobId ~= ""
+            and pending.SourceJobId ~= game.JobId then
+            privateRoute.Current = {
+                UserId = LocalPlayer.UserId,
+                PlaceId = game.PlaceId,
+                JobId = game.JobId,
+                Owner = pending.Owner,
+            }
+            privateRoute.Pending = nil
+            debugPrint("Private Guard", "Arrived through a recorded private join; owner =", pending.Owner)
+        elseif not fresh or pending.SourceJobId ~= game.JobId then
+            privateRoute.Pending = nil
+        end
+    else
+        privateRoute.Pending = nil
+    end
+end
+writePrivateRoute(privateRoute)
+
+local function isInConfiguredFriendServer()
+    if game.PlaceId ~= AFK_PLACE_ID then
+        return false
+    end
+    local configuredJob = Config.FriendPrivateServerJobId
+    if type(configuredJob) == "string" and configuredJob ~= "" and game.JobId == configuredJob then
+        return true
+    end
+    local current = privateRoute.Current
+    return isCurrentPrivateServer(current)
+        and type(Config.FriendName) == "string"
+        and current.Owner:lower() == Config.FriendName:lower()
+end
+
+local function clearPendingPrivateRoute(token)
+    local record = readPrivateRoute()
+    local pending = record.Pending
+    if type(pending) == "table" and (token == nil or pending.Token == token) then
+        record.Pending = nil
+        writePrivateRoute(record)
+    end
+end
+
+local function requestTrackedPrivateServer(Teleporter, ownerName, placeId, subtitle)
+    local token = game:GetService("HttpService"):GenerateGUID(false)
+    local record = readPrivateRoute()
+    record.Pending = {
+        Token = token,
+        UserId = LocalPlayer.UserId,
+        Owner = ownerName,
+        PlaceId = placeId,
+        SourceJobId = game.JobId,
+        RequestedAt = os.time(),
+    }
+    writePrivateRoute(record)
+
+    -- Scope failure cleanup to this request; late callbacks cannot erase a newer route.
+    local failureConnection = TeleportService.TeleportInitFailed:Connect(function(player, _, _, failedPlaceId)
+        if player == LocalPlayer and failedPlaceId == placeId then
+            clearPendingPrivateRoute(token)
+        end
+    end)
+    task.delay(PRIVATE_ROUTE_MAX_AGE, function()
+        failureConnection:Disconnect()
+        clearPendingPrivateRoute(token)
+    end)
+
+    local ok, accepted, reason = pcall(function()
+        return Teleporter.Request({
+            placeId = placeId,
+            privateOwner = ownerName,
+        }, {
+            Title = "Joining Private Server",
+            SubTitle = subtitle,
+        })
+    end)
+    if not ok or not accepted then
+        failureConnection:Disconnect()
+        clearPendingPrivateRoute(token)
+    end
+    if not ok then
+        error(accepted, 0)
+    end
+    return accepted, reason
+end
+
+debugPrint("Disconnect", "Installing error-message listener")
+local success, err = pcall(function()
+    disconnectConnection = GuiService.ErrorMessageChanged:Connect(function(message)
+        debugPrint("Disconnect", "ErrorMessageChanged =", message)
+        -- Never run the freeze attempt in the AFK world, including during teleports.
+        if game.PlaceId == AFK_PLACE_ID then
+            debugPrint("Disconnect", "Freeze disabled in the AFK place")
+            return
+        end
+
+        if versionKickRequested or triggered or type(message) ~= "string" then
+            debugPrint("Disconnect", "Ignored; versionKick =", versionKickRequested, "alreadyTriggered =", triggered, "messageType =", type(message))
+            return
+        end
+
+        local text = message:lower()
+        local isAuthError = text:find("auth error", 1, true) ~= nil
+
+        if game.PlaceId == VERSION_PLACE_ID and not isAuthError then
+            debugPrint("Disconnect", "Ignored by main-place exception; not an auth error")
+            return
+        end
+
+        local disconnected =
+            isAuthError
+            or text:find("kicked", 1, true)
+            or text:find("disconnect", 1, true)
+            or text:find("lost connection", 1, true)
+            or text:find("slayers2: please rejoin for safety", 1, true)
+
+        if not disconnected then
+            debugPrint("Disconnect", "Ignored; message does not match a disconnect keyword")
+            return
+        end
+
+        triggered = true
+        debugPrint("Disconnect", "Matched disconnect; entering existing freeze attempt")
+        warn("Disconnect detected; starting freeze attempt:", message)
+
+        -- Preserves your existing local freeze attempt.
+        while true do
+        end
+    end)
+end)
+
+if not success then
+    warn("Disconnect listener unavailable:", err)
+else
+    debugPrint("Disconnect", "Listener connected")
+end
+
+local function parseVersion(text)
+    if type(text) ~= "string" then
+        return nil
+    end
+
+    -- The game's label uses "v.194"; plain "194" is also accepted.
+    local cleaned = text:match("^%s*(.-)%s*$")
+    cleaned = cleaned:gsub("^[vV]%.?%s*", "", 1)
+    return tonumber(cleaned)
+end
+
+local function canJoinPrivate()
+    if versionKickRequested or triggered then
+        return false
+    end
+
+    if game.PlaceId == VERSION_PLACE_ID then
+        return versionLabel ~= nil
+            and parseVersion(versionLabel.Text) == Config.ExpectedVersion
+    end
+
+    return true
+end
+
+local function logPrivateBlocked(stage)
+    debugPrint("Private", "Stopped at", stage,
+        "versionKick =", versionKickRequested,
+        "disconnectTriggered =", triggered,
+        "versionText =", versionLabel and versionLabel.Text)
+end
+
+local function startPrivateJoin()
+    if privateJoinStarted then
+        debugPrint("Private", "Join flow already started; duplicate start ignored")
+        return
+    end
+
+    if not canJoinPrivate() then
+        logPrivateBlocked("start")
+        return
+    end
+
+    privateJoinStarted = true
+    debugPrint("Private", "Starting private-server flow; skip own server =", Config.PassOwnPrivateServer == true)
+
+    task.spawn(function()
+        local joinSuccess, joinError = pcall(function()
+            assert(type(Config.FriendName) == "string" and Config.FriendName ~= "", "Set Config.FriendName at the top")
+            assert(Config.FriendName:lower() ~= LocalPlayer.Name:lower(), "FriendName must be another player")
+
+            debugPrint("Private", "Friend configuration passed validation")
+            local cam = waitForChildDebug(ReplicatedStorage, "CAM")
+            local client = waitForChildDebug(cam, "Client")
+            local modules = waitForChildDebug(client, "Modules")
+            local teleporterModule = waitForChildDebug(modules, "Teleporter")
+            local Teleporter = requireDebug(teleporterModule)
+
+            if not canJoinPrivate() then
+                logPrivateBlocked("module loading completed")
+                return
+            end
+
+            local function joinPrivate(ownerName, subtitle)
+                if not canJoinPrivate() then
+                    logPrivateBlocked("request for " .. ownerName)
+                    return false, "Cancelled"
+                end
+
+                debugPrint("Private", "Calling Teleporter.Request; owner =", ownerName, "PlaceId =", Config.PrivateServerPlaceId)
+                local requestAccepted, requestReason = requestTrackedPrivateServer(
+                    Teleporter, ownerName, Config.PrivateServerPlaceId, subtitle
+                )
+                debugPrint("Private", "Request returned; owner =", ownerName, "accepted =", requestAccepted, "reason =", requestReason)
+                return requestAccepted, requestReason
+            end
+
+            local ownReason = "Private-server access is not owned"
+            local hasVip = false
+
+            if Config.PassOwnPrivateServer == true then
+                ownReason = "Skipped by PassOwnPrivateServer"
+                debugPrint("Private", "Own server skipped; joining configured friend directly")
+            else
+                local global = waitForChildDebug(cam, "Global")
+                local vipModule = waitForChildDebug(global, "VipAccess")
+                local VipAccess = requireDebug(vipModule)
+
+                if not canJoinPrivate() then
+                    logPrivateBlocked("VIP module loading completed")
+                    return
+                end
+
+                debugPrint("Private", "Checking VipAccess.Has")
+                hasVip = VipAccess.Has(LocalPlayer)
+                debugPrint("Private", "VipAccess.Has returned =", hasVip)
+            end
+
+            if hasVip then
+                local joinedOwn
+                joinedOwn, ownReason = joinPrivate(
+                    LocalPlayer.Name,
+                    "Trying your private server"
+                )
+
+                if not canJoinPrivate() then
+                    logPrivateBlocked("own request completed")
+                    return
+                end
+
+                if joinedOwn then
+                    debugPrint("Private", "Own request accepted; no friend fallback")
+                    return
+                elseif ownReason == "Busy" then
+                    debugPrint("Private", "Own request is Busy; stopping fallback")
+                    warn("Another teleport request is already running")
+                    return
+                end
+            end
+
+            if not canJoinPrivate() then
+                logPrivateBlocked("before friend fallback")
+                return
+            end
+
+            debugPrint("Private", "Trying friend =", Config.FriendName, "Own result =", ownReason)
+            local joinedFriend, friendReason = joinPrivate(
+                Config.FriendName,
+                "Trying " .. Config.FriendName .. "'s private server"
+            )
+
+            if joinedFriend then
+                debugPrint("Private", "Friend request accepted")
+            end
+
+            if not joinedFriend and canJoinPrivate() then
+                warn(
+                    "Private-server join flow failed.",
+                    "Own:", ownReason,
+                    "Friend:", friendReason
+                )
+            end
+        end)
+
+        debugPrint("Private", "Join task finished; pcall success =", joinSuccess, "error =", joinError)
+        if not joinSuccess and not versionKickRequested and not triggered then
+            warn("Private-server join failed:", joinError)
+        end
+    end)
+end
+
+local function startAFKServerRules()
+    if game.PlaceId ~= AFK_PLACE_ID then
+        return
+    end
+
+    local returnEnabled = Config.AFKReturnEnabled == true
+    local timeout = math.max(tonumber(Config.AFKReturnAfterSeconds) or 3600, 0)
+    local deadline = returnEnabled and (os.clock() + timeout) or math.huge
+    local returnDue = false
+    local returnStarted = false
+    local friendJoinStarted = false
+    local pendingTransfer
+    local checkedPlayers = {}
+    local requestReturnToMain
+
+    local function isActive()
+        return game.PlaceId == AFK_PLACE_ID
+            and LocalPlayer.Parent == Players
+            and not versionKickRequested
+            and not triggered
+    end
+
+    local function finishTransfer(transfer)
+        if pendingTransfer ~= transfer then
+            return
+        end
+        pendingTransfer = nil
+        if returnDue and not returnStarted then
+            task.defer(requestReturnToMain)
+        end
+    end
+
+    requestReturnToMain = function()
+        if not returnEnabled then
+            return
+        end
+        returnDue = true
+        if not isActive() or returnStarted then
+            return
+        end
+        if pendingTransfer then
+            debugPrint("AFK Return", "Timer elapsed; waiting for the pending transfer")
+            return
+        end
+
+        returnStarted = true
+        local transfer = {Kind = "Main return", PlaceId = VERSION_PLACE_ID}
+        pendingTransfer = transfer
+        debugPrint("AFK Return", "Timer elapsed; teleporting to", VERSION_PLACE_ID)
+        clearPendingPrivateRoute()
+        local ok, message = pcall(function()
+            TeleportService:Teleport(VERSION_PLACE_ID, LocalPlayer)
+        end)
+        if not ok then
+            warn("AFK return teleport failed:", message)
+            finishTransfer(transfer)
+        end
+    end
+
+    TeleportService.TeleportInitFailed:Connect(function(player, result, message, placeId)
+        local transfer = pendingTransfer
+        if player ~= LocalPlayer or not transfer or placeId ~= transfer.PlaceId then
+            return
+        end
+        warn("AFK teleport failed:", transfer.Kind, result, message)
+        finishTransfer(transfer)
+    end)
+
+    -- Arm this before any friendship/module/GUI waits when enabled.
+    if returnEnabled then
+        debugPrint("AFK Return", "Return timer started; seconds =", timeout)
+        task.delay(timeout, requestReturnToMain)
+    else
+        debugPrint("AFK Return", "Timed return disabled")
+    end
+
+    if not Config.AFKJoinFriendWhenFriendPresent then
+        return
+    end
+    if isInConfiguredFriendServer() then
+        debugPrint("AFK Friend", "Already in the configured friend's server; friend-triggered joins disabled")
+        return
+    end
+
+    local function checkPlayer(otherPlayer)
+        if otherPlayer == LocalPlayer or checkedPlayers[otherPlayer.UserId]
+            or friendJoinStarted or returnDue or returnStarted or not isActive() then
+            return
+        end
+        checkedPlayers[otherPlayer.UserId] = true
+
+        task.spawn(function()
+            local ok, isFriend = pcall(function()
+                return LocalPlayer:IsFriendsWithAsync(otherPlayer.UserId)
+            end)
+            if not ok then
+                warn("AFK friend check failed for", otherPlayer.Name, isFriend)
+                return
+            end
+            if not isFriend or otherPlayer.Parent ~= Players or not isActive()
+                or friendJoinStarted or returnDue or returnStarted then
+                return
+            end
+            if os.clock() >= deadline then
+                requestReturnToMain()
+                return
+            end
+
+            -- Claim the one friend-join attempt before module loading can yield.
+            friendJoinStarted = true
+            debugPrint("AFK Friend", "Friend detected =", otherPlayer.Name, "Joining owner =", Config.FriendName)
+            local transfer
+            local joinOK, joinError = pcall(function()
+                assert(type(Config.FriendName) == "string" and Config.FriendName ~= "", "Set Config.FriendName")
+                assert(Config.FriendName:lower() ~= LocalPlayer.Name:lower(), "FriendName must be another player")
+
+                local cam = waitForChildDebug(ReplicatedStorage, "CAM")
+                local client = waitForChildDebug(cam, "Client")
+                local modules = waitForChildDebug(client, "Modules")
+                local Teleporter = requireDebug(waitForChildDebug(modules, "Teleporter"))
+
+                if not isActive() or returnStarted or otherPlayer.Parent ~= Players then
+                    return
+                end
+                if returnDue or os.clock() >= deadline then
+                    requestReturnToMain()
+                    return
+                end
+
+                transfer = {Kind = "Friend private server", PlaceId = AFK_PLACE_ID}
+                pendingTransfer = transfer
+                -- A yielding/accepted request is not proof that the player left.
+                -- Release only this attempt if it stalls, so the hourly return can run.
+                task.delay(30, function()
+                    if pendingTransfer == transfer and isActive() then
+                        debugPrint("AFK Friend", "Still here after 30 seconds; releasing the pending transfer")
+                        finishTransfer(transfer)
+                    end
+                end)
+                local accepted, reason = requestTrackedPrivateServer(
+                    Teleporter, Config.FriendName, AFK_PLACE_ID,
+                    "Joining " .. Config.FriendName .. "'s private server"
+                )
+                debugPrint("AFK Friend", "Request accepted =", accepted, "reason =", reason)
+                if not accepted then
+                    warn("AFK friend private-server request failed:", reason)
+                    finishTransfer(transfer)
+                    return
+                end
+
+            end)
+            if not joinOK then
+                warn("AFK friend private-server join failed:", joinError)
+                if transfer then
+                    finishTransfer(transfer)
+                end
+            end
+        end)
+    end
+
+    -- Connect first so a player joining during the initial scan is not missed.
+    Players.PlayerAdded:Connect(checkPlayer)
+    for _, otherPlayer in ipairs(Players:GetPlayers()) do
+        checkPlayer(otherPlayer)
+    end
+end
+
+local function startAFKResourceMonitor()
+    debugPrint("AFK", "Starting resource monitor")
+    -- AFK Resource Monitor
+    -- Run from a LocalScript or paste into the Client Command Bar during a playtest.
+
+    local CONFIG = {
+    	-- Exact username. Leave blank to monitor the local player.
+    	PlayerName = "",
+    	RefreshSeconds = 0.5,
+    	DisplayOrder = 2147483647,
+
+    	Items = {
+    		{
+    			Name = "Ore", -- Exact inventory data name.
+    			DisplayName = "Ore", -- Text shown in the GUI.
+    			Icon = "rbxassetid://87183725793362",
+    		},
+    		{
+    			Name = "Coin Pouch", -- Exact inventory data name.
+    			DisplayName = "Pounch", -- Text shown in the GUI.
+    			Icon = "rbxassetid://126473769642414",
+    		},
+    		{
+    			Name = "Metal Scraps", -- Exact inventory data name.
+    			DisplayName = "Metal", -- Text shown in the GUI.
+    			Icon = "rbxassetid://129731726532959",
+    		},
+    		{
+    			Name = "Silk Thread", -- Exact inventory data name.
+    			DisplayName = "SilK", -- Text shown in the GUI.
+    			Icon = "rbxassetid://86755077727133",
+    		},
+    	},
+
+    	WenIcon = "rbxassetid://119954170187936",
+    }
+
+    local Players = game:GetService("Players")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+    local localPlayer = Players.LocalPlayer
+    assert(localPlayer, "AFK Resource Monitor must run on the client")
+
+    local playerGui = waitForChildDebug(localPlayer, "PlayerGui")
+    local oldGui = playerGui:FindFirstChild("AFKResourceMonitor")
+
+    if oldGui then
+        debugPrint("AFK", "Replacing existing AFKResourceMonitor GUI")
+    	oldGui:Destroy()
+    end
+
+    local COLORS = {
+    	Gold = Color3.fromRGB(214, 157, 65),
+    	GoldBright = Color3.fromRGB(255, 221, 150),
+    	Cream = Color3.fromRGB(255, 240, 207),
+    	Panel = Color3.fromRGB(13, 13, 15),
+    	Card = Color3.fromRGB(20, 20, 23),
+    	Black = Color3.fromRGB(0, 0, 0),
+    }
+
+    local function make(className, properties, parent)
+    	local instance = Instance.new(className)
+
+    	for property, value in pairs(properties or {}) do
+    		instance[property] = value
+    	end
+
+    	instance.Parent = parent
+    	return instance
+    end
+
+    local function addCorner(parent, radius)
+    	return make("UICorner", {
+    		CornerRadius = UDim.new(0, radius),
+    	}, parent)
+    end
+
+    local function addStroke(parent, color, thickness, transparency)
+    	return make("UIStroke", {
+    		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    		Color = color,
+    		Thickness = thickness,
+    		Transparency = transparency or 0,
+    	}, parent)
+    end
+
+    local function addTextConstraint(parent, minSize, maxSize)
+    	return make("UITextSizeConstraint", {
+    		MinTextSize = minSize,
+    		MaxTextSize = maxSize,
+    	}, parent)
+    end
+
+    local function formatNumber(value)
+    	local number = math.floor(tonumber(value) or 0)
+    	local sign = number < 0 and "-" or ""
+    	local digits = tostring(math.abs(number))
+    	local formatted = digits
+
+    	repeat
+    		local replacements
+    		formatted, replacements = formatted:gsub("^(%d+)(%d%d%d)", "%1,%2")
+    	until replacements == 0
+
+    	return sign .. formatted
+    end
+
+    local function normalizedProfileName(name)
+    	return string.gsub(name, "%-Studio$", "")
+    end
+
+    local targetName = CONFIG.PlayerName ~= "" and CONFIG.PlayerName or localPlayer.Name
+    debugPrint("AFK", "Monitoring =", targetName, "RefreshSeconds =", CONFIG.RefreshSeconds)
+
+    local function findProfile()
+    	local playerService = ReplicatedStorage:FindFirstChild("Player_Service")
+    	local dataRoot = playerService and playerService:FindFirstChild("Data")
+
+    	if not dataRoot then
+            return nil, playerService and "Waiting for Player_Service.Data" or "Waiting for Player_Service"
+    	end
+
+    	for _, profile in ipairs(dataRoot:GetChildren()) do
+    		if normalizedProfileName(profile.Name):lower() == targetName:lower() then
+    			return profile
+    		end
+    	end
+
+        return nil, "Waiting for profile: " .. targetName
+    end
+
+    local function getActiveSlot(profile)
+    	local equippedSlot = profile and profile:FindFirstChild("slotEquipped")
+    	local slots = profile and profile:FindFirstChild("slots")
+
+        if not equippedSlot or not slots then
+            return nil, not equippedSlot and "Waiting for slotEquipped" or "Waiting for slots"
+        end
+
+        local slotName = "Slot" .. tostring(equippedSlot.Value)
+        local activeSlot = slots:FindFirstChild(slotName)
+        return activeSlot, not activeSlot and ("Waiting for " .. slotName) or nil
+    end
+
+    local expPerLevel = 60
+
+    do
+    	local cam = ReplicatedStorage:FindFirstChild("CAM")
+    	local global = cam and cam:FindFirstChild("Global")
+    	local settingsModule = global and global:FindFirstChild("gameSettings")
+
+    	if settingsModule then
+    		local ok, settings = pcall(requireDebug, settingsModule)
+        debugPrint("AFK", "gameSettings require success =", ok, "resultType =", type(settings))
+        if not ok then
+            debugPrint("AFK", "gameSettings failed; using default expPerLevel; error =", settings)
+        end
+
+    		if ok and type(settings) == "table" and tonumber(settings.expPerLevel) then
+    			expPerLevel = tonumber(settings.expPerLevel)
+    		end
+    	end
+    end
+
+    debugPrint("AFK", "expPerLevel =", expPerLevel, "Building monitor GUI")
+
+    local function readLevel(slot)
+    	local exp = slot and slot:FindFirstChild("Exp")
+    	local goal = exp and exp:FindFirstChild("Goal")
+
+    	if not goal or expPerLevel <= 0 then
+            debugState("AFK Level", not goal and "Waiting for Exp.Goal" or "Invalid expPerLevel")
+    		return 0
+    	end
+
+        debugState("AFK Level", "Exp.Goal loaded")
+    	return math.floor(goal.Value / expPerLevel)
+    end
+
+    local function readItemTotal(slot, itemName)
+    	local inventoryRoot = slot and slot:FindFirstChild("Inventory")
+    	local inventory = inventoryRoot and inventoryRoot:FindFirstChild("Inventory")
+    	local total = 0
+
+    	if not inventory then
+            debugState("AFK Inventory", "Waiting for Inventory.Inventory")
+    		return total
+    	end
+
+        debugState("AFK Inventory", "Inventory loaded")
+
+    	for _, item in ipairs(inventory:GetChildren()) do
+    		if item.Name == itemName then
+    			local amount = item:FindFirstChild("Amount")
+    			total += amount and tonumber(amount.Value) or 1
+    		end
+    	end
+
+    	return total
+    end
+
+    local screenGui = make("ScreenGui", {
+    	Name = "AFKResourceMonitor",
+    	DisplayOrder = CONFIG.DisplayOrder,
+    	IgnoreGuiInset = true,
+    	ResetOnSpawn = false,
+    	ZIndexBehavior = Enum.ZIndexBehavior.Global,
+    }, playerGui)
+
+    pcall(function()
+    	screenGui.ScreenInsets = Enum.ScreenInsets.None
+    	screenGui.OnTopOfCoreBlur = true
+    end)
+
+    local overlay = make("Frame", {
+    	Name = "Overlay",
+    	BackgroundColor3 = COLORS.Black,
+    	BackgroundTransparency = 0.28,
+    	BorderSizePixel = 0,
+    	Size = UDim2.fromScale(1, 1),
+    	Visible = true,
+    	ZIndex = 100,
+    }, screenGui)
+
+    local panel = make("Frame", {
+    	Name = "MainPanel",
+    	AnchorPoint = Vector2.new(0.5, 0.5),
+    	BackgroundColor3 = COLORS.Panel,
+    	BackgroundTransparency = 0.03,
+    	BorderSizePixel = 0,
+    	Position = UDim2.fromScale(0.5, 0.5),
+    	Size = UDim2.fromScale(0.82, 0.55),
+    	ZIndex = 110,
+    }, overlay)
+
+    addCorner(panel, 18)
+    addStroke(panel, COLORS.Gold, 3, 0.08)
+
+    local serverBanner = make("Frame", {
+        Name = "ServerBanner",
+        AnchorPoint = Vector2.new(0.5, 1),
+        BackgroundColor3 = COLORS.Panel,
+        BackgroundTransparency = 0.03,
+        BorderSizePixel = 0,
+        Position = UDim2.fromScale(0.5, 0.20),
+        Size = UDim2.fromScale(0.82, 0.07),
+        ZIndex = 110,
+    }, overlay)
+
+    addCorner(serverBanner, 12)
+    addStroke(serverBanner, COLORS.Gold, 2, 0.08)
+
+    local serverLabel = make("TextLabel", {
+        Name = "ServerInfo",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromScale(0.94, 0.78),
+        Text = "Current Server - Loading...",
+        TextColor3 = COLORS.Cream,
+        TextScaled = true,
+        TextWrapped = false,
+        TextStrokeColor3 = COLORS.Black,
+        TextStrokeTransparency = 0.35,
+        ZIndex = 120,
+    }, serverBanner)
+
+    -- Allow the entire owner/count line to shrink in small windows.
+    addTextConstraint(serverLabel, 1, 24)
+
+    local function refreshServerInfo()
+        if not screenGui.Parent then
+            return
+        end
+
+        local owner
+        if isInConfiguredFriendServer() then
+            owner = Config.FriendName
+        elseif isCurrentPrivateServer(privateRoute.Current) then
+            owner = privateRoute.Current.Owner
+        end
+
+        local serverName = type(owner) == "string" and owner ~= ""
+            and (owner .. " Private Server") or "Current Server (owner unknown)"
+        local maximum = tonumber(Players.MaxPlayers) or 0
+        local maximumText = maximum > 0 and tostring(math.floor(maximum)) or "?"
+        serverLabel.Text = string.format(
+            "%s - %d/%s", serverName, #Players:GetPlayers(), maximumText
+        )
+    end
+
+    make("UIGradient", {
+    	Color = ColorSequence.new({
+    		ColorSequenceKeypoint.new(0, Color3.fromRGB(26, 24, 22)),
+    		ColorSequenceKeypoint.new(0.5, Color3.fromRGB(10, 10, 12)),
+    		ColorSequenceKeypoint.new(1, Color3.fromRGB(21, 18, 16)),
+    	}),
+    	Rotation = 90,
+    }, panel)
+
+    local title = make("TextLabel", {
+    	Name = "PlayerTitle",
+    	BackgroundTransparency = 1,
+    	Font = Enum.Font.GothamBold,
+    	Position = UDim2.fromScale(0.08, 0.035),
+    	Size = UDim2.fromScale(0.84, 0.12),
+    	Text = targetName .. " - Level --",
+    	TextColor3 = COLORS.Cream,
+    	TextScaled = true,
+    	TextStrokeColor3 = COLORS.Black,
+    	TextStrokeTransparency = 0.35,
+    	ZIndex = 120,
+    }, panel)
+
+    addTextConstraint(title, 16, 38)
+
+    local titleLine = make("Frame", {
+    	AnchorPoint = Vector2.new(0.5, 0),
+    	BackgroundColor3 = COLORS.Gold,
+    	BackgroundTransparency = 0.1,
+    	BorderSizePixel = 0,
+    	Position = UDim2.fromScale(0.5, 0.17),
+    	Size = UDim2.fromScale(0.45, 0.006),
+    	ZIndex = 120,
+    }, panel)
+
+    make("UIGradient", {
+    	Transparency = NumberSequence.new({
+    		NumberSequenceKeypoint.new(0, 1),
+    		NumberSequenceKeypoint.new(0.5, 0),
+    		NumberSequenceKeypoint.new(1, 1),
+    	}),
+    }, titleLine)
+
+    local closeButton = make("TextButton", {
+    	Name = "Close",
+    	AnchorPoint = Vector2.new(1, 0),
+    	AutoButtonColor = false,
+    	BackgroundColor3 = Color3.fromRGB(18, 18, 20),
+    	BorderSizePixel = 0,
+    	Font = Enum.Font.GothamBold,
+    	Position = UDim2.fromScale(0.975, 0.035),
+    	Size = UDim2.fromScale(0.055, 0.1),
+    	Text = "X",
+    	TextColor3 = Color3.new(1, 1, 1),
+    	TextScaled = true,
+    	ZIndex = 130,
+    }, panel)
+
+    addCorner(closeButton, 10)
+    addStroke(closeButton, COLORS.Gold, 2, 0.15)
+    addTextConstraint(closeButton, 16, 30)
+
+    local cardsHolder = make("Frame", {
+    	Name = "Cards",
+    	AnchorPoint = Vector2.new(0.5, 0),
+    	BackgroundTransparency = 1,
+    	Position = UDim2.fromScale(0.5, 0.22),
+    	Size = UDim2.fromScale(0.94, 0.48),
+    	ZIndex = 120,
+    }, panel)
+
+    make("UIListLayout", {
+    	FillDirection = Enum.FillDirection.Horizontal,
+    	HorizontalAlignment = Enum.HorizontalAlignment.Center,
+    	Padding = UDim.new(0.012, 0),
+    	SortOrder = Enum.SortOrder.LayoutOrder,
+    	VerticalAlignment = Enum.VerticalAlignment.Center,
+    }, cardsHolder)
+
+    local function getItemDisplayName(itemConfig)
+        local displayName = itemConfig.DisplayName
+        if type(displayName) == "string" and displayName ~= "" then
+            return displayName
+        end
+        return itemConfig.Name
+    end
+
+    local itemLabels = {}
+
+    for index, itemConfig in ipairs(CONFIG.Items) do
+    	local card = make("Frame", {
+    		Name = itemConfig.Name,
+    		BackgroundColor3 = COLORS.Card,
+    		BackgroundTransparency = 0.08,
+    		BorderSizePixel = 0,
+    		LayoutOrder = index,
+    		Size = UDim2.fromScale(0.238, 0.95),
+    		ZIndex = 121,
+    	}, cardsHolder)
+
+    	addCorner(card, 14)
+    	addStroke(card, COLORS.Gold, 2, 0.16)
+
+    	make("UIGradient", {
+    		Color = ColorSequence.new({
+    			ColorSequenceKeypoint.new(0, Color3.fromRGB(34, 31, 27)),
+    			ColorSequenceKeypoint.new(1, Color3.fromRGB(12, 12, 14)),
+    		}),
+    		Rotation = 90,
+    	}, card)
+
+    	local icon = make("ImageLabel", {
+    		Name = "Icon",
+    		AnchorPoint = Vector2.new(0.5, 0.5),
+    		BackgroundTransparency = 1,
+    		Image = itemConfig.Icon,
+    		Position = UDim2.fromScale(0.5, 0.43),
+    		ScaleType = Enum.ScaleType.Fit,
+    		Size = UDim2.fromScale(0.58, 0.58),
+    		ZIndex = 124,
+    	}, card)
+
+    	make("UIAspectRatioConstraint", {
+    		AspectRatio = 1,
+    	}, icon)
+
+    	local label = make("TextLabel", {
+    		Name = "Count",
+    		AnchorPoint = Vector2.new(0.5, 1),
+    		BackgroundTransparency = 1,
+    		Font = Enum.Font.GothamBold,
+    		Position = UDim2.fromScale(0.5, 0.96),
+    		Size = UDim2.fromScale(0.94, 0.21),
+    		Text = getItemDisplayName(itemConfig) .. " - x0",
+    		TextColor3 = COLORS.Cream,
+    		TextScaled = true,
+    		TextStrokeColor3 = COLORS.Black,
+    		TextStrokeTransparency = 0.25,
+    		ZIndex = 125,
+    	}, card)
+
+    	addTextConstraint(label, 10, 22)
+    	itemLabels[index] = label
+    end
+
+    local wenFrame = make("Frame", {
+    	Name = "WenFooter",
+    	AnchorPoint = Vector2.new(0.5, 1),
+    	BackgroundColor3 = COLORS.Card,
+    	BackgroundTransparency = 0.08,
+    	BorderSizePixel = 0,
+    	Position = UDim2.fromScale(0.5, 0.94),
+    	Size = UDim2.fromScale(0.7, 0.17),
+    	ZIndex = 121,
+    }, panel)
+
+    addCorner(wenFrame, 14)
+    addStroke(wenFrame, COLORS.Gold, 2, 0.12)
+
+    local wenIcon = make("ImageLabel", {
+    	Name = "Icon",
+    	AnchorPoint = Vector2.new(0, 0.5),
+    	BackgroundTransparency = 1,
+    	Image = CONFIG.WenIcon,
+    	Position = UDim2.fromScale(0.18, 0.5),
+    	ScaleType = Enum.ScaleType.Fit,
+    	Size = UDim2.fromScale(0.16, 0.82),
+    	ZIndex = 124,
+    }, wenFrame)
+
+    make("UIAspectRatioConstraint", {
+    	AspectRatio = 1,
+    }, wenIcon)
+
+    local wenLabel = make("TextLabel", {
+    	Name = "Total",
+    	AnchorPoint = Vector2.new(0, 0.5),
+    	BackgroundTransparency = 1,
+    	Font = Enum.Font.GothamBold,
+    	Position = UDim2.fromScale(0.39, 0.5),
+    	Size = UDim2.fromScale(0.48, 0.58),
+    	Text = "Wen - 0",
+    	TextColor3 = COLORS.Cream,
+    	TextScaled = true,
+    	TextStrokeColor3 = COLORS.Black,
+    	TextStrokeTransparency = 0.25,
+    	TextXAlignment = Enum.TextXAlignment.Left,
+    	ZIndex = 125,
+    }, wenFrame)
+
+    addTextConstraint(wenLabel, 14, 34)
+
+    local openButton = make("TextButton", {
+    	Name = "OpenAFK",
+    	AnchorPoint = Vector2.new(0, 0.5),
+    	AutoButtonColor = false,
+    	BackgroundColor3 = COLORS.Panel,
+    	BorderSizePixel = 0,
+    	Font = Enum.Font.GothamBold,
+    	Position = UDim2.fromScale(0.012, 0.5),
+    	Size = UDim2.fromOffset(72, 78),
+    	Text = "AFK",
+    	TextColor3 = COLORS.GoldBright,
+    	TextScaled = true,
+    	Visible = false,
+    	ZIndex = 200,
+    }, screenGui)
+
+    addCorner(openButton, 18)
+    addStroke(openButton, COLORS.Gold, 2, 0.05)
+    addTextConstraint(openButton, 16, 26)
+
+    debugPrint("AFK", "Monitor GUI created")
+
+    local function setOpen(isOpen)
+        debugPrint("AFK", "Panel open =", isOpen)
+    	overlay.Visible = isOpen
+    	openButton.Visible = not isOpen
+    end
+
+    closeButton.MouseButton1Click:Connect(function()
+    	setOpen(false)
+    end)
+
+    openButton.MouseButton1Click:Connect(function()
+    	setOpen(true)
+    end)
+
+    local function showWaiting()
+    	title.Text = targetName .. " - Loading..."
+
+    	for index, itemConfig in ipairs(CONFIG.Items) do
+    		itemLabels[index].Text = getItemDisplayName(itemConfig) .. " - x0"
+    	end
+
+    	wenLabel.Text = "Wen - 0"
+    end
+
+    local function refresh()
+    	local profile, profileReason = findProfile()
+    	local slot, slotReason = getActiveSlot(profile)
+
+    	if not profile or not slot then
+            debugState("AFK Data", profileReason or slotReason or "Waiting for data")
+    		showWaiting()
+    		return
+    	end
+
+        debugState("AFK Data", "Profile ready: " .. profile.Name .. " / " .. slot.Name)
+    	title.Text = targetName .. " - Level " .. formatNumber(readLevel(slot))
+
+    	for index, itemConfig in ipairs(CONFIG.Items) do
+    		local total = readItemTotal(slot, itemConfig.Name)
+    		itemLabels[index].Text = getItemDisplayName(itemConfig) .. " - x" .. formatNumber(total)
+    	end
+
+    	local wen = slot:FindFirstChild("Wen")
+        debugState("AFK Wen", wen and "Wen loaded" or "Waiting for Wen")
+    	wenLabel.Text = "Wen - " .. formatNumber(wen and wen.Value or 0)
+
+        if Config.DebugPrints then
+            local values = {title.Text, wenLabel.Text}
+            for _, itemLabel in ipairs(itemLabels) do
+                table.insert(values, itemLabel.Text)
+            end
+            debugState("AFK Values", table.concat(values, " | "))
+        end
+    end
+
+    local serverInfoConnections = {
+        Players.PlayerAdded:Connect(refreshServerInfo),
+        -- ChildRemoved fires after removal, so GetPlayers() has the updated count.
+        Players.ChildRemoved:Connect(function(child)
+            if child:IsA("Player") then
+                refreshServerInfo()
+            end
+        end),
+        Players:GetPropertyChangedSignal("MaxPlayers"):Connect(refreshServerInfo),
+    }
+
+    refreshServerInfo()
+    showWaiting()
+    debugPrint("AFK", "Starting refresh loop")
+
+    task.spawn(function()
+    	while screenGui.Parent do
+    		local ok, message = pcall(refresh)
+
+    		if not ok then
+    			warn("AFK Resource Monitor refresh failed:", message)
+    		end
+
+    		task.wait(math.max(CONFIG.RefreshSeconds, 0.1))
+    	end
+        debugPrint("AFK", "Refresh loop stopped; GUI removed")
+    end)
+
+    screenGui.Destroying:Connect(function()
+        for _, connection in ipairs(serverInfoConnections) do
+            connection:Disconnect()
+        end
+        debugPrint("AFK", "GUI destroying")
+    end)
+
+    debugPrint("AFK", "Monitor setup complete")
+end
+
+local function applyAFKLowLagSettings()
+    if game.PlaceId ~= AFK_PLACE_ID then
+        return
+    end
+
+    local success, err = pcall(function()
+        local communication = waitForChildDebug(ReplicatedStorage, "Communication")
+        local serverAndClient = waitForChildDebug(communication, "ServerAndClient")
+        local signals = waitForChildDebug(serverAndClient, "Signals")
+        local SignalEvent = requireDebug(waitForChildDebug(signals, "SignalEvent"))
+
+        local settings = {
+            {"ParticleQuality", 0},
+            {"ParticleQualityMine", 0},
+            {"ParticleQualityAllies", 0},
+            {"ParticleQualityOthers", 0},
+            {"ScreenShakeStrength", 0},
+            {"MaterialQuality", false},
+            {"ShadowQuality", false},
+        }
+
+        for _, setting in ipairs(settings) do
+            SignalEvent.ToServer(setting[1], setting[2])
+            task.wait(0.05)
+        end
+
+        print("Low-lag settings applied")
+    end)
+
+    if not success then
+        warn("Low-lag settings failed:", err)
+    end
+end
+
+if game.PlaceId == VERSION_PLACE_ID then
+    debugPrint("Route", "Main place: version check, then private-server flow")
+    task.spawn(function()
+        local playerGui = waitForChildDebug(LocalPlayer, "PlayerGui")
+        local versionGui = waitForChildDebug(playerGui, "Version")
+        versionLabel = waitForChildDebug(versionGui, "Label")
+
+        local function checkVersion()
+            if versionKickRequested or triggered or game.PlaceId ~= VERSION_PLACE_ID then
+                debugPrint("Version", "Check ignored; versionKick =", versionKickRequested, "disconnect =", triggered, "PlaceId =", game.PlaceId)
+                return
+            end
+
+            local currentVersion = parseVersion(versionLabel.Text)
+            debugPrint("Version", "Text =", versionLabel.Text, "Parsed =", currentVersion, "Expected =", Config.ExpectedVersion)
+
+            -- Wait for the game's displayed version to load.
+            if currentVersion == nil then
+                debugPrint("Version", "Waiting for numeric version text")
+                return
+            end
+
+            if currentVersion == Config.ExpectedVersion then
+                debugPrint("Version", "Version matched")
+                startPrivateJoin()
+                return
+            end
+
+            -- Disable freezing BEFORE kicking for a version mismatch.
+            versionKickRequested = true
+            debugPrint("Version", "Mismatch; disabling freeze listener before kick")
+
+            if disconnectConnection then
+                disconnectConnection:Disconnect()
+                disconnectConnection = nil
+            end
+
+            debugPrint("Version", "Kicking: Version change, recheck again.")
+            LocalPlayer:Kick("Version change, recheck again.")
+        end
+
+        versionLabel:GetPropertyChangedSignal("Text"):Connect(checkVersion)
+        debugPrint("Version", "Text-change listener connected; checking current text")
+        checkVersion()
+    end)
+elseif game.PlaceId == AFK_PLACE_ID then
+    debugPrint("Route", "AFK place: low-lag settings, friend check, return timer, and resource monitor")
+    task.spawn(applyAFKLowLagSettings)
+    startAFKServerRules()
+    task.spawn(startAFKResourceMonitor)
+else
+    debugPrint("Route", "Other place: private-server flow without version check")
+    -- Other places keep the existing disconnect rules without a version gate.
+    startPrivateJoin()
+end
+
+debugPrint("Startup", "Place handler dispatched; listeners/tasks are active")
