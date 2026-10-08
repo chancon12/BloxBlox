@@ -5,6 +5,7 @@ local Config = {
     RedeemLiveCodes = true, -- Pull every unexpired code exposed by the live Codes config.
     CodeFallback = { -- Used only when the live config is unavailable.
         "Roguelike",
+        "RoguelikeRaceReset",
         "M1LL1ON",
     },
     ClanTargetRarities = {
@@ -1246,13 +1247,27 @@ local function startResourceMonitor()
     addCorner(panel, 18)
     addStroke(panel, COLORS.Gold, 3, 0.08)
 
+    local statusBar = make("Frame", {
+        Name = "WorkflowServerBar",
+        AnchorPoint = Vector2.new(0.5, 0),
+        BackgroundColor3 = COLORS.Panel,
+        BackgroundTransparency = 0.03,
+        BorderSizePixel = 0,
+        Position = UDim2.fromScale(0.5, 0.875),
+        Size = UDim2.fromScale(0.74, 0.065),
+        ZIndex = 110,
+    }, overlay)
+
+    addCorner(statusBar, 14)
+    addStroke(statusBar, COLORS.Gold, 2, 0.08)
+
     local serverLabel = make("TextLabel", {
         Name = "WorkflowAndServerInfo",
         AnchorPoint = Vector2.new(0.5, 0.5),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamSemibold,
-        Position = UDim2.fromScale(0.5, 0.425),
-        Size = UDim2.fromScale(0.94, 0.055),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromScale(0.94, 0.72),
         Text = "Loading status...",
         TextColor3 = COLORS.GoldBright,
         TextScaled = true,
@@ -1260,7 +1275,7 @@ local function startResourceMonitor()
         TextStrokeColor3 = COLORS.Black,
         TextStrokeTransparency = 0.35,
         ZIndex = 120,
-    }, panel)
+    }, statusBar)
 
     addTextConstraint(serverLabel, 8, 19)
 
@@ -1434,8 +1449,8 @@ local function startResourceMonitor()
     	Name = "Cards",
     	AnchorPoint = Vector2.new(0.5, 0),
     	BackgroundTransparency = 1,
-		Position = UDim2.fromScale(0.5, 0.49),
-		Size = UDim2.fromScale(0.94, 0.29),
+		Position = UDim2.fromScale(0.5, 0.42),
+		Size = UDim2.fromScale(0.94, 0.36),
     	ZIndex = 120,
     }, panel)
 
