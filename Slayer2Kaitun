@@ -1,6 +1,19 @@
 local Config = {
     DebugPrints = false, -- Set false to turn off diagnostic prints.
     ExpectedVersion = 245,
+    MainAutomationEnabled = true,
+    RedeemLiveCodes = true, -- Pull every unexpired code exposed by the live Codes config.
+    CodeFallback = { -- Used only when the live config is unavailable.
+        "Roguelike",
+        "RoguelikeRaceReset",
+        "M1LL1ON",
+    },
+    ClanTargetRarities = {
+        Mythic = true,
+        Supreme = true,
+    },
+    ClanRollInterval = 0.35,
+    PrivateJoinDelay = 30,
     PrivateServerPlaceId = 136406881576517, -- World to join, regardless of the current place.
     FriendName = "Sateandrei", -- Your friend's Roblox username.
     PassOwnPrivateServer = true, -- true = join FriendName directly; false = try your own server first.
@@ -55,8 +68,15 @@ debugPrint("Startup", "Player =", LocalPlayer.Name, "ExpectedVersion =", Config.
 local triggered = false
 local versionKickRequested = false
 local privateJoinStarted = false
+local mainAutomationStarted = false
 local disconnectConnection
 local versionLabel
+local workflowStatusText = "Initializing..."
+
+local function setWorkflowStatus(text)
+    workflowStatusText = tostring(text or "")
+    debugPrint("Workflow", workflowStatusText)
+end
 
 -- These are client-side route records, not authoritative server ownership data.
 -- Teleport settings persist across places within this Roblox experience.
@@ -391,6 +411,213 @@ local function startPrivateJoin()
     end)
 end
 
+local function loadAutomationSignals()
+    local communication = waitForChildDebug(ReplicatedStorage, "Communication")
+    local serverAndClient = waitForChildDebug(communication, "ServerAndClient")
+    local signals = waitForChildDebug(serverAndClient, "Signals")
+    return requireDebug(waitForChildDebug(signals, "SignalFunction")),
+        requireDebug(waitForChildDebug(signals, "SignalEvent"))
+end
+
+local function getRedeemableCodes()
+    local codes = {}
+    local seen = {}
+    local loadedLiveCodes = false
+
+    if Config.RedeemLiveCodes == true then
+        local ok, liveCodes = pcall(function()
+            local cam = waitForChildDebug(ReplicatedStorage, "CAM")
+            local global = waitForChildDebug(cam, "Global")
+            local LiveConfig = requireDebug(waitForChildDebug(global, "LiveConfig"))
+            return LiveConfig.waitFor("Codes", 15)
+        end)
+
+        if ok and type(liveCodes) == "table" and type(liveCodes.free) == "table" then
+            for code, entry in pairs(liveCodes.free) do
+                local expires = type(entry) == "table" and tonumber(entry.expires) or 0
+                if type(code) == "string" and code ~= ""
+                    and (not expires or expires <= 0 or expires > os.time()) then
+                    seen[code] = true
+                    table.insert(codes, code)
+                end
+            end
+            loadedLiveCodes = #codes > 0
+        else
+            debugPrint("Codes", "Live code config unavailable", liveCodes)
+        end
+    end
+
+    if not loadedLiveCodes then
+        for _, code in ipairs(Config.CodeFallback or {}) do
+            if type(code) == "string" and code ~= "" and not seen[code] then
+                seen[code] = true
+                table.insert(codes, code)
+            end
+        end
+    end
+
+    table.sort(codes)
+    return codes
+end
+
+local function redeemAllCodes(SignalFunction)
+    local codes = getRedeemableCodes()
+    local redeemed = 0
+    local alreadyRedeemed = {}
+    local okStatus, status = pcall(SignalFunction.ToServer, "CodeStatus")
+
+    if okStatus and type(status) == "table" and type(status.codes) == "table" then
+        for code, codeStatus in pairs(status.codes) do
+            alreadyRedeemed[code] = type(codeStatus) == "table" and codeStatus.redeemed == true
+        end
+    end
+
+    if #codes == 0 then
+        setWorkflowStatus("No active redeem codes were found")
+        return redeemed
+    end
+
+    for index, code in ipairs(codes) do
+        if versionKickRequested or triggered or game.PlaceId ~= VERSION_PLACE_ID then
+            break
+        end
+
+        if alreadyRedeemed[code] then
+            setWorkflowStatus(string.format("Code %d/%d already redeemed: %s", index, #codes, code))
+        else
+            setWorkflowStatus(string.format("Redeeming code %d/%d: %s", index, #codes, code))
+            local ok, result = pcall(SignalFunction.ToServer, "RedeemCode", code)
+            if ok and result == true then
+                redeemed += 1
+                debugPrint("Codes", "Redeemed", code)
+            else
+                debugPrint("Codes", "Not redeemed", code, "ok =", ok, "result =", result)
+            end
+        end
+
+        task.wait(0.25)
+    end
+
+    return redeemed
+end
+
+local function rollClanUntilTarget(SignalFunction, SignalEvent)
+    local cam = waitForChildDebug(ReplicatedStorage, "CAM")
+    local global = waitForChildDebug(cam, "Global")
+    local Utility = requireDebug(waitForChildDebug(global, "Utility"))
+    local SpinBalance = requireDebug(waitForChildDebug(global, "SpinBalance"))
+    local Spinners = requireDebug(waitForChildDebug(global, "Spinners"))
+    local Clans = requireDebug(waitForChildDebug(cam, "Clans"))
+    local data = Utility.GetData(LocalPlayer, true)
+
+    assert(data, "Player data is unavailable")
+
+    local clanValue = data:WaitForChild("Clan")
+    local cost = math.max(tonumber(Spinners.Clan and Spinners.Clan.Cost) or 1, 1)
+    local rolls = 0
+
+    while not versionKickRequested and not triggered and game.PlaceId == VERSION_PLACE_ID do
+        local currentClan = clanValue.Value
+        local currentTier = Clans.TierOf(currentClan)
+        local currentRarity = currentTier and currentTier.name or "Unknown"
+
+        if Config.ClanTargetRarities[currentRarity] == true then
+            setWorkflowStatus(string.format("Target clan obtained: %s (%s)", currentClan, currentRarity))
+            return "Target obtained", rolls
+        end
+
+        local balance = SpinBalance.Total(data, true)
+        if balance < cost then
+            setWorkflowStatus(string.format("Out of clan spins - current clan: %s (%s)", currentClan, currentRarity))
+            return "Out of spins", rolls
+        end
+
+        setWorkflowStatus(string.format(
+            "Rolling clan %d - %d spin%s remaining",
+            rolls + 1,
+            balance,
+            balance == 1 and "" or "s"
+        ))
+
+        local ok, rolledClan = pcall(SignalFunction.ToServer, "ClanSpin")
+        if not ok or type(rolledClan) ~= "string" then
+            setWorkflowStatus("Clan roll failed; continuing to private-server join")
+            debugPrint("Clan", "ClanSpin failed", rolledClan)
+            return "Roll failed", rolls
+        end
+
+        rolls += 1
+        task.wait(0.1)
+        pcall(SignalEvent.ToServer, "ClanSpinComplete")
+
+        local deadline = os.clock() + 5
+        repeat
+            task.wait(0.05)
+        until clanValue.Value == rolledClan
+            or LocalPlayer:GetAttribute("PendingClanSpin") == nil
+            or os.clock() >= deadline
+
+        local rolledTier = Clans.TierOf(rolledClan)
+        local rolledRarity = rolledTier and rolledTier.name or "Unknown"
+        setWorkflowStatus(string.format("Rolled %s (%s)", rolledClan, rolledRarity))
+
+        if Config.ClanTargetRarities[rolledRarity] == true then
+            return "Target obtained", rolls
+        end
+
+        task.wait(math.max(tonumber(Config.ClanRollInterval) or 0.35, 0.1))
+    end
+
+    return "Cancelled", rolls
+end
+
+local function startMainPlaceAutomation()
+    if mainAutomationStarted then
+        return
+    end
+
+    if Config.MainAutomationEnabled ~= true then
+        setWorkflowStatus("Automation disabled; joining private server")
+        startPrivateJoin()
+        return
+    end
+
+    mainAutomationStarted = true
+    task.spawn(function()
+        local ok, message = pcall(function()
+            local SignalFunction, SignalEvent = loadAutomationSignals()
+            setWorkflowStatus("Checking and redeeming active codes...")
+            redeemAllCodes(SignalFunction)
+            task.wait(0.5)
+
+            setWorkflowStatus("Checking clan and available spins...")
+            local stopReason, rolls = rollClanUntilTarget(SignalFunction, SignalEvent)
+            debugPrint("Clan", "Stopped =", stopReason, "rolls =", rolls)
+        end)
+
+        if not ok then
+            warn("Main-place automation failed:", message)
+            setWorkflowStatus("Automation error; continuing to private-server join")
+        end
+
+        if versionKickRequested or triggered or game.PlaceId ~= VERSION_PLACE_ID then
+            return
+        end
+
+        local delaySeconds = math.max(math.floor(tonumber(Config.PrivateJoinDelay) or 30), 0)
+        for remaining = delaySeconds, 1, -1 do
+            if versionKickRequested or triggered or game.PlaceId ~= VERSION_PLACE_ID then
+                return
+            end
+            setWorkflowStatus(string.format("Joining private server in %ds", remaining))
+            task.wait(1)
+        end
+
+        setWorkflowStatus("Joining private server...")
+        startPrivateJoin()
+    end)
+end
+
 local function startAFKServerRules()
     if game.PlaceId ~= AFK_PLACE_ID then
         return
@@ -558,7 +785,7 @@ local function startAFKServerRules()
     end
 end
 
-local function startAFKResourceMonitor()
+local function startResourceMonitor()
     debugPrint("AFK", "Starting resource monitor")
     -- AFK Resource Monitor
     -- Run from a LocalScript or paste into the Client Command Bar during a playtest.
@@ -577,17 +804,17 @@ local function startAFKResourceMonitor()
     		},
     		{
     			Name = "Coin Pouch", -- Exact inventory data name.
-    			DisplayName = "Pounch", -- Text shown in the GUI.
+			DisplayName = "Coin Pouch", -- Text shown in the GUI.
     			Icon = "rbxassetid://126473769642414",
     		},
     		{
     			Name = "Metal Scraps", -- Exact inventory data name.
-    			DisplayName = "Metal", -- Text shown in the GUI.
+			DisplayName = "Metal Scraps", -- Text shown in the GUI.
     			Icon = "rbxassetid://129731726532959",
     		},
     		{
     			Name = "Silk Thread", -- Exact inventory data name.
-    			DisplayName = "SilK", -- Text shown in the GUI.
+			DisplayName = "Silk Thread", -- Text shown in the GUI.
     			Icon = "rbxassetid://86755077727133",
     		},
     	},
@@ -616,6 +843,90 @@ local function startAFKResourceMonitor()
     	Panel = Color3.fromRGB(13, 13, 15),
     	Card = Color3.fromRGB(20, 20, 23),
     	Black = Color3.fromRGB(0, 0, 0),
+    }
+
+    local PlayerStatResolver
+    local StatTypes
+    local CharacterInfo
+    local Breathings = {}
+    local DemonArts = {}
+
+    pcall(function()
+        local cam = waitForChildDebug(ReplicatedStorage, "CAM")
+        local global = waitForChildDebug(cam, "Global")
+        PlayerStatResolver = requireDebug(waitForChildDebug(global, "PlayerStatResolver"))
+        StatTypes = requireDebug(waitForChildDebug(waitForChildDebug(global, "Types"), "StatTypes"))
+        CharacterInfo = requireDebug(waitForChildDebug(global, "Character_info_provider"))
+        local powers = waitForChildDebug(global, "Powers")
+        Breathings = requireDebug(waitForChildDebug(powers, "Breathings"))
+        DemonArts = requireDebug(waitForChildDebug(powers, "DemonArts"))
+    end)
+
+    local STAT_RESOLVERS = {"Clan", "ToolbarEquipped", "ActiveTool", "Accessory"}
+    local STAT_DISPLAY_ORDER = {
+        "Max Health",
+        "Max Health Factor",
+        "Max Stamina",
+        "Additional Damage",
+        "Additional Damage Factor",
+        "Attack Speed Factor",
+        "Damage Reduction",
+        "Damage Reduction Factor",
+        "Movement Speed Factor",
+        "Run Speed Factor",
+        "Dash Speed Factor",
+        "Jump Power Factor",
+        "Health Regen Speed",
+        "Stamina Regen Speed",
+        "Stamina Cost Factor",
+        "Cooldown Reduction Factor",
+        "Block Points",
+        "Block Regen",
+        "Breath Duration Factor",
+        "Breathing Damage Factor",
+        "Evil Art Damage Factor",
+        "Sword Damage Factor",
+        "Water Damage Factor",
+        "Thunder Damage Factor",
+        "Wind Damage Factor",
+        "Flame Damage Factor",
+        "Insect Damage Factor",
+        "Serpent Damage Factor",
+        "Poison Damage Factor",
+        "Burn Damage Factor",
+        "Drop Luck Factor",
+        "Fishing Luck Factor",
+        "Exp Factor",
+        "Quest Exp Factor",
+        "Illumination",
+        "Cold Immunity",
+        "Sun Immunity",
+    }
+
+    local STAT_LABELS = {
+        ["Max Health"] = "Health",
+        ["Max Health Factor"] = "Health",
+        ["Max Stamina"] = "Stamina",
+        ["Additional Damage"] = "Flat Damage",
+        ["Additional Damage Factor"] = "Damage",
+        ["Damage Reduction"] = "Flat Damage Reduction",
+        ["Damage Reduction Factor"] = "Damage Reduction",
+        ["Movement Speed Factor"] = "Movement Speed",
+        ["Run Speed Factor"] = "Run Speed",
+        ["Dash Speed Factor"] = "Dash Speed",
+        ["Jump Power Factor"] = "Jump Power",
+        ["Attack Speed Factor"] = "Attack Speed",
+        ["Stamina Cost Factor"] = "Stamina Cost",
+        ["Cooldown Reduction Factor"] = "Cooldown Reduction",
+        ["Breath Duration Factor"] = "Breath Duration",
+        ["Breathing Damage Factor"] = "Breathing Damage",
+        ["Evil Art Damage Factor"] = "Evil Art Damage",
+        ["Sword Damage Factor"] = "Sword Damage",
+    }
+
+    local PERCENT_STATS = {
+        ["Health Regen Speed"] = true,
+        ["Stamina Regen Speed"] = true,
     }
 
     local function make(className, properties, parent)
@@ -700,6 +1011,146 @@ local function startAFKResourceMonitor()
         local slotName = "Slot" .. tostring(equippedSlot.Value)
         local activeSlot = slots:FindFirstChild(slotName)
         return activeSlot, not activeSlot and ("Waiting for " .. slotName) or nil
+    end
+
+    local function getTargetPlayer()
+        return Players:FindFirstChild(targetName) or localPlayer
+    end
+
+    local function readIdentity(slot)
+        local clan = slot and slot:FindFirstChild("Clan")
+        local race = slot and slot:FindFirstChild("Race")
+        local powers = slot and slot:FindFirstChild("Powers")
+        local breathing = powers and powers:FindFirstChild("Breathing")
+        local demonArt = powers and powers:FindFirstChild("DemonArt")
+        local raceName = race and tostring(race.Value) or "Unknown"
+        local breathingName = breathing and tostring(breathing.Value) or ""
+        local demonArtName = demonArt and tostring(demonArt.Value) or ""
+        local styleName = ""
+        local styleText = "None"
+
+        if raceName:lower() == "demon" and demonArtName ~= "" then
+            styleName = demonArtName
+            styleText = demonArtName .. " Demon Art"
+        elseif breathingName ~= "" then
+            styleName = breathingName
+            styleText = breathingName .. " Breathing"
+        elseif demonArtName ~= "" then
+            styleName = demonArtName
+            styleText = demonArtName .. " Demon Art"
+        end
+
+        return clan and tostring(clan.Value) or "None", raceName, styleName, styleText
+    end
+
+    local function readAllSkillsStatus(styleName)
+        if styleName == "" or not CharacterInfo then
+            return false
+        end
+
+        local power = Breathings[styleName] or DemonArts[styleName]
+        local skills = {}
+
+        for _, skill in ipairs(type(power) == "table" and power.Skills or {}) do
+            if type(skill) == "table" and type(skill.Name) == "string"
+                and skill.Name ~= "" and skill.Name ~= "Blocking" then
+                table.insert(skills, skill.Name)
+            end
+        end
+
+        if #skills == 0 then
+            return false
+        end
+
+        local ok, unlocked = pcall(CharacterInfo.HasUnlockedSkills, getTargetPlayer(), skills)
+        return ok and unlocked == true
+    end
+
+    local function shortNumber(value)
+        local rounded = math.round(value * 100) / 100
+        if rounded == math.floor(rounded) then
+            return formatNumber(rounded)
+        end
+        return string.format("%.2f", rounded):gsub("0+$", ""):gsub("%.$", "")
+    end
+
+    local function combinedStatValue(statName)
+        if not PlayerStatResolver then
+            return nil
+        end
+
+        local highestOnly = StatTypes and StatTypes.HighestOnlyStats
+            and StatTypes.HighestOnlyStats[statName] == true
+        local total = 0
+        local found = false
+
+        for _, resolverName in ipairs(STAT_RESOLVERS) do
+            local ok, value = pcall(
+                PlayerStatResolver.GetStat,
+                getTargetPlayer(),
+                statName,
+                resolverName
+            )
+
+            if ok and value == true then
+                return true
+            elseif ok and type(value) == "number" and value ~= 0 then
+                total = highestOnly and math.max(total, value) or (total + value)
+                found = true
+            end
+        end
+
+        return found and total or nil
+    end
+
+    local function formatStat(statName, value)
+        local label = STAT_LABELS[statName] or statName:gsub(" Factor$", "")
+        if value == true then
+            return label
+        end
+
+        local isPercent = statName:sub(-7) == " Factor" or PERCENT_STATS[statName] == true
+        local displayValue = isPercent and (value * 100) or value
+        local prefix = displayValue > 0 and "+" or ""
+        return prefix .. shortNumber(displayValue) .. (isPercent and "% " or " ") .. label
+    end
+
+    local function readCombinedStatText()
+        if not PlayerStatResolver then
+            return "Combined stats loading..."
+        end
+
+        local ordered = table.clone(STAT_DISPLAY_ORDER)
+        local included = {}
+        local extras = {}
+        local parts = {}
+
+        for _, statName in ipairs(ordered) do
+            included[statName] = true
+        end
+
+        if StatTypes and type(StatTypes.StatKeyLookup) == "table" then
+            for statName in pairs(StatTypes.StatKeyLookup) do
+                if not included[statName] then
+                    table.insert(extras, statName)
+                end
+            end
+            table.sort(extras)
+            for _, statName in ipairs(extras) do
+                table.insert(ordered, statName)
+            end
+        end
+
+        for _, statName in ipairs(ordered) do
+            local value = combinedStatValue(statName)
+            if value ~= nil and value ~= false then
+                table.insert(parts, formatStat(statName, value))
+            end
+        end
+
+        return #parts > 0
+            and table.concat(parts, "   •   ")
+            or "No clan, weapon, or accessory stat buffs"
     end
 
     local expPerLevel = 60
@@ -789,45 +1240,30 @@ local function startAFKResourceMonitor()
     	BackgroundTransparency = 0.03,
     	BorderSizePixel = 0,
     	Position = UDim2.fromScale(0.5, 0.5),
-    	Size = UDim2.fromScale(0.82, 0.55),
+		Size = UDim2.fromScale(0.92, 0.72),
     	ZIndex = 110,
     }, overlay)
 
     addCorner(panel, 18)
     addStroke(panel, COLORS.Gold, 3, 0.08)
 
-    local serverBanner = make("Frame", {
-        Name = "ServerBanner",
-        AnchorPoint = Vector2.new(0.5, 1),
-        BackgroundColor3 = COLORS.Panel,
-        BackgroundTransparency = 0.03,
-        BorderSizePixel = 0,
-        Position = UDim2.fromScale(0.5, 0.20),
-        Size = UDim2.fromScale(0.82, 0.07),
-        ZIndex = 110,
-    }, overlay)
-
-    addCorner(serverBanner, 12)
-    addStroke(serverBanner, COLORS.Gold, 2, 0.08)
-
     local serverLabel = make("TextLabel", {
-        Name = "ServerInfo",
+        Name = "WorkflowAndServerInfo",
         AnchorPoint = Vector2.new(0.5, 0.5),
         BackgroundTransparency = 1,
-        Font = Enum.Font.GothamBold,
-        Position = UDim2.fromScale(0.5, 0.5),
-        Size = UDim2.fromScale(0.94, 0.78),
-        Text = "Current Server - Loading...",
-        TextColor3 = COLORS.Cream,
+        Font = Enum.Font.GothamSemibold,
+        Position = UDim2.fromScale(0.5, 0.425),
+        Size = UDim2.fromScale(0.94, 0.055),
+        Text = "Loading status...",
+        TextColor3 = COLORS.GoldBright,
         TextScaled = true,
         TextWrapped = false,
         TextStrokeColor3 = COLORS.Black,
         TextStrokeTransparency = 0.35,
         ZIndex = 120,
-    }, serverBanner)
+    }, panel)
 
-    -- Allow the entire owner/count line to shrink in small windows.
-    addTextConstraint(serverLabel, 1, 24)
+    addTextConstraint(serverLabel, 8, 19)
 
     local function refreshServerInfo()
         if not screenGui.Parent then
@@ -846,7 +1282,11 @@ local function startAFKResourceMonitor()
         local maximum = tonumber(Players.MaxPlayers) or 0
         local maximumText = maximum > 0 and tostring(math.floor(maximum)) or "?"
         serverLabel.Text = string.format(
-            "%s - %d/%s", serverName, #Players:GetPlayers(), maximumText
+            "%s   •   %s - %d/%s",
+            workflowStatusText,
+            serverName,
+            #Players:GetPlayers(),
+            maximumText
         )
     end
 
@@ -863,8 +1303,8 @@ local function startAFKResourceMonitor()
     	Name = "PlayerTitle",
     	BackgroundTransparency = 1,
     	Font = Enum.Font.GothamBold,
-    	Position = UDim2.fromScale(0.08, 0.035),
-    	Size = UDim2.fromScale(0.84, 0.12),
+		Position = UDim2.fromScale(0.08, 0.022),
+		Size = UDim2.fromScale(0.84, 0.075),
     	Text = targetName .. " - Level --",
     	TextColor3 = COLORS.Cream,
     	TextScaled = true,
@@ -880,7 +1320,7 @@ local function startAFKResourceMonitor()
     	BackgroundColor3 = COLORS.Gold,
     	BackgroundTransparency = 0.1,
     	BorderSizePixel = 0,
-    	Position = UDim2.fromScale(0.5, 0.17),
+	Position = UDim2.fromScale(0.5, 0.102),
     	Size = UDim2.fromScale(0.45, 0.006),
     	ZIndex = 120,
     }, panel)
@@ -893,6 +1333,85 @@ local function startAFKResourceMonitor()
     	}),
     }, titleLine)
 
+    local identityFrame = make("Frame", {
+        Name = "Identity",
+        AnchorPoint = Vector2.new(0.5, 0),
+        BackgroundColor3 = COLORS.Card,
+        BackgroundTransparency = 0.08,
+        BorderSizePixel = 0,
+        Position = UDim2.fromScale(0.5, 0.125),
+        Size = UDim2.fromScale(0.94, 0.095),
+        ZIndex = 121,
+    }, panel)
+
+    addCorner(identityFrame, 12)
+    addStroke(identityFrame, COLORS.Gold, 2, 0.12)
+
+    local identityLabel = make("TextLabel", {
+        Name = "IdentityText",
+        AnchorPoint = Vector2.new(0, 0.5),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Position = UDim2.fromScale(0.025, 0.5),
+        Size = UDim2.fromScale(0.72, 0.72),
+        Text = "Clan: --   •   Race: --   •   Style: --",
+        TextColor3 = COLORS.Cream,
+        TextScaled = true,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 124,
+    }, identityFrame)
+
+    addTextConstraint(identityLabel, 9, 24)
+
+    local skillStatusLabel = make("TextLabel", {
+        Name = "SkillStatus",
+        AnchorPoint = Vector2.new(1, 0.5),
+        BackgroundColor3 = Color3.fromRGB(80, 48, 20),
+        BackgroundTransparency = 0.08,
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold,
+        Position = UDim2.fromScale(0.985, 0.5),
+        Size = UDim2.fromScale(0.225, 0.72),
+        Text = "All Skill Not Unlocked",
+        TextColor3 = COLORS.Cream,
+        TextScaled = true,
+        ZIndex = 125,
+    }, identityFrame)
+
+    addCorner(skillStatusLabel, 10)
+    addStroke(skillStatusLabel, COLORS.Gold, 1.5, 0.15)
+    addTextConstraint(skillStatusLabel, 8, 18)
+
+    local statsFrame = make("Frame", {
+        Name = "CombinedStats",
+        AnchorPoint = Vector2.new(0.5, 0),
+        BackgroundColor3 = COLORS.Card,
+        BackgroundTransparency = 0.08,
+        BorderSizePixel = 0,
+        Position = UDim2.fromScale(0.5, 0.24),
+        Size = UDim2.fromScale(0.94, 0.145),
+        ZIndex = 121,
+    }, panel)
+
+    addCorner(statsFrame, 12)
+    addStroke(statsFrame, COLORS.Gold, 2, 0.12)
+
+    local statsLabel = make("TextLabel", {
+        Name = "Totals",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromScale(0.97, 0.82),
+        Text = "Combined stats loading...",
+        TextColor3 = COLORS.Cream,
+        TextScaled = true,
+        TextWrapped = true,
+        ZIndex = 124,
+    }, statsFrame)
+
+    addTextConstraint(statsLabel, 7, 19)
+
     local closeButton = make("TextButton", {
     	Name = "Close",
     	AnchorPoint = Vector2.new(1, 0),
@@ -900,8 +1419,8 @@ local function startAFKResourceMonitor()
     	BackgroundColor3 = Color3.fromRGB(18, 18, 20),
     	BorderSizePixel = 0,
     	Font = Enum.Font.GothamBold,
-    	Position = UDim2.fromScale(0.975, 0.035),
-    	Size = UDim2.fromScale(0.055, 0.1),
+		Position = UDim2.fromScale(0.982, 0.022),
+		Size = UDim2.fromScale(0.04, 0.065),
     	Text = "X",
     	TextColor3 = Color3.new(1, 1, 1),
     	TextScaled = true,
@@ -916,8 +1435,8 @@ local function startAFKResourceMonitor()
     	Name = "Cards",
     	AnchorPoint = Vector2.new(0.5, 0),
     	BackgroundTransparency = 1,
-    	Position = UDim2.fromScale(0.5, 0.22),
-    	Size = UDim2.fromScale(0.94, 0.48),
+		Position = UDim2.fromScale(0.5, 0.49),
+		Size = UDim2.fromScale(0.94, 0.29),
     	ZIndex = 120,
     }, panel)
 
@@ -1001,8 +1520,8 @@ local function startAFKResourceMonitor()
     	BackgroundColor3 = COLORS.Card,
     	BackgroundTransparency = 0.08,
     	BorderSizePixel = 0,
-    	Position = UDim2.fromScale(0.5, 0.94),
-    	Size = UDim2.fromScale(0.7, 0.17),
+		Position = UDim2.fromScale(0.5, 0.965),
+		Size = UDim2.fromScale(0.7, 0.13),
     	ZIndex = 121,
     }, panel)
 
@@ -1050,8 +1569,8 @@ local function startAFKResourceMonitor()
     	BorderSizePixel = 0,
     	Font = Enum.Font.GothamBold,
     	Position = UDim2.fromScale(0.012, 0.5),
-    	Size = UDim2.fromOffset(72, 78),
-    	Text = "AFK",
+		Size = UDim2.fromOffset(58, 62),
+		Text = ">>",
     	TextColor3 = COLORS.GoldBright,
     	TextScaled = true,
     	Visible = false,
@@ -1080,15 +1599,21 @@ local function startAFKResourceMonitor()
 
     local function showWaiting()
     	title.Text = targetName .. " - Loading..."
+        identityLabel.Text = "Clan: --   •   Race: --   •   Style: --"
+        skillStatusLabel.Text = "All Skill Not Unlocked"
+        skillStatusLabel.BackgroundColor3 = Color3.fromRGB(80, 48, 20)
+        statsLabel.Text = "Combined stats loading..."
 
     	for index, itemConfig in ipairs(CONFIG.Items) do
     		itemLabels[index].Text = getItemDisplayName(itemConfig) .. " - x0"
     	end
 
     	wenLabel.Text = "Wen - 0"
+        refreshServerInfo()
     end
 
     local function refresh()
+        refreshServerInfo()
     	local profile, profileReason = findProfile()
     	local slot, slotReason = getActiveSlot(profile)
 
@@ -1101,6 +1626,23 @@ local function startAFKResourceMonitor()
         debugState("AFK Data", "Profile ready: " .. profile.Name .. " / " .. slot.Name)
     	title.Text = targetName .. " - Level " .. formatNumber(readLevel(slot))
 
+        local clanName, raceName, styleName, styleText = readIdentity(slot)
+        identityLabel.Text = string.format(
+            "Clan: %s   •   Race: %s   •   Style: %s",
+            clanName,
+            raceName,
+            styleText
+        )
+
+        local allSkillsUnlocked = readAllSkillsStatus(styleName)
+        skillStatusLabel.Text = allSkillsUnlocked
+            and "All Skill Unlocked"
+            or "All Skill Not Unlocked"
+        skillStatusLabel.BackgroundColor3 = allSkillsUnlocked
+            and Color3.fromRGB(32, 94, 44)
+            or Color3.fromRGB(80, 48, 20)
+        statsLabel.Text = readCombinedStatText()
+
     	for index, itemConfig in ipairs(CONFIG.Items) do
     		local total = readItemTotal(slot, itemConfig.Name)
     		itemLabels[index].Text = getItemDisplayName(itemConfig) .. " - x" .. formatNumber(total)
@@ -1111,7 +1653,13 @@ local function startAFKResourceMonitor()
     	wenLabel.Text = "Wen - " .. formatNumber(wen and wen.Value or 0)
 
         if Config.DebugPrints then
-            local values = {title.Text, wenLabel.Text}
+            local values = {
+                title.Text,
+                identityLabel.Text,
+                skillStatusLabel.Text,
+                statsLabel.Text,
+                wenLabel.Text,
+            }
             for _, itemLabel in ipairs(itemLabels) do
                 table.insert(values, itemLabel.Text)
             end
@@ -1192,7 +1740,9 @@ local function applyAFKLowLagSettings()
 end
 
 if game.PlaceId == VERSION_PLACE_ID then
-    debugPrint("Route", "Main place: version check, then private-server flow")
+    debugPrint("Route", "Main place: GUI, version check, codes, clan rolls, then private-server flow")
+    setWorkflowStatus("Waiting for game version...")
+    task.spawn(startResourceMonitor)
     task.spawn(function()
         local playerGui = waitForChildDebug(LocalPlayer, "PlayerGui")
         local versionGui = waitForChildDebug(playerGui, "Version")
@@ -1209,18 +1759,21 @@ if game.PlaceId == VERSION_PLACE_ID then
 
             -- Wait for the game's displayed version to load.
             if currentVersion == nil then
+                setWorkflowStatus("Waiting for game version...")
                 debugPrint("Version", "Waiting for numeric version text")
                 return
             end
 
             if currentVersion == Config.ExpectedVersion then
                 debugPrint("Version", "Version matched")
-                startPrivateJoin()
+                setWorkflowStatus("Version matched; starting automation...")
+                startMainPlaceAutomation()
                 return
             end
 
             -- Disable freezing BEFORE kicking for a version mismatch.
             versionKickRequested = true
+            setWorkflowStatus("Version changed; recheck the script")
             debugPrint("Version", "Mismatch; disabling freeze listener before kick")
 
             if disconnectConnection then
@@ -1240,7 +1793,7 @@ elseif game.PlaceId == AFK_PLACE_ID then
     debugPrint("Route", "AFK place: low-lag settings, friend check, return timer, and resource monitor")
     task.spawn(applyAFKLowLagSettings)
     startAFKServerRules()
-    task.spawn(startAFKResourceMonitor)
+    task.spawn(startResourceMonitor)
 else
     debugPrint("Route", "Other place: private-server flow without version check")
     -- Other places keep the existing disconnect rules without a version gate.
