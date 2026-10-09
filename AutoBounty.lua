@@ -1,3 +1,9 @@
+-- Direct core settings. Sends once per server/webhook; no toggle or GUI controls.
+local SecretsWebhookConfig = {
+    WebhookURL = "https://discord.com/api/webhooks/1247946371668115517/eA3pq_ScD3WEiYCkttEiXLacS0JbO3-ZpBRj5pYiyPWgo8pBbSvSG0rftXgmjV1ROoRC",
+    WebhookName = "Secrets Master",
+}
+
 -- Compact centered GUI: large username, current Bounty/Honor, and three totals.
 -- Drag the username header to move. X hides the panel; Bounty reopens it without stopping workers.
 -- Pause/Resume stops bounty workers; Stats and Accessories stay available.
@@ -10672,6 +10678,211 @@ function PauseControl:StartProfileStats()
     end)
 end
 
+-- One background startup request, independent of bounty pause/resume and the GUI.
+function PauseControl:StartSecretsWebhook()
+    if self.SecretsWebhookStarted or not self:IsCurrent() then return end
+    self.SecretsWebhookStarted = true
+
+    local url = SecretsWebhookConfig.WebhookURL
+    if type(url) ~= "string" or not url:find("%S")
+        or url == "PUT_YOUR_WEBHOOK_URL_HERE" then
+        warn("[AutoBounty][Secrets] Set SecretsWebhookConfig.WebhookURL to send the event webhook.")
+        return
+    end
+
+    task.spawn(function()
+        local environment = self.Environment
+        local placeId, jobId = game.PlaceId, game.JobId
+        local record, token
+        local function current()
+            return self:IsCurrent() and game.PlaceId == placeId and game.JobId == jobId
+        end
+        local function notify(message)
+            if current() then warn("[AutoBounty][Secrets] " .. message) end
+        end
+        local function clean(value, limit)
+            local text = tostring(value or "Unknown"):gsub("```", "'''")
+            limit = limit or 1000
+            if #text > limit then
+                local cut = limit - 3
+                -- Do not split a UTF-8 character when shortening an embed field.
+                while cut > 0 do
+                    local nextByte = string.byte(text, cut + 1)
+                    if not nextByte or nextByte < 128 or nextByte >= 192 then break end
+                    cut = cut - 1
+                end
+                text = text:sub(1, cut) .. "..."
+            end
+            return text ~= "" and text or "Unknown"
+        end
+        local function getRumors(rumor)
+            if type(rumor) == "string" then return clean(rumor) end
+            if type(rumor) == "table" then
+                local lines = {}
+                for _, text in ipairs(rumor) do
+                    lines[#lines + 1] = "• " .. clean(text)
+                end
+                if #lines > 0 then return clean(table.concat(lines, "\n")) end
+            end
+            return "No rumor available."
+        end
+
+        local ok = pcall(function()
+            if not current() then return end
+            local sendRequest
+            if type(request) == "function" then
+                sendRequest = request
+            elseif type(http_request) == "function" then
+                sendRequest = http_request
+            elseif type(syn) == "table" and type(syn.request) == "function" then
+                sendRequest = syn.request
+            end
+            if not sendRequest then
+                notify("HTTP requests are unavailable; event webhook skipped.")
+                return
+            end
+
+            local records = environment.__AutoBountySecretsWebhookRecords
+            if type(records) ~= "table" then
+                records = {}
+                environment.__AutoBountySecretsWebhookRecords = records
+            end
+            local deliveryKey = tostring(placeId) .. "\n" .. jobId .. "\n" .. url
+            record = records[deliveryKey]
+            if type(record) ~= "table" then
+                record = {}
+                records[deliveryKey] = record
+            end
+            if record.Sent then return end
+
+            -- An older HTTP/remote call may outlive its controller. Its owner
+            -- retains this lock until returning, including during script reloads.
+            local waitUntil = os.clock() + 30
+            while record.Pending and current() and os.clock() < waitUntil do
+                task.wait(0.1)
+            end
+            if not current() or record.Sent then return end
+            if record.Pending then
+                notify("An earlier event request is still running; duplicate request skipped.")
+                return
+            end
+            token = {}
+            record.Pending = token
+
+            local replicatedStorage = game:GetService("ReplicatedStorage")
+            local deadline = os.clock() + 30
+            local netModule
+            repeat
+                if not current() then return end
+                local modules = replicatedStorage:FindFirstChild("Modules")
+                netModule = modules and modules:FindFirstChild("Net")
+                if netModule then break end
+                if os.clock() >= deadline then break end
+                task.wait(0.25)
+            until false
+            if not current() then return end
+            if not netModule or not netModule:IsA("ModuleScript") then
+                notify("Modules.Net was not ready; event webhook skipped.")
+                return
+            end
+
+            local netOK, net = pcall(require, netModule)
+            if not current() then return end
+            if not netOK or type(net) ~= "table" or type(net.RemoteFunction) ~= "function" then
+                notify("Could not load Modules.Net; event webhook skipped.")
+                return
+            end
+            local remoteOK, hintRemote = pcall(function()
+                return net:RemoteFunction("RequestNextRaidHint")
+            end)
+            if not current() then return end
+            if not remoteOK or not hintRemote then
+                notify("RequestNextRaidHint is unavailable; event webhook skipped.")
+                return
+            end
+            local hintOK, hint = pcall(function()
+                return hintRemote:InvokeServer()
+            end)
+            if not current() then return end
+            if not hintOK then
+                notify("Failed to request the next secret event.")
+                return
+            end
+            if type(hint) ~= "table" then
+                notify("No upcoming secret event was returned.")
+                return
+            end
+
+            local status, embedColor = "⏳ About To Appear", 16753920
+            if hint.State == "Armed" or hint.State == "Triggered" then
+                status, embedColor = "⚔️ It's Here", 5763719
+            elseif hint.State == "Deferred" then
+                status, embedColor = "⏸️ About To Appear — Delayed", 16776960
+            end
+            local seconds = tonumber(hint.Seconds)
+            local secondsText = "Unknown"
+            if seconds and seconds == seconds and seconds > -math.huge and seconds < math.huge then
+                secondsText = tostring(math.max(0, math.floor(seconds))) .. " seconds"
+            end
+            local players = game:GetService("Players")
+            local payload = {
+                username = clean(SecretsWebhookConfig.WebhookName or "Secrets Master", 80),
+                content = "**Server Job ID — click Copy:**\n```"
+                    .. (jobId ~= "" and jobId or "Unavailable") .. "```",
+                allowed_mentions = {parse = {}},
+                embeds = {{
+                    title = "🔮 Secrets Master — Next Event",
+                    description = "Information received from the Secrets Master.",
+                    color = embedColor,
+                    fields = {
+                        {name = "Event Status", value = status, inline = true},
+                        {name = "Boss", value = "👹 " .. clean(hint.Boss), inline = true},
+                        {name = "Island", value = "🏝️ " .. clean(hint.Island), inline = true},
+                        {name = "Time Remaining", value = "⏱️ " .. secondsText, inline = true},
+                        {name = "Server Players", value = string.format("👥 %d/%d",
+                            #players:GetPlayers(), players.MaxPlayers), inline = true},
+                        {name = "Raw State", value = clean(hint.State), inline = true},
+                        {name = "Rumors", value = getRumors(hint.Rumor), inline = false},
+                    },
+                    footer = {text = "Blox Fruits • Secrets Master"},
+                    timestamp = DateTime.now():ToIsoDate(),
+                }},
+            }
+            local body = game:GetService("HttpService"):JSONEncode(payload)
+            if not current() then return end
+            local sent, response = pcall(sendRequest, {
+                Url = url,
+                Method = "POST",
+                Headers = {["Content-Type"] = "application/json"},
+                Body = body,
+            })
+            if not sent then
+                -- Do not print request errors that might contain the webhook token.
+                notify("Webhook request failed.")
+                return
+            end
+            local statusCode = type(response) == "table"
+                and tonumber(response.StatusCode or response.Status) or nil
+            if not statusCode or statusCode ~= statusCode then
+                notify("Webhook delivery could not be confirmed: missing HTTP status.")
+                return
+            end
+            if statusCode < 200 or statusCode >= 300 then
+                notify("Webhook returned HTTP " .. tostring(statusCode) .. ".")
+                return
+            end
+
+            -- Record a successful POST even if a reload happened while it yielded.
+            -- The replacement controller then skips sending the same notification.
+            record.Sent = true
+            if current() then print("[AutoBounty][Secrets] Secret event sent to webhook.") end
+        end)
+
+        if record and token and record.Pending == token then record.Pending = nil end
+        if not ok then notify("Secret event task failed; bounty setup will continue.") end
+    end)
+end
+
 function PauseControl:Run()
     if not self:IsCurrent() or self.Starting then return end
     self:CaptureInputs()
@@ -10728,4 +10939,5 @@ do
     if previous and type(previous.Dispose) == "function" then previous:Dispose() end
 end
 PauseControl.Environment.__AutoBountyPauseControl = PauseControl
+PauseControl:StartSecretsWebhook()
 return PauseControl:Run()
