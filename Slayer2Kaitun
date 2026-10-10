@@ -5,7 +5,6 @@ local Config = {
     RedeemLiveCodes = true, -- Pull every unexpired code exposed by the live Codes config.
     CodeFallback = { -- Used only when the live config is unavailable.
         "Roguelike",
-        "RoguelikeRaceReset",
         "M1LL1ON",
     },
     ClanTargetRarities = {
