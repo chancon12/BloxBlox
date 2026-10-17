@@ -1718,6 +1718,78 @@ local function startResourceMonitor()
     debugPrint("AFK", "Monitor setup complete")
 end
 
+local function cancelAFKQuestsOnce()
+    if game.PlaceId ~= AFK_PLACE_ID then return end
+
+    local environment = getgenv()
+    local previous = environment.__PrivateAFKQuestCancelOnce
+    if type(previous) == "table" and previous.Player == LocalPlayer
+        and previous.PlaceId == game.PlaceId and previous.JobId == game.JobId then
+        return
+    end
+    local state = {Player = LocalPlayer, PlaceId = game.PlaceId, JobId = game.JobId}
+    environment.__PrivateAFKQuestCancelOnce = state
+
+    local success, err = pcall(function()
+        local cam = waitForChildDebug(ReplicatedStorage, "CAM")
+        local global = waitForChildDebug(cam, "Global")
+        local Utility = requireDebug(waitForChildDebug(global, "Utility"))
+        local subsets = waitForChildDebug(global, "Subsets")
+        local gameplay = waitForChildDebug(subsets, "Gameplay")
+        local Quests = requireDebug(waitForChildDebug(gameplay, "Quests"))
+        local communication = waitForChildDebug(ReplicatedStorage, "Communication")
+        local serverAndClient = waitForChildDebug(communication, "ServerAndClient")
+        local signals = waitForChildDebug(serverAndClient, "Signals")
+        local SignalEvent = requireDebug(waitForChildDebug(signals, "SignalEvent"))
+        assert(type(Quests.Holder) == "table", "Quest definitions are unavailable")
+
+        local deadline = os.clock() + 30
+        local holder
+        repeat
+            if game.PlaceId ~= AFK_PLACE_ID or Players.LocalPlayer ~= LocalPlayer then return end
+            local data = Utility.GetData(LocalPlayer, true)
+            local questsFolder = data and data:FindFirstChild("Quests")
+            holder = questsFolder and questsFolder:FindFirstChild("Holder")
+            if not holder then task.wait(0.25) end
+        until holder or os.clock() >= deadline
+        assert(holder, "Could not find the player's active quest holder")
+
+        -- Take one snapshot; quests accepted later are not cancelled by this pass.
+        local activeQuests = holder:GetChildren()
+        state.Attempted = true
+        local removed = 0
+        for _, quest in ipairs(activeQuests) do
+            if game.PlaceId ~= AFK_PLACE_ID or Players.LocalPlayer ~= LocalPlayer then break end
+            local questString = quest:FindFirstChild("QuestString")
+            local questId = questString and questString.Value or quest.Name
+            local questInfo = Quests.Holder[questId]
+
+            if not questInfo or questInfo.NoCancel ~= true then
+                print("Removing active quest:", quest.Name)
+                local sent, cancelError = pcall(SignalEvent.ToServer, "RemoveQuest", quest.Name)
+                if sent then
+                    removed = removed + 1
+                else
+                    warn("Quest cancel request failed:", quest.Name, cancelError)
+                end
+            else
+                warn("Quest cannot be cancelled:", quest.Name)
+            end
+        end
+        state.Completed = true
+        state.RequestsSent = removed
+        print("Cancel requests sent:", removed)
+    end)
+
+    if not success then
+        warn("One-time quest cancellation failed:", err)
+        -- If no cancellation pass began, a manual rerun may try loading the data again.
+        if not state.Attempted and environment.__PrivateAFKQuestCancelOnce == state then
+            environment.__PrivateAFKQuestCancelOnce = nil
+        end
+    end
+end
+
 local function applyAFKLowLagSettings()
     if game.PlaceId ~= AFK_PLACE_ID then
         return
@@ -1803,7 +1875,8 @@ if game.PlaceId == VERSION_PLACE_ID then
         checkVersion()
     end)
 elseif game.PlaceId == AFK_PLACE_ID then
-    debugPrint("Route", "AFK place: low-lag settings, friend check, return timer, and resource monitor")
+    debugPrint("Route", "AFK place: one-time quest cancellation, low-lag settings, friend check, return timer, and resource monitor")
+    task.spawn(cancelAFKQuestsOnce)
     task.spawn(applyAFKLowLagSettings)
     startAFKServerRules()
     task.spawn(startResourceMonitor)
