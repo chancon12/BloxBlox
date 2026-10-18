@@ -1,7 +1,13 @@
+-- Demon Slayer: private-server workflow, full farming config, progression, and live status.
 local Config = {
     DebugPrints = false, -- Set false to turn off diagnostic prints.
     ExpectedVersion = 25,
     MainAutomationEnabled = true,
+    SlayerLoader = {
+        Enabled = true, -- Loads your Slayer farming script after the config is ready.
+        Key = "7f289cc8-12df-4481-bc84-a97182b6b01e",
+        Url = "https://api.luarmor.net/files/v4/loaders/ff744638668c00b2f2f8fdce4072716e.lua",
+    },
     RedeemLiveCodes = true, -- Pull every unexpired code exposed by the live Codes config.
     CodeFallback = { -- Used only when the live config is unavailable.
         "Roguelike",
@@ -21,6 +27,178 @@ local Config = {
     AFKReturnEnabled = false, -- false disables the timed AFK return to the main place.
     AFKReturnAfterSeconds = 60 * 60, -- Return to the main place after one hour in this script session.
 }
+
+-- Full Slayer farming config. Private-server settings above use local Config.
+local environment = getgenv()
+local oldController = environment.__DemonSlayerProgressionController
+if oldController then
+	oldController.Running = false
+end
+
+environment.Configs = {
+	RandomStart = {
+		Enabled = true, -- false keeps your manual acquisition settings
+		Breathing = false,
+		DemonArt = true,
+		-- Both false = random 50/50. Enable only one to force that path.
+		-- A Demon character overrides the path and always learns Demon Art.
+		BreathingNames = {
+			"Flame", "Insect", "Serpent", "Sound",
+			"Stone", "Thunder", "Water", "Wind"
+		},
+		DemonArtNames = {
+			"Arrow", "Blood Manipulation", "Cryokinesis", "Dream",
+			"Obi Manipulation", "Pyrokenesis", "Reaper", "Shockwave", "Tamari"
+		}
+	},
+	AccountDescription = {
+		Enabled = true,
+		Url = "http://localhost:3030/api/accounts/description",
+		UpdateInterval = 30, -- Send only changed titles; at most once per 30 seconds.
+		MaxLevel = 225,
+		BeforeKickWait = 2 -- Briefly allow the latest title to finish sending before a kick.
+	},
+	Progression = {
+		Enabled = true,
+		StyleUnlockLevel = 25,
+		KickOnReachingStyleLevel = true,
+		KickOnObtainingStyle = true,
+		-- Below 25: no style acquisition. At 25+: enable the chosen path if no style is owned.
+		-- Demons at 25+ pause farming until a Demon Art is confirmed owned.
+		-- Crossing 25 kicks once; starting/rejoining at 25+ does not kick for this stage.
+		-- Gaining Breathing or Demon Art kicks once; rejoining with a style resumes farming.
+		TargetLevel = 225,
+		CheckInterval = 0.5,
+		KickOnReachingTarget = true,
+		KickOnAllSkillsUnlocked = true,
+		-- Starting at 225 does not kick. Crossing from below 225 does.
+		-- At 225: farm one matching boss until the current style's skills are unlocked.
+		-- Becoming fully unlocked kicks once; rejoining fully unlocked farms all bosses.
+		AllBosses = {
+			"Eliminate Domae", "Eliminate Datai", "Eliminate Akazo",
+			"Eliminate Reaper", "Eliminate Obari", "Eliminate Nezura",
+			"Eliminate Gyutai", "Eliminate Gyorei", "Eliminate Giyen",
+			"Eliminate Enru", "Eliminate Rengu", "Eliminate Saneri",
+			"Eliminate Tengai", "Eliminate Yahari", "Eliminate Sumari",
+			"Eliminate Shinora", "Eliminate Zentaro"
+		},
+		BossByStyle = {
+			Cryokinesis = {"Eliminate Domae"},
+			["Obi Manipulation"] = {"Eliminate Datai"},
+			Shockwave = {"Eliminate Akazo"},
+			Reaper = {"Eliminate Reaper"},
+			Serpent = {"Eliminate Obari"},
+			Pyrokenesis = {"Eliminate Nezura"},
+			["Blood Manipulation"] = {"Eliminate Gyutai"},
+			Stone = {"Eliminate Gyorei"},
+			Water = {"Eliminate Giyen"},
+			Dream = {"Eliminate Enru"},
+			Flame = {"Eliminate Rengu"},
+			Wind = {"Eliminate Saneri"},
+			Sound = {"Eliminate Tengai"},
+			Arrow = {"Eliminate Yahari"},
+			Tamari = {"Eliminate Sumari"},
+			Insect = {"Eliminate Shinora"},
+			Lightning = {"Eliminate Zentaro"}
+			-- Thunder is accepted as an alias for Lightning.
+		}
+	},
+	Accessories = {
+		AutoEquip = true, Build = "Additional Damage", VanityAutoEquip = true
+	},
+	Appearance = {
+		Blur = true, Draggable = true, Dropshadow = true,
+		MinimizeKeybind = "RightControl", Resizable = true,
+		Searching = true, Theme = "Midnight"
+	},
+	AutoCraft = {Enabled = false, Recipes = {}},
+	AutoFarm = {Enabled = true, QuestSelection = "Smart"},
+	AutoFinalSelection = {Enabled = false},
+	AutoSellCoins = {Enabled = false, Threshold = 0},
+	BlackMarketer = {AutoBuy = false, BuyItems = {}, Enabled = false},
+	BossHunt = {Enabled = false},
+	Bosses = {
+		Enabled = false,
+		Selected = {
+			"Eliminate Domae", "Eliminate Datai", "Eliminate Akazo",
+			"Eliminate Reaper", "Eliminate Obari", "Eliminate Nezura",
+			"Eliminate Gyutai", "Eliminate Gyorei", "Eliminate Giyen",
+			"Eliminate Enru", "Eliminate Rengu", "Eliminate Saneri",
+			"Eliminate Tengai", "Eliminate Yahari", "Eliminate Sumari",
+			"Eliminate Shinora", "Eliminate Zentaro", "Fujiko"
+		}
+	},
+	Breathing = {AutoLearn = false, AutoUnlockSkills = true, Selected = "Flame"},
+	Character = {
+		Fly = {Enabled = false, Keybind = "F8", Speed = 50},
+		Noclip = {Enabled = false, Keybind = "F6", Speed = 50},
+		WalkSpeed = {Enabled = false, Keybind = "F7", Speed = 50}
+	},
+	Combat = {
+		AutoClanSkill = false, AutoM1 = true, AutoParry = false,
+		EvadeGuardBreak = false, EvadeOnBlocking = false,
+		EvadeOnCooldown = false, EvadeOnHit = false, EvadePierce = false,
+		InstantKill = false, InstantKillThreshold = 90, KillAura = false,
+		MeleeDistance = 3, MeleeYOffset = 4, Mode = "Above",
+		ParryBossesOnly = false, ParryHandDemon = false, ParryYetiDemon = false,
+		ShowHitbox = false, ShowSkillHitbox = false, Weapon = "Smart"
+	},
+	DemonArt = {
+		AutoUnlockSkills = true, Enabled = false, Orb = "Arrow",
+		SpinFallback = false, UseOrb = false
+		-- Set UseOrb = true if you want automatic orb use while no style is owned.
+	},
+	DemonHorn = {Enabled = false},
+	Dungeon = {
+		AutoBuy = false, AutoHeal = false, AutoLeave = false, AutoPickCards = true,
+		AutoResetAtFloor = false, AutoRestockHeal = false, BuyAtEndOnly = false,
+		BuyItemType = "Exp", CardPriority = {"Points"}, Enabled = false,
+		FightMode = "V1", HealItem = "Health Potion", HealThreshold = 50,
+		IgnoreCards = {}, InstantKillThreshold = 1, MasterySelected = "",
+		ResetFloor = 50, SmartCards = true
+	},
+	Fishing = {
+		AutoFishing = false, AutoPermit = false, AutoRestockBait = true,
+		AutoSellFish = false, AutoTeleport = false, AutoUpgradeRod = true,
+		BaitSelection = "Worm", CustomSpot = false, ReelUseSignal = true,
+		RodSelection = "Smart", SellCatches = {}, UseBait = true
+	},
+	Gourd = {AutoBuy = false, Enabled = false, Item = "Large Gourd"},
+	HorseQuestline = {Enabled = false},
+	Hub = {
+		AutoJoinFriend = true, AutoJoinGame = true, AutoJoinPrivateServer = false,
+		AutoRedeemCodes = true, AutoSpin = false, FriendName = "nil", TargetClans = {}
+	},
+	LegendaryRod = {Completed = false, Enabled = false, LedgerPaid = false, TollPaid = false},
+	Mobs = {Enabled = false, Selected = {}},
+	Muzan = {Enabled = false},
+	MuzanQuestline = {Enabled = false},
+	Niko = {Enabled = false},
+	Reputation = {Enabled = false},
+	Schematics = {Enabled = false},
+	SealedChest = {Enabled = false, Mode = "Normal", Selected = {}},
+	Sidequests = {
+		Blade = {Enabled = false}, Coins = {Enabled = false},
+		Gemstone = {Enabled = false}, JewelryBox = {Enabled = false},
+		Letter = {Enabled = false}, Notes = {Enabled = false},
+		Package = {Enabled = false}, Pages = {Enabled = false},
+		Pantry = {Enabled = false}, Penny = {Enabled = false},
+		Shiori = {Enabled = false}
+	},
+	Skills = {
+		B = {Enabled = false, ["Hold Duration"] = 1, Mode = "Instant"},
+		C = {Enabled = false, ["Hold Duration"] = 1, Mode = "Instant"},
+		K = {Enabled = false, ["Hold Duration"] = 1, Mode = "Instant"},
+		N = {Enabled = false, ["Hold Duration"] = 1, Mode = "Instant"},
+		V = {Enabled = false, ["Hold Duration"] = 1, Mode = "Instant"},
+		X = {Enabled = false, ["Hold Duration"] = 1, Mode = "Instant"},
+		Z = {Enabled = true, ["Hold Duration"] = 1, Mode = "Instant"}
+	},
+	Stats = {Enabled = false, Selected = {"Additional Damage", "Max Health"}},
+	StreamerMode = {Enabled = false},
+	Titles = {AutoEquip = true, Build = "Additional Damage"}
+}
+
 
 local function debugPrint(section, ...)
     if Config.DebugPrints then
@@ -70,11 +248,597 @@ local privateJoinStarted = false
 local mainAutomationStarted = false
 local disconnectConnection
 local versionLabel
-local workflowStatusText = "Initializing..."
+local workflowStatusText = "Initializing Slayer automation..."
+local slayerLoaderStatusText = ""
+local refreshWorkflowDisplay
 
 local function setWorkflowStatus(text)
-    workflowStatusText = tostring(text or "")
+    local nextText = tostring(text or "")
+    if workflowStatusText == nextText then return end
+    workflowStatusText = nextText
     debugPrint("Workflow", workflowStatusText)
+    if refreshWorkflowDisplay then refreshWorkflowDisplay() end
+end
+
+local function setSlayerLoaderStatus(text)
+    slayerLoaderStatusText = tostring(text or "")
+    if refreshWorkflowDisplay then refreshWorkflowDisplay() end
+end
+
+local function formatWorkflowServerInfo(serverName, playerCount, maximumText)
+    local loaderText = slayerLoaderStatusText ~= "" and ("   •   " .. slayerLoaderStatusText) or ""
+    return string.format("%s\n%s - %d/%s%s", workflowStatusText,
+        serverName, playerCount, maximumText, loaderText)
+end
+
+-- Slayer progression starts only after entering the farming world.
+local function startSlayerProgression()
+    local Config = environment.Configs
+
+    local function ApplyRandomStart(config)
+    	local options = config.RandomStart
+    	if not options or options.Enabled ~= true then return end
+    	if options.Breathing == true and options.DemonArt == true then
+    		warn("[RandomStart] Enable only Breathing or DemonArt; manual settings kept.")
+    		return
+    	end
+    	local random = Random.new()
+    	local useBreathing
+    	if options.Breathing == true then
+    		useBreathing = true
+    	elseif options.DemonArt == true then
+    		useBreathing = false
+    	else
+    		useBreathing = random:NextInteger(1, 2) == 1
+    	end
+    	local names = useBreathing and options.BreathingNames or options.DemonArtNames
+    	if type(names) ~= "table" or #names == 0 then
+    		warn("[RandomStart] The selected path needs at least one name; manual settings kept.")
+    		return
+    	end
+    	local selectedName = names[random:NextInteger(1, #names)]
+    	if useBreathing then
+    		config.Breathing.Selected = selectedName
+    	else
+    		config.DemonArt.Orb = selectedName
+    	end
+    	config.Breathing.AutoLearn = useBreathing
+    	config.DemonArt.Enabled = not useBreathing
+    end
+
+    ApplyRandomStart(Config)
+
+    local function StartProgressionController()
+    	if Config.Progression.Enabled ~= true then
+    		setWorkflowStatus("Slayer autoprogression disabled")
+    		return
+    	end
+    	local Players = game:GetService("Players")
+    	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    	local HttpService = game:GetService("HttpService")
+
+    	-- Remember the chosen path once; do not reroll it on every check.
+    	local requested = {
+    		Breathing = Config.Breathing.AutoLearn == true,
+    		DemonArt = Config.DemonArt.Enabled == true,
+    		UseOrb = Config.DemonArt.UseOrb == true,
+    		SpinFallback = Config.DemonArt.SpinFallback == true
+    	}
+    	local state = {Running = true, Kicked = false}
+    	environment.__DemonSlayerProgressionController = state
+    	local expPerLevel
+    	local descriptionState = {Busy = false, LastAttempt = -math.huge}
+    	local skillModules = {NextTry = 0}
+
+    	local function status(message)
+    		if state.Status ~= message then
+    			state.Status = message
+    			print("[Progression] " .. message)
+    			setWorkflowStatus(message)
+    		end
+    	end
+
+    	local function clean(value)
+    		local name = tostring(value or ""):match("^%s*(.-)%s*$")
+    		local lower = name:lower()
+    		if lower == "" or lower == "none" or lower == "nil"
+    			or lower == "null" or lower == "n/a" then
+    			return ""
+    		end
+    		return name
+    	end
+
+    	local function styleKey(name)
+    		local key = clean(name):lower()
+    		if key == "thunder" then return "lightning" end
+    		if key == "pyrokinesis" then return "pyrokenesis" end
+    		return key
+    	end
+
+    	local function setBosses(bossNames)
+    		local selected = Config.Bosses.Selected
+    		-- Preserve the table identity for loaders that keep a reference to it.
+    		if type(selected) ~= "table" then
+    			selected = {}
+    			Config.Bosses.Selected = selected
+    		end
+    		local same = #selected == #bossNames
+    		if same then
+    			for index, name in ipairs(bossNames) do
+    				if selected[index] ~= name then same = false; break end
+    			end
+    		end
+    		if not same then
+    			Config.Bosses.Enabled = false
+    			for key in pairs(selected) do selected[key] = nil end
+    			for index, name in ipairs(bossNames) do selected[index] = name end
+    		end
+    		Config.Bosses.Enabled = #bossNames > 0
+    	end
+
+    	local function setBoss(bossName)
+    		setBosses(bossName and {bossName} or {})
+    	end
+
+    	local function pause()
+    		Config.AutoFarm.Enabled = false
+    		Config.BossHunt.Enabled = false
+    		setBoss(nil)
+    		Config.Breathing.AutoLearn = false
+    		Config.DemonArt.Enabled = false
+    		Config.DemonArt.UseOrb = false
+    		Config.DemonArt.SpinFallback = false
+    	end
+
+    	local function findSlot(player)
+    		local service = ReplicatedStorage:FindFirstChild("Player_Service")
+    		local data = service and service:FindFirstChild("Data")
+    		if not data then return nil end
+    		for _, profile in ipairs(data:GetChildren()) do
+    			if profile.Name:gsub("%-Studio$", ""):lower() == player.Name:lower() then
+    				local equipped = profile:FindFirstChild("slotEquipped")
+    				local slots = profile:FindFirstChild("slots")
+    				if equipped and slots then
+    					return slots:FindFirstChild("Slot" .. tostring(equipped.Value))
+    				end
+    				return nil
+    			end
+    		end
+    	end
+
+    	local function readLevel(slot)
+    		local exp = slot:FindFirstChild("Exp")
+    		local goal = exp and exp:FindFirstChild("Goal")
+    		local value = goal and tonumber(goal.Value)
+    		-- Missing/uninitialized data is unknown, not level zero.
+    		if not value or value <= 0 or value ~= value or value == math.huge then
+    			return nil
+    		end
+    		if not expPerLevel then
+    			local cam = ReplicatedStorage:FindFirstChild("CAM")
+    			local global = cam and cam:FindFirstChild("Global")
+    			local settingsModule = global and global:FindFirstChild("gameSettings")
+    			if not settingsModule then return nil end
+    			local ok, settings = pcall(require, settingsModule)
+    			local amount = ok and type(settings) == "table" and tonumber(settings.expPerLevel)
+    			if amount and amount > 0 and amount < math.huge then
+    				expPerLevel = amount
+    			else
+    				expPerLevel = 60 -- Same fallback as your resource monitor.
+    				warn("[Progression] Could not read expPerLevel; using the monitor fallback of 60.")
+    			end
+    		end
+    		return math.floor(value / expPerLevel)
+    	end
+
+    	local function readStyle(slot)
+    		local race = slot:FindFirstChild("Race")
+    		local raceName = race and clean(race.Value):lower() or ""
+    		if raceName == "" then return nil, nil, nil end
+    		local powers = slot:FindFirstChild("Powers")
+    		local breathing = powers and powers:FindFirstChild("Breathing")
+    		local demonArt = powers and powers:FindFirstChild("DemonArt")
+    		if raceName == "demon" then
+    			-- A saved Breathing style does not mean this Demon owns a Demon Art.
+    			if not demonArt then return nil, nil, raceName end
+    			local name = clean(demonArt.Value)
+    			return name, name ~= "" and "DemonArt" or nil, raceName
+    		end
+    		-- An absent value is still loading; a present value of None is empty.
+    		if not breathing or not demonArt then return nil, nil, raceName end
+    		local breathingName = clean(breathing.Value)
+    		local demonArtName = clean(demonArt.Value)
+    		if breathingName ~= "" then return breathingName, "Breathing", raceName end
+    		return demonArtName, demonArtName ~= "" and "DemonArt" or nil, raceName
+    	end
+
+    	local function readAllSkillsStatus(player, slot, style, styleType)
+    		if not style or style == "" or not styleType then return nil end
+    		local catalogName = styleType == "DemonArt" and "DemonArts" or "Breathings"
+    		if not skillModules.CharacterInfo or not skillModules[catalogName] then
+    			if os.clock() < skillModules.NextTry then return nil end
+    			skillModules.NextTry = os.clock() + 2
+    			local cam = ReplicatedStorage:FindFirstChild("CAM")
+    			local global = cam and cam:FindFirstChild("Global")
+    			local powers = global and global:FindFirstChild("Powers")
+    			local catalogModule = powers and powers:FindFirstChild(catalogName)
+    			local infoModule = global and global:FindFirstChild("Character_info_provider")
+    			if not catalogModule or not infoModule then return nil end
+    			local okInfo, info = pcall(require, infoModule)
+    			local okCatalog, catalog = pcall(require, catalogModule)
+    			if not okInfo or type(info) ~= "table" or type(info.HasUnlockedSkills) ~= "function"
+    				or not okCatalog or type(catalog) ~= "table" then
+    				return nil
+    			end
+    			skillModules.CharacterInfo = info
+    			skillModules[catalogName] = catalog
+    			skillModules.NextTry = 0
+    		end
+    		local catalog = skillModules[catalogName]
+    		local power = catalog[style]
+    		if type(power) ~= "table" then
+    			for name, definition in pairs(catalog) do
+    				if type(name) == "string" and styleKey(name) == styleKey(style) then
+    					power = definition
+    					break
+    				end
+    			end
+    		end
+    		if type(power) ~= "table" or type(power.Skills) ~= "table" then return nil end
+    		local skills = {}
+    		for _, skill in ipairs(power.Skills) do
+    			if type(skill) == "table" and type(skill.Name) == "string"
+    				and clean(skill.Name) ~= "" and clean(skill.Name):lower() ~= "blocking" then
+    				skills[#skills + 1] = skill.Name
+    			end
+    		end
+    		if #skills == 0 then return nil end -- An empty/loading catalog is not completion.
+    		local ok, unlocked = pcall(skillModules.CharacterInfo.HasUnlockedSkills, player, skills)
+    		if not ok or type(unlocked) ~= "boolean" or findSlot(player) ~= slot then return nil end
+    		return unlocked -- nil = unavailable; false = confirmed locked; true = all unlocked.
+    	end
+
+    	local breathingIcons = {
+    		serpent = "🐍", flame = "🔥", water = "🌊", wind = "🍃",
+    		stone = "🪨", insect = "🦋", sound = "🎵", lightning = "⚡"
+    	}
+
+    	local function buildAccountTitle(slot, level, style, styleType, allSkillsUnlocked)
+    		local clan = slot:FindFirstChild("Clan")
+    		local wenValue = slot:FindFirstChild("Wen")
+    		local wen = wenValue and tonumber(wenValue.Value)
+    		if style == nil or not clan or not wen or wen < 0
+    			or wen ~= wen or wen == math.huge then
+    			return nil -- Wait for actual data instead of filling in example values.
+    		end
+    		local styleText
+    		if style == "" then
+    			styleText = "⚔️ NO STYLE"
+    		elseif styleType == "DemonArt" then
+    			styleText = "👹 " .. style:upper() .. " DEMON ART"
+    		else
+    			styleText = (breathingIcons[styleKey(style)] or "⚔️") .. " " .. style:upper() .. " STYLE"
+    		end
+    		local clanName = clean(clan.Value)
+    		local clanText = clanName ~= "" and clanName:upper() .. " CLAN" or "NO CLAN"
+    		local levelText = "LV." .. level
+    		if level >= Config.AccountDescription.MaxLevel then levelText = levelText .. " MAX" end
+    		local wenText
+    		-- Round DOWN so the title never claims more Wen than the account has.
+    		if wen >= 1000000000 then
+    			wenText = math.floor(wen / 1000000000) .. "B WEN+"
+    		elseif wen >= 1000000 then
+    			wenText = math.floor(wen / 1000000) .. "M WEN+"
+    		elseif wen >= 1000 then
+    			wenText = math.floor(wen / 1000) .. "K WEN+"
+    		else
+    			wenText = math.floor(wen) .. " WEN"
+    		end
+    		return "🔥【SLAYER 2】" .. styleText .. " | ⭐ " .. clanText
+    			.. " | 💯 " .. levelText .. " | 💰 " .. wenText
+    			.. (allSkillsUnlocked == true and " | DONE" or "")
+    	end
+
+    	local function updateAccountDescription(player, slot, level, style, styleType, beforeKick, allSkillsUnlocked)
+    		local options = Config.AccountDescription
+    		if not options or options.Enabled ~= true then return nil end
+    		local title = buildAccountTitle(slot, level, style, styleType, allSkillsUnlocked)
+    		if not title then return nil end
+    		local requestFunction = request or http_request or (syn and syn.request)
+    		if type(requestFunction) ~= "function" then
+    			if not descriptionState.WarnedNoRequest then
+    				descriptionState.WarnedNoRequest = true
+    				warn("[AccountDescription] No request function available; description updates skipped.")
+    			end
+    			return nil
+    		end
+    		if title == descriptionState.LastSent or descriptionState.Busy then return title end
+    		local interval = math.max(tonumber(options.UpdateInterval) or 30, 1)
+    		local finalChange = beforeKick and title ~= descriptionState.LastAttemptTitle
+    		if not finalChange and os.clock() - descriptionState.LastAttempt < interval then return title end
+    		descriptionState.Busy = true
+    		descriptionState.LastAttempt = os.clock()
+    		descriptionState.LastAttemptTitle = title
+    		task.spawn(function()
+    			if not state.Running then descriptionState.Busy = false; return end
+    			local ok, response = pcall(function()
+    				return requestFunction({
+    					Url = options.Url,
+    					Method = "PUT",
+    					Headers = {["Content-Type"] = "application/json"},
+    					Body = HttpService:JSONEncode({username = player.Name, description = title})
+    				})
+    			end)
+    			descriptionState.Busy = false
+    			if not state.Running then return end
+    			local statusCode = ok and type(response) == "table" and tonumber(response.StatusCode)
+    			if statusCode and statusCode >= 200 and statusCode < 300 then
+    				descriptionState.LastSent = title
+    				print("[AccountDescription] " .. title)
+    			else
+    				warn("[AccountDescription] Update failed (" .. (statusCode and "HTTP " .. statusCode
+    					or ok and "missing HTTP status" or "request/encoding error") .. "); will retry later.")
+    			end
+    		end)
+    		return title
+    	end
+
+    	local function matchingBoss(style)
+    		for name, bosses in pairs(Config.Progression.BossByStyle) do
+    			if styleKey(name) == styleKey(style) then
+    				return bosses[1] -- Exactly one boss, including Arrow.
+    			end
+    		end
+    	end
+
+    	local function setStyleAcquisition(level, style, raceName)
+    		-- Missing style data must not be treated as an empty style.
+    		local canAcquire = raceName ~= nil and level >= Config.Progression.StyleUnlockLevel and style == ""
+    		local isDemon = raceName == "demon"
+    		if isDemon and canAcquire and not state.DemonArtPrepared then
+    			-- If the original choice was Breathing, pick a Demon Art once instead.
+    			local options = Config.RandomStart
+    			local names = options and options.DemonArtNames
+    			if not requested.DemonArt and options and options.Enabled == true
+    				and type(names) == "table" and #names > 0 then
+    				Config.DemonArt.Orb = names[Random.new():NextInteger(1, #names)]
+    			end
+    			state.DemonArtPrepared = true
+    		end
+    		local useDemonArt = isDemon or requested.DemonArt
+    		Config.Breathing.AutoLearn = canAcquire and not isDemon and requested.Breathing
+    		Config.DemonArt.Enabled = canAcquire and useDemonArt
+    		Config.DemonArt.UseOrb = canAcquire and useDemonArt and requested.UseOrb
+    		Config.DemonArt.SpinFallback = canAcquire and useDemonArt and requested.SpinFallback
+    	end
+
+    	local function kickForProgress(player, slot, level, style, styleType, message, enableStyleAcquisition, allSkillsUnlocked)
+    		if not state.Running or state.Kicked then return end
+    		pause()
+    		if enableStyleAcquisition then setStyleAcquisition(level, style, state.RaceName) end
+    		state.Kicked = true
+    		status(message)
+    		local title = updateAccountDescription(player, slot, level, style, styleType, true, allSkillsUnlocked)
+    		local deadline = os.clock() + math.max(tonumber(Config.AccountDescription.BeforeKickWait) or 2, 0)
+    		while title and descriptionState.LastSent ~= title and os.clock() < deadline do
+    			task.wait(0.1)
+    			if not state.Running then return end
+    			updateAccountDescription(player, slot, level, style, styleType, true, allSkillsUnlocked)
+    		end
+    		if state.Running then player:Kick(message) end
+    	end
+
+    	local function update()
+    		if not state.Running or state.Kicked then return end
+    		local player = Players.LocalPlayer
+    		local slot = player and findSlot(player)
+    		if not slot then
+    			pause()
+    			status("Waiting for the local player's active slot.")
+    			return
+    		end
+    		if state.Slot ~= slot then
+    			state.Slot = slot
+    			state.LastLevel = nil -- Switching save slots is not a level-up.
+    			state.LastStyle = nil -- A style already owned on another slot is not newly learned.
+    			state.SkillStyleKey = nil
+    			state.LastAllSkillsUnlocked = nil
+    		end
+    		local level = readLevel(slot)
+    		if level == nil then
+    			pause()
+    			status("Waiting for level data.")
+    			return
+    		end
+    		local target = Config.Progression.TargetLevel
+    		local previousLevel = state.LastLevel
+    		state.LastLevel = level
+    		local style, styleType, raceName = readStyle(slot)
+    		state.RaceName = raceName
+    		local previousStyle = state.LastStyle
+    		if style ~= nil then
+    			state.LastStyle = style -- Keep the last confirmed value while data is loading.
+    		end
+    		-- Share one confirmed result between the description and boss progression.
+    		-- The DONE suffix depends on skills, even before the level-225 boss stage.
+    		local allSkillsUnlocked = readAllSkillsStatus(player, slot, style, styleType)
+    		if Config.Progression.KickOnReachingTarget and previousLevel
+    			and previousLevel < target and level >= target then
+    			kickForProgress(player, slot, level, style, styleType,
+    				"Reached level " .. target .. ". Rejoin to start boss farming.", false, allSkillsUnlocked)
+    			return
+    		end
+    		local styleLevel = Config.Progression.StyleUnlockLevel
+    		if Config.Progression.KickOnReachingStyleLevel and previousLevel
+    			and previousLevel < styleLevel and level >= styleLevel then
+    			kickForProgress(player, slot, level, style, styleType,
+    				"Reached level " .. styleLevel .. ". Rejoin to continue progression with style acquisition available.", true, allSkillsUnlocked)
+    			return
+    		end
+
+    		if Config.Progression.KickOnObtainingStyle and previousStyle == ""
+    			and style and style ~= "" then
+    			local kind = styleType == "DemonArt" and "Demon Art" or "Breathing"
+    			kickForProgress(player, slot, level, style, styleType,
+    				"Obtained " .. style .. " " .. kind .. ". Rejoin to resume farming with style learning off.",
+    				false, allSkillsUnlocked)
+    			return
+    		end
+
+    		if level >= target and style and style ~= "" then
+    			local currentStyleKey = (styleType or "") .. ":" .. styleKey(style)
+    			if state.SkillStyleKey ~= currentStyleKey then
+    				state.SkillStyleKey = currentStyleKey
+    				state.LastAllSkillsUnlocked = nil
+    			end
+    			if allSkillsUnlocked ~= nil then
+    				local previouslyUnlocked = state.LastAllSkillsUnlocked
+    				state.LastAllSkillsUnlocked = allSkillsUnlocked
+    				if Config.Progression.KickOnAllSkillsUnlocked and previouslyUnlocked == false
+    					and allSkillsUnlocked == true then
+    					kickForProgress(player, slot, level, style, styleType,
+    						"All " .. style .. " skills unlocked. Rejoin to farm all listed bosses.", false, allSkillsUnlocked)
+    					return
+    				end
+    			end
+    		elseif style == "" or level < target then
+    			state.SkillStyleKey = nil
+    			state.LastAllSkillsUnlocked = nil
+    		end
+
+    		updateAccountDescription(player, slot, level, style, styleType, false, allSkillsUnlocked)
+    		local needsStyle = style == "" -- nil means still loading.
+    		setStyleAcquisition(level, style, raceName)
+    		Config.BossHunt.Enabled = false
+
+    		if level >= styleLevel and (raceName == nil or (raceName == "demon" and (style == nil or needsStyle))) then
+    			Config.AutoFarm.Enabled = false
+    			setBoss(nil)
+    			if raceName == nil then
+    				status("Level " .. level .. ": waiting for race data.")
+    			elseif style == nil then
+    				status("Level " .. level .. ": waiting for Demon Art data.")
+    			else
+    				status("Level " .. level .. ": learning " .. tostring(Config.DemonArt.Orb) .. " Demon Art; leveling OFF until learned.")
+    			end
+    			return
+    		end
+
+    		if level < target then
+    			setBoss(nil)
+    			Config.AutoFarm.Enabled = true
+    			if level < styleLevel then
+                    status("Level " .. level .. ": leveling to " .. styleLevel .. "; style learning OFF.")
+                elseif Config.Breathing.AutoLearn then
+                    status("Level " .. level .. ": learning " .. Config.Breathing.Selected .. " Breathing; leveling ON.")
+                elseif Config.DemonArt.Enabled then
+                    status("Level " .. level .. ": acquiring " .. tostring(Config.DemonArt.Orb) .. " Demon Art; leveling ON.")
+                else
+                    status("Level " .. level .. ": leveling to " .. target .. "; style learning OFF; " .. (style or "style data loading"))
+                end
+    		else
+    			Config.AutoFarm.Enabled = false
+    			if allSkillsUnlocked == true then
+    				setBosses(Config.Progression.AllBosses)
+    				status("Level " .. level .. ": all " .. style .. " skills unlocked; farming all "
+    					.. #Config.Progression.AllBosses .. " listed bosses.")
+    				return
+    			end
+    			local boss = style and style ~= "" and matchingBoss(style) or nil
+    			setBoss(boss)
+    			if boss then
+    				status("Level " .. level .. ": " .. style .. " -> " .. boss)
+    			elseif style == nil then
+    				status("Level " .. level .. ": waiting for style data.")
+    			elseif needsStyle then
+    				status("Level " .. level .. ": waiting to obtain the selected style.")
+    			else
+    				status("Level " .. level .. ": no boss mapping for " .. style .. "; boss farming off.")
+    			end
+    		end
+    	end
+
+    	local function safeUpdate()
+    		local ok, errorMessage = pcall(update)
+    		if not ok then
+    			pause()
+    			status("Check failed: " .. tostring(errorMessage))
+    		end
+    	end
+
+    	-- Apply already-loaded data before your loader reads Configs.
+    	pause()
+    	safeUpdate()
+    	task.spawn(function()
+    		while state.Running and not state.Kicked and Config.Progression.Enabled do
+    			task.wait(Config.Progression.CheckInterval)
+    			if state.Running and Config.Progression.Enabled then safeUpdate() end
+    		end
+    	end)
+    end
+
+    StartProgressionController()
+end
+
+local function startSlayerAutomation()
+    if game.PlaceId ~= AFK_PLACE_ID then return end
+    setWorkflowStatus("Reading player level, race, and owned style...")
+    startSlayerProgression()
+    local controller = environment.__DemonSlayerProgressionController
+    local loader = Config.SlayerLoader
+    if not loader or loader.Enabled ~= true then
+        setSlayerLoaderStatus("Slayer loader disabled")
+        return
+    end
+
+    -- Apply the first confirmed progression state before the loader reads Configs.
+    setSlayerLoaderStatus("Waiting for player data")
+    while controller and controller.Running and not controller.Kicked
+        and (controller.LastLevel == nil or controller.LastStyle == nil) do
+        task.wait(0.25)
+    end
+    if versionKickRequested or triggered or game.PlaceId ~= AFK_PLACE_ID
+        or (controller and (controller.Kicked or not controller.Running)) then
+        return
+    end
+
+    local previous = environment.__SlayerMainLoaderState
+    if type(previous) == "table" and previous.Player == LocalPlayer
+        and previous.PlaceId == game.PlaceId and previous.JobId == game.JobId
+        and (previous.Status == "loading" or previous.Status == "loaded") then
+        setSlayerLoaderStatus(previous.Status == "loaded" and "Slayer loader already started" or "Slayer loader already loading")
+        return
+    end
+
+    local loaderState = {Player = LocalPlayer, PlaceId = game.PlaceId, JobId = game.JobId, Status = "loading"}
+    environment.__SlayerMainLoaderState = loaderState
+    setSlayerLoaderStatus("Loading Slayer farming script...")
+    local ok, message = pcall(function()
+        assert(type(loader.Key) == "string" and loader.Key ~= "", "Set Config.SlayerLoader.Key")
+        assert(type(loader.Url) == "string" and loader.Url ~= "", "Set Config.SlayerLoader.Url")
+        environment.KEY = loader.Key
+        local compiled, compileError = loadstring(game:HttpGet(loader.Url))
+        assert(compiled, compileError)
+        compiled()
+    end)
+    if ok then
+        loaderState.Status = "loaded"
+        setSlayerLoaderStatus("Slayer loader started")
+    else
+        loaderState.Status = "failed"
+        if controller then controller.Running = false end
+        local farming = environment.Configs
+        farming.AutoFarm.Enabled = false
+        farming.BossHunt.Enabled = false
+        farming.Bosses.Enabled = false
+        farming.Breathing.AutoLearn = false
+        farming.DemonArt.Enabled = false
+        farming.DemonArt.UseOrb = false
+        farming.DemonArt.SpinFallback = false
+        setSlayerLoaderStatus("Slayer loader failed")
+        setWorkflowStatus("Slayer loader error: " .. tostring(message))
+        warn("Slayer loader failed:", message)
+    end
 end
 
 -- These are client-side route records, not authoritative server ownership data.
@@ -303,6 +1067,7 @@ local function startPrivateJoin()
     end
 
     privateJoinStarted = true
+    setWorkflowStatus("Preparing private-server join...")
     debugPrint("Private", "Starting private-server flow; skip own server =", Config.PassOwnPrivateServer == true)
 
     task.spawn(function()
@@ -328,6 +1093,7 @@ local function startPrivateJoin()
                     return false, "Cancelled"
                 end
 
+                setWorkflowStatus("Joining " .. ownerName .. " private server...")
                 debugPrint("Private", "Calling Teleporter.Request; owner =", ownerName, "PlaceId =", Config.PrivateServerPlaceId)
                 local requestAccepted, requestReason = requestTrackedPrivateServer(
                     Teleporter, ownerName, Config.PrivateServerPlaceId, subtitle
@@ -665,6 +1431,7 @@ local function startAFKServerRules()
         returnStarted = true
         local transfer = {Kind = "Main return", PlaceId = VERSION_PLACE_ID}
         pendingTransfer = transfer
+        setWorkflowStatus("AFK timer complete; returning to the main place...")
         debugPrint("AFK Return", "Timer elapsed; teleporting to", VERSION_PLACE_ID)
         clearPendingPrivateRoute()
         local ok, message = pcall(function()
@@ -727,6 +1494,7 @@ local function startAFKServerRules()
 
             -- Claim the one friend-join attempt before module loading can yield.
             friendJoinStarted = true
+            setWorkflowStatus("Friend detected; joining " .. Config.FriendName .. " private server...")
             debugPrint("AFK Friend", "Friend detected =", otherPlayer.Name, "Joining owner =", Config.FriendName)
             local transfer
             local joinOK, joinError = pcall(function()
@@ -850,16 +1618,18 @@ local function startResourceMonitor()
     local Breathings = {}
     local DemonArts = {}
 
-    pcall(function()
-        local cam = waitForChildDebug(ReplicatedStorage, "CAM")
-        local global = waitForChildDebug(cam, "Global")
-        PlayerStatResolver = requireDebug(waitForChildDebug(global, "PlayerStatResolver"))
-        StatTypes = requireDebug(waitForChildDebug(waitForChildDebug(global, "Types"), "StatTypes"))
-        CharacterInfo = requireDebug(waitForChildDebug(global, "Character_info_provider"))
-        local powers = waitForChildDebug(global, "Powers")
-        Breathings = requireDebug(waitForChildDebug(powers, "Breathings"))
-        DemonArts = requireDebug(waitForChildDebug(powers, "DemonArts"))
-    end)
+    local function loadMonitorModules()
+        pcall(function()
+            local cam = waitForChildDebug(ReplicatedStorage, "CAM")
+            local global = waitForChildDebug(cam, "Global")
+            PlayerStatResolver = requireDebug(waitForChildDebug(global, "PlayerStatResolver"))
+            StatTypes = requireDebug(waitForChildDebug(waitForChildDebug(global, "Types"), "StatTypes"))
+            CharacterInfo = requireDebug(waitForChildDebug(global, "Character_info_provider"))
+            local powers = waitForChildDebug(global, "Powers")
+            Breathings = requireDebug(waitForChildDebug(powers, "Breathings"))
+            DemonArts = requireDebug(waitForChildDebug(powers, "DemonArts"))
+        end)
+    end
 
     local STAT_RESOLVERS = {"Clan", "ToolbarEquipped", "ActiveTool", "Accessory"}
     local STAT_DISPLAY_ORDER = {
@@ -1023,14 +1793,19 @@ local function startResourceMonitor()
         local breathing = powers and powers:FindFirstChild("Breathing")
         local demonArt = powers and powers:FindFirstChild("DemonArt")
         local raceName = race and tostring(race.Value) or "Unknown"
-        local breathingName = breathing and tostring(breathing.Value) or ""
-        local demonArtName = demonArt and tostring(demonArt.Value) or ""
+        local function styleValue(valueObject)
+            local value = valueObject and tostring(valueObject.Value):match("^%s*(.-)%s*$") or ""
+            local lower = value:lower()
+            return (lower == "none" or lower == "nil" or lower == "null" or lower == "n/a") and "" or value
+        end
+        local breathingName = styleValue(breathing)
+        local demonArtName = styleValue(demonArt)
         local styleName = ""
         local styleText = "None"
 
-        if raceName:lower() == "demon" and demonArtName ~= "" then
+        if raceName:lower() == "demon" then
             styleName = demonArtName
-            styleText = demonArtName .. " Demon Art"
+            styleText = demonArtName ~= "" and (demonArtName .. " Demon Art") or "None"
         elseif breathingName ~= "" then
             styleName = breathingName
             styleText = breathingName .. " Breathing"
@@ -1252,8 +2027,8 @@ local function startResourceMonitor()
         BackgroundColor3 = COLORS.Panel,
         BackgroundTransparency = 0.03,
         BorderSizePixel = 0,
-        Position = UDim2.fromScale(0.5, 0.875),
-        Size = UDim2.fromScale(0.74, 0.065),
+        Position = UDim2.fromScale(0.5, 0.865),
+        Size = UDim2.fromScale(0.92, 0.12),
         ZIndex = 110,
     }, overlay)
 
@@ -1266,11 +2041,11 @@ local function startResourceMonitor()
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamSemibold,
         Position = UDim2.fromScale(0.5, 0.5),
-        Size = UDim2.fromScale(0.94, 0.72),
-        Text = "Loading status...",
+        Size = UDim2.fromScale(0.96, 0.9),
+        Text = workflowStatusText,
         TextColor3 = COLORS.GoldBright,
         TextScaled = true,
-        TextWrapped = false,
+        TextWrapped = true,
         TextStrokeColor3 = COLORS.Black,
         TextStrokeTransparency = 0.35,
         ZIndex = 120,
@@ -1294,13 +2069,7 @@ local function startResourceMonitor()
             and (owner .. " Private Server") or "Current Server (owner unknown)"
         local maximum = tonumber(Players.MaxPlayers) or 0
         local maximumText = maximum > 0 and tostring(math.floor(maximum)) or "?"
-        serverLabel.Text = string.format(
-            "%s   •   %s - %d/%s",
-            workflowStatusText,
-            serverName,
-            #Players:GetPlayers(),
-            maximumText
-        )
+        serverLabel.Text = formatWorkflowServerInfo(serverName, #Players:GetPlayers(), maximumText)
     end
 
     make("UIGradient", {
@@ -1691,8 +2460,10 @@ local function startResourceMonitor()
         Players:GetPropertyChangedSignal("MaxPlayers"):Connect(refreshServerInfo),
     }
 
+    refreshWorkflowDisplay = refreshServerInfo
     refreshServerInfo()
     showWaiting()
+    task.spawn(loadMonitorModules)
     debugPrint("AFK", "Starting refresh loop")
 
     task.spawn(function()
@@ -1709,6 +2480,7 @@ local function startResourceMonitor()
     end)
 
     screenGui.Destroying:Connect(function()
+        if refreshWorkflowDisplay == refreshServerInfo then refreshWorkflowDisplay = nil end
         for _, connection in ipairs(serverInfoConnections) do
             connection:Disconnect()
         end
@@ -1743,6 +2515,7 @@ local function cancelAFKQuestsOnce()
         local SignalEvent = requireDebug(waitForChildDebug(signals, "SignalEvent"))
         assert(type(Quests.Holder) == "table", "Quest definitions are unavailable")
 
+        setWorkflowStatus("Waiting for active quests before starting progression...")
         local deadline = os.clock() + 30
         local holder
         repeat
@@ -1765,6 +2538,7 @@ local function cancelAFKQuestsOnce()
             local questInfo = Quests.Holder[questId]
 
             if not questInfo or questInfo.NoCancel ~= true then
+                setWorkflowStatus("Cancelling active quest: " .. quest.Name)
                 print("Removing active quest:", quest.Name)
                 local sent, cancelError = pcall(SignalEvent.ToServer, "RemoveQuest", quest.Name)
                 if sent then
@@ -1779,10 +2553,12 @@ local function cancelAFKQuestsOnce()
         state.Completed = true
         state.RequestsSent = removed
         print("Cancel requests sent:", removed)
+        setWorkflowStatus("Quest cleanup complete: " .. removed .. " cancellation requests sent")
     end)
 
     if not success then
         warn("One-time quest cancellation failed:", err)
+        setWorkflowStatus("Quest cleanup unavailable; continuing to progression")
         -- If no cancellation pass began, a manual rerun may try loading the data again.
         if not state.Attempted and environment.__PrivateAFKQuestCancelOnce == state then
             environment.__PrivateAFKQuestCancelOnce = nil
@@ -1876,10 +2652,15 @@ if game.PlaceId == VERSION_PLACE_ID then
     end)
 elseif game.PlaceId == AFK_PLACE_ID then
     debugPrint("Route", "AFK place: one-time quest cancellation, low-lag settings, friend check, return timer, and resource monitor")
-    task.spawn(cancelAFKQuestsOnce)
+    setWorkflowStatus("Preparing Slayer progression and clearing active quests...")
+    task.spawn(startResourceMonitor)
     task.spawn(applyAFKLowLagSettings)
     startAFKServerRules()
-    task.spawn(startResourceMonitor)
+    task.spawn(function()
+        cancelAFKQuestsOnce()
+        if versionKickRequested or triggered then return end
+        startSlayerAutomation()
+    end)
 else
     debugPrint("Route", "Other place: private-server flow without version check")
     -- Other places keep the existing disconnect rules without a version gate.
