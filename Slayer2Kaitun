@@ -41,7 +41,7 @@ environment.Configs = {
 		Breathing = false,
 		DemonArt = true,
 		-- Both false = random 50/50. Enable only one to force that path.
-		-- A Demon character overrides the path and always learns Demon Art.
+		-- Demons use the Demon Art path when Progression.AutoLearnDemonArt is enabled.
 		BreathingNames = {
 			"Flame", "Insect", "Serpent", "Sound",
 			"Stone", "Thunder", "Water", "Wind"
@@ -61,10 +61,11 @@ environment.Configs = {
 	Progression = {
 		Enabled = true,
 		StyleUnlockLevel = 25,
+		AutoLearnDemonArt = false, -- false = skip Demon Art acquisition and keep leveling to TargetLevel.
 		KickOnReachingStyleLevel = true,
 		KickOnObtainingStyle = true,
 		-- Below 25: no style acquisition. At 25+: enable the chosen path if no style is owned.
-		-- Demons at 25+ pause farming until a Demon Art is confirmed owned.
+		-- With AutoLearnDemonArt enabled, Demons at 25+ pause farming until an art is owned.
 		-- Crossing 25 kicks once; starting/rejoining at 25+ does not kick for this stage.
 		-- Gaining Breathing or Demon Art kicks once; rejoining with a style resumes farming.
 		TargetLevel = 225,
@@ -595,7 +596,8 @@ local function startSlayerProgression()
     		-- Missing style data must not be treated as an empty style.
     		local canAcquire = raceName ~= nil and level >= Config.Progression.StyleUnlockLevel and style == ""
     		local isDemon = raceName == "demon"
-    		if isDemon and canAcquire and not state.DemonArtPrepared then
+    		local allowDemonArtLearning = Config.Progression.AutoLearnDemonArt ~= false
+    		if allowDemonArtLearning and isDemon and canAcquire and not state.DemonArtPrepared then
     			-- If the original choice was Breathing, pick a Demon Art once instead.
     			local options = Config.RandomStart
     			local names = options and options.DemonArtNames
@@ -605,7 +607,7 @@ local function startSlayerProgression()
     			end
     			state.DemonArtPrepared = true
     		end
-    		local useDemonArt = isDemon or requested.DemonArt
+    		local useDemonArt = allowDemonArtLearning and (isDemon or requested.DemonArt)
     		Config.Breathing.AutoLearn = canAcquire and not isDemon and requested.Breathing
     		Config.DemonArt.Enabled = canAcquire and useDemonArt
     		Config.DemonArt.UseOrb = canAcquire and useDemonArt and requested.UseOrb
@@ -672,7 +674,7 @@ local function startSlayerProgression()
     		if Config.Progression.KickOnReachingStyleLevel and previousLevel
     			and previousLevel < styleLevel and level >= styleLevel then
     			kickForProgress(player, slot, level, style, styleType,
-    				"Reached level " .. styleLevel .. ". Rejoin to continue progression with style acquisition available.", true, allSkillsUnlocked)
+    				"Reached level " .. styleLevel .. ". Rejoin to continue progression.", true, allSkillsUnlocked)
     			return
     		end
 
@@ -711,7 +713,9 @@ local function startSlayerProgression()
     		setStyleAcquisition(level, style, raceName)
     		Config.BossHunt.Enabled = false
 
-    		if level >= styleLevel and (raceName == nil or (raceName == "demon" and (style == nil or needsStyle))) then
+    		local demonArtLearningDisabled = Config.Progression.AutoLearnDemonArt == false
+    		if level >= styleLevel and (raceName == nil or (raceName == "demon"
+                and (style == nil or (needsStyle and not demonArtLearningDisabled)))) then
     			Config.AutoFarm.Enabled = false
     			setBoss(nil)
     			if raceName == nil then
@@ -733,6 +737,8 @@ local function startSlayerProgression()
                     status("Level " .. level .. ": learning " .. Config.Breathing.Selected .. " Breathing; leveling ON.")
                 elseif Config.DemonArt.Enabled then
                     status("Level " .. level .. ": acquiring " .. tostring(Config.DemonArt.Orb) .. " Demon Art; leveling ON.")
+                elseif needsStyle and demonArtLearningDisabled and (raceName == "demon" or requested.DemonArt) then
+                    status("Level " .. level .. ": Demon Art learning disabled; leveling to " .. target .. ".")
                 else
                     status("Level " .. level .. ": leveling to " .. target .. "; style learning OFF; " .. (style or "style data loading"))
                 end
@@ -751,7 +757,11 @@ local function startSlayerProgression()
     			elseif style == nil then
     				status("Level " .. level .. ": waiting for style data.")
     			elseif needsStyle then
-    				status("Level " .. level .. ": waiting to obtain the selected style.")
+                    if demonArtLearningDisabled and (raceName == "demon" or requested.DemonArt) then
+                        status("Level " .. level .. ": target reached; Demon Art learning disabled; no owned style for boss selection.")
+                    else
+    				    status("Level " .. level .. ": waiting to obtain the selected style.")
+                    end
     			else
     				status("Level " .. level .. ": no boss mapping for " .. style .. "; boss farming off.")
     			end
