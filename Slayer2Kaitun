@@ -54,9 +54,12 @@ environment.Configs = {
 	AccountDescription = {
 		Enabled = true,
 		Url = "http://localhost:3030/api/accounts/description",
-		UpdateInterval = 30, -- Send only changed titles; at most once per 30 seconds.
+		UpdateInterval = 30, -- Send changed descriptions; at most once per 30 seconds, except before a kick.
 		MaxLevel = 225,
-		BeforeKickWait = 2 -- Briefly allow the latest title to finish sending before a kick.
+		BeforeKickWait = 2, -- Briefly allow the latest description to finish sending before a kick.
+		SkillKeyOverrides = {
+			-- Optional: ["Exact skill name"] = "B" if its key is absent from the game catalog.
+		}
 	},
 	Progression = {
 		Enabled = true,
@@ -453,6 +456,24 @@ local function startSlayerProgression()
     		return demonArtName, demonArtName ~= "" and "DemonArt" or nil, raceName
     	end
 
+    	local function skillMoveLabel(skill)
+    		local function asKey(value)
+    			if value == nil then return nil end
+    			local text = clean(tostring(value))
+    			local key = text:match("^Enum%.KeyCode%.([%a])$") or text:match("^([%a])$")
+    			return key and key:upper() or nil
+    		end
+    		local overrides = Config.AccountDescription.SkillKeyOverrides
+    		local override = type(overrides) == "table" and asKey(overrides[skill.Name])
+    		if override then return override end
+    		for _, field in ipairs({"KeyCode", "Keybind", "KeyBind", "Key", "Bind", "Input"}) do
+    			local key = asKey(skill[field])
+    			if key then return key end
+    		end
+    		-- Use the actual skill name when the catalog does not expose its key.
+    		return clean(skill.Name)
+    	end
+
     	local function readAllSkillsStatus(player, slot, style, styleType)
     		if not style or style == "" or not styleType then return nil end
     		local catalogName = styleType == "DemonArt" and "DemonArts" or "Breathings"
@@ -486,17 +507,30 @@ local function startSlayerProgression()
     			end
     		end
     		if type(power) ~= "table" or type(power.Skills) ~= "table" then return nil end
-    		local skills = {}
+    		local skills, definitions = {}, {}
     		for _, skill in ipairs(power.Skills) do
     			if type(skill) == "table" and type(skill.Name) == "string"
     				and clean(skill.Name) ~= "" and clean(skill.Name):lower() ~= "blocking" then
     				skills[#skills + 1] = skill.Name
+    				definitions[#definitions + 1] = skill
     			end
     		end
     		if #skills == 0 then return nil end -- An empty/loading catalog is not completion.
     		local ok, unlocked = pcall(skillModules.CharacterInfo.HasUnlockedSkills, player, skills)
     		if not ok or type(unlocked) ~= "boolean" or findSlot(player) ~= slot then return nil end
-    		return unlocked -- nil = unavailable; false = confirmed locked; true = all unlocked.
+    		if unlocked then return true, {} end
+    		local remaining = {}
+    		for _, skill in ipairs(definitions) do
+    			local okMove, moveUnlocked = pcall(
+    				skillModules.CharacterInfo.HasUnlockedSkills, player, {skill.Name}
+    			)
+    			if not okMove or type(moveUnlocked) ~= "boolean" or findSlot(player) ~= slot then
+    				return false, nil -- Keep progression's confirmed result; details are unavailable.
+    			end
+    			if not moveUnlocked then remaining[#remaining + 1] = skillMoveLabel(skill) end
+    		end
+    		if #remaining == 0 then return false, nil end -- Data changed during the read; retry next check.
+    		return false, remaining
     	end
 
     	local breathingIcons = {
@@ -540,11 +574,88 @@ local function startSlayerProgression()
     			.. (allSkillsUnlocked == true and " | DONE" or "")
     	end
 
-    	local function updateAccountDescription(player, slot, level, style, styleType, beforeKick, allSkillsUnlocked)
-    		local options = Config.AccountDescription
-    		if not options or options.Enabled ~= true then return nil end
+    	local function descriptionNumber(value)
+    		local digits = string.format("%.0f", math.floor(value))
+    		local formatted = digits:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+    		return formatted
+    	end
+
+    	local function readDescriptionItems(slot)
+    		local root = slot:FindFirstChild("Inventory")
+    		local inventory = root and root:FindFirstChild("Inventory")
+    		if not inventory then return nil end
+    		local totals = {}
+    		for _, item in ipairs(inventory:GetChildren()) do
+    			local name = clean(item.Name):gsub("[%c]", " ")
+    			local amountObject = item:FindFirstChild("Amount")
+    			local amount = 1
+    			if amountObject then amount = tonumber(amountObject.Value) end
+    			if not amount or amount < 0 or amount ~= amount or amount == math.huge then
+    				return nil -- Wait for valid inventory quantities.
+    			end
+    			amount = math.floor(amount)
+    			if name ~= "" and amount > 0 then
+    				totals[name] = (totals[name] or 0) + amount
+    			end
+    		end
+    		local names = {}
+    		for name in pairs(totals) do names[#names + 1] = name end
+    		table.sort(names)
+    		local items = {}
+    		for _, name in ipairs(names) do
+    			items[#items + 1] = "x" .. descriptionNumber(totals[name]) .. " " .. name
+    		end
+    		return #items > 0 and table.concat(items, ", ") or "None"
+    	end
+
+    	local function buildAccountDescription(slot, level, style, styleType, allSkillsUnlocked, remainingMoves)
     		local title = buildAccountTitle(slot, level, style, styleType, allSkillsUnlocked)
     		if not title then return nil end
+    		local items = readDescriptionItems(slot)
+    		if not items then return nil end
+    		local clanName = clean(slot:FindFirstChild("Clan").Value)
+    		local wen = tonumber(slot:FindFirstChild("Wen").Value)
+    		local levelText = descriptionNumber(level)
+    		if level >= Config.AccountDescription.MaxLevel then levelText = levelText .. " MAX" end
+    		local styleLine
+    		if style == "" then
+    			styleLine = "⚔️ Style: None"
+    		elseif styleType == "DemonArt" then
+    			styleLine = "👹 Demon Art: " .. style
+    		else
+    			styleLine = (breathingIcons[styleKey(style)] or "⚔️") .. " Breathing Style: " .. style
+    		end
+    		local skillsText = "Checking..."
+    		if style == "" then
+    			skillsText = "No style learned"
+    		elseif allSkillsUnlocked == true then
+    			skillsText = "All Unlocked"
+    		elseif type(remainingMoves) == "table" and #remainingMoves > 0 then
+    			skillsText = table.concat(remainingMoves, ", ")
+    				.. (#remainingMoves == 1 and " move left" or " moves left")
+    		end
+    		return table.concat({
+    			title,
+    			"",
+    			"📋 Account Details",
+    			"🏆 Level: " .. levelText,
+    			styleLine,
+    			"⭐ Clan: " .. (clanName ~= "" and clanName or "None"),
+    			"💰 Wen: " .. descriptionNumber(wen),
+    			"⚔️ Skills: " .. skillsText,
+    			"🎒 Items: " .. items,
+    			"",
+    			"✅ Full Access Account",
+    			"⚡ Instant Delivery",
+    			"🛠️ 24/7 Support & Warranty"
+    		}, "\n"), title
+    	end
+
+    	local function updateAccountDescription(player, slot, level, style, styleType, beforeKick, allSkillsUnlocked, remainingMoves)
+    		local options = Config.AccountDescription
+    		if not options or options.Enabled ~= true then return nil end
+    		local description, title = buildAccountDescription(slot, level, style, styleType, allSkillsUnlocked, remainingMoves)
+    		if not description then return nil end
     		local requestFunction = request or http_request or (syn and syn.request)
     		if type(requestFunction) ~= "function" then
     			if not descriptionState.WarnedNoRequest then
@@ -553,13 +664,13 @@ local function startSlayerProgression()
     			end
     			return nil
     		end
-    		if title == descriptionState.LastSent or descriptionState.Busy then return title end
+    		if description == descriptionState.LastSent or descriptionState.Busy then return description end
     		local interval = math.max(tonumber(options.UpdateInterval) or 30, 1)
-    		local finalChange = beforeKick and title ~= descriptionState.LastAttemptTitle
-    		if not finalChange and os.clock() - descriptionState.LastAttempt < interval then return title end
+    		local finalChange = beforeKick and description ~= descriptionState.LastAttemptDescription
+    		if not finalChange and os.clock() - descriptionState.LastAttempt < interval then return description end
     		descriptionState.Busy = true
     		descriptionState.LastAttempt = os.clock()
-    		descriptionState.LastAttemptTitle = title
+    		descriptionState.LastAttemptDescription = description
     		task.spawn(function()
     			if not state.Running then descriptionState.Busy = false; return end
     			local ok, response = pcall(function()
@@ -567,21 +678,21 @@ local function startSlayerProgression()
     					Url = options.Url,
     					Method = "PUT",
     					Headers = {["Content-Type"] = "application/json"},
-    					Body = HttpService:JSONEncode({username = player.Name, description = title})
+    					Body = HttpService:JSONEncode({username = player.Name, description = description})
     				})
     			end)
     			descriptionState.Busy = false
     			if not state.Running then return end
     			local statusCode = ok and type(response) == "table" and tonumber(response.StatusCode)
     			if statusCode and statusCode >= 200 and statusCode < 300 then
-    				descriptionState.LastSent = title
+    				descriptionState.LastSent = description
     				print("[AccountDescription] " .. title)
     			else
     				warn("[AccountDescription] Update failed (" .. (statusCode and "HTTP " .. statusCode
     					or ok and "missing HTTP status" or "request/encoding error") .. "); will retry later.")
     			end
     		end)
-    		return title
+    		return description
     	end
 
     	local function matchingBoss(style)
@@ -614,18 +725,18 @@ local function startSlayerProgression()
     		Config.DemonArt.SpinFallback = canAcquire and useDemonArt and requested.SpinFallback
     	end
 
-    	local function kickForProgress(player, slot, level, style, styleType, message, enableStyleAcquisition, allSkillsUnlocked)
+    	local function kickForProgress(player, slot, level, style, styleType, message, enableStyleAcquisition, allSkillsUnlocked, remainingMoves)
     		if not state.Running or state.Kicked then return end
     		pause()
     		if enableStyleAcquisition then setStyleAcquisition(level, style, state.RaceName) end
     		state.Kicked = true
     		status(message)
-    		local title = updateAccountDescription(player, slot, level, style, styleType, true, allSkillsUnlocked)
+    		local description = updateAccountDescription(player, slot, level, style, styleType, true, allSkillsUnlocked, remainingMoves)
     		local deadline = os.clock() + math.max(tonumber(Config.AccountDescription.BeforeKickWait) or 2, 0)
-    		while title and descriptionState.LastSent ~= title and os.clock() < deadline do
+    		while description and descriptionState.LastSent ~= description and os.clock() < deadline do
     			task.wait(0.1)
     			if not state.Running then return end
-    			updateAccountDescription(player, slot, level, style, styleType, true, allSkillsUnlocked)
+    			description = updateAccountDescription(player, slot, level, style, styleType, true, allSkillsUnlocked, remainingMoves) or description
     		end
     		if state.Running then player:Kick(message) end
     	end
@@ -663,18 +774,18 @@ local function startSlayerProgression()
     		end
     		-- Share one confirmed result between the description and boss progression.
     		-- The DONE suffix depends on skills, even before the level-225 boss stage.
-    		local allSkillsUnlocked = readAllSkillsStatus(player, slot, style, styleType)
+    		local allSkillsUnlocked, remainingMoves = readAllSkillsStatus(player, slot, style, styleType)
     		if Config.Progression.KickOnReachingTarget and previousLevel
     			and previousLevel < target and level >= target then
     			kickForProgress(player, slot, level, style, styleType,
-    				"Reached level " .. target .. ". Rejoin to start boss farming.", false, allSkillsUnlocked)
+    				"Reached level " .. target .. ". Rejoin to start boss farming.", false, allSkillsUnlocked, remainingMoves)
     			return
     		end
     		local styleLevel = Config.Progression.StyleUnlockLevel
     		if Config.Progression.KickOnReachingStyleLevel and previousLevel
     			and previousLevel < styleLevel and level >= styleLevel then
     			kickForProgress(player, slot, level, style, styleType,
-    				"Reached level " .. styleLevel .. ". Rejoin to continue progression.", true, allSkillsUnlocked)
+    				"Reached level " .. styleLevel .. ". Rejoin to continue progression.", true, allSkillsUnlocked, remainingMoves)
     			return
     		end
 
@@ -683,7 +794,7 @@ local function startSlayerProgression()
     			local kind = styleType == "DemonArt" and "Demon Art" or "Breathing"
     			kickForProgress(player, slot, level, style, styleType,
     				"Obtained " .. style .. " " .. kind .. ". Rejoin to resume farming with style learning off.",
-    				false, allSkillsUnlocked)
+    				false, allSkillsUnlocked, remainingMoves)
     			return
     		end
 
@@ -699,7 +810,7 @@ local function startSlayerProgression()
     				if Config.Progression.KickOnAllSkillsUnlocked and previouslyUnlocked == false
     					and allSkillsUnlocked == true then
     					kickForProgress(player, slot, level, style, styleType,
-    						"All " .. style .. " skills unlocked. Rejoin to farm all listed bosses.", false, allSkillsUnlocked)
+    						"All " .. style .. " skills unlocked. Rejoin to farm all listed bosses.", false, allSkillsUnlocked, remainingMoves)
     					return
     				end
     			end
@@ -708,7 +819,7 @@ local function startSlayerProgression()
     			state.LastAllSkillsUnlocked = nil
     		end
 
-    		updateAccountDescription(player, slot, level, style, styleType, false, allSkillsUnlocked)
+    		updateAccountDescription(player, slot, level, style, styleType, false, allSkillsUnlocked, remainingMoves)
     		local needsStyle = style == "" -- nil means still loading.
     		setStyleAcquisition(level, style, raceName)
     		Config.BossHunt.Enabled = false
