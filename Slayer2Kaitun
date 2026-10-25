@@ -1,7 +1,7 @@
 -- Demon Slayer: private-server workflow, full farming config, progression, and live status.
 local Config = {
     DebugPrints = false, -- Set false to turn off diagnostic prints.
-    ExpectedVersion = 25,
+    ExpectedVersion = 26,
     MainAutomationEnabled = true,
     SlayerLoader = {
         Enabled = true, -- Loads your Slayer farming script after the config is ready.
