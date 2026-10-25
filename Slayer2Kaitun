@@ -1,4 +1,4 @@
--- Demon Slayer: private-server workflow, full farming config, progression, and live status.
+-- Demon Slayer: Human-only Breathing progression, private-server workflow, and live status.
 local Config = {
     DebugPrints = false, -- Set false to turn off diagnostic prints.
     ExpectedVersion = 26,
@@ -37,11 +37,10 @@ end
 
 environment.Configs = {
 	RandomStart = {
-		Enabled = false, -- false keeps your manual acquisition settings
+		Enabled = true, -- Pick a random Breathing type once when progression starts; HumanOnly prevents Demon Art selection.
 		Breathing = true,
 		DemonArt = false,
-		-- Both false = random 50/50. Enable only one to force that path.
-		-- Demons use the Demon Art path when Progression.AutoLearnDemonArt is enabled.
+		-- HumanOnly forces the Breathing path and never chooses Demon Art.
 		BreathingNames = {
 			"Flame", "Insect", "Serpent", "Sound",
 			"Stone", "Thunder", "Water", "Wind"
@@ -63,12 +62,13 @@ environment.Configs = {
 	},
 	Progression = {
 		Enabled = true,
+		HumanOnly = true, -- Require a Human slot; never convert race or fall back to Demon Art.
 		StyleUnlockLevel = 25,
-		AutoLearnDemonArt = false, -- false = skip Demon Art acquisition and keep leveling to TargetLevel.
+		AutoLearnDemonArt = false, -- Always kept off while HumanOnly is true.
 		KickOnReachingStyleLevel = true,
 		KickOnObtainingStyle = true,
 		-- Below 25: no style acquisition. At 25+: enable the chosen path if no style is owned.
-		-- With AutoLearnDemonArt enabled, Demons at 25+ pause farming until an art is owned.
+		-- HumanOnly pauses on Demon/unknown race; a Demon slot must be changed manually.
 		-- Crossing 25 kicks once; starting/rejoining at 25+ does not kick for this stage.
 		-- Gaining Breathing or Demon Art kicks once; rejoining with a style resumes farming.
 		TargetLevel = 225,
@@ -132,7 +132,7 @@ environment.Configs = {
 			"Eliminate Shinora", "Eliminate Zentaro", "Fujiko"
 		}
 	},
-	Breathing = {AutoLearn = false, AutoUnlockSkills = true, Selected = "Flame"},
+	Breathing = {AutoLearn = false, AutoUnlockSkills = true, Selected = "Flame"}, -- Controller enables learning at level 25+.
 	Character = {
 		Fly = {Enabled = false, Keybind = "F8", Speed = 50},
 		Noclip = {Enabled = false, Keybind = "F6", Speed = 50},
@@ -148,9 +148,9 @@ environment.Configs = {
 		ShowHitbox = false, ShowSkillHitbox = false, Weapon = "Smart"
 	},
 	DemonArt = {
-		AutoUnlockSkills = true, Enabled = false, Orb = "Arrow",
+		AutoUnlockSkills = false, Enabled = false, Orb = "Arrow",
 		SpinFallback = false, UseOrb = false
-		-- Set UseOrb = true if you want automatic orb use while no style is owned.
+		-- HumanOnly keeps acquisition, orbs, spins, and Demon Art skill unlocking off.
 	},
 	DemonHorn = {Enabled = false},
 	Dungeon = {
@@ -279,6 +279,21 @@ end
 local function startSlayerProgression()
     local Config = environment.Configs
 
+    local function enforceHumanOnly()
+        if Config.Progression.HumanOnly ~= true then return end
+        Config.Progression.AutoLearnDemonArt = false
+        Config.RandomStart.Breathing = true
+        Config.RandomStart.DemonArt = false
+        Config.DemonArt.Enabled = false
+        Config.DemonArt.UseOrb = false
+        Config.DemonArt.SpinFallback = false
+        Config.DemonArt.AutoUnlockSkills = false
+        Config.Muzan.Enabled = false
+        Config.MuzanQuestline.Enabled = false
+    end
+
+    enforceHumanOnly()
+
     local function ApplyRandomStart(config)
     	local options = config.RandomStart
     	if not options or options.Enabled ~= true then return end
@@ -323,7 +338,7 @@ local function startSlayerProgression()
 
     	-- Remember the chosen path once; do not reroll it on every check.
     	local requested = {
-    		Breathing = Config.Breathing.AutoLearn == true,
+    		Breathing = Config.Progression.HumanOnly == true or Config.Breathing.AutoLearn == true,
     		DemonArt = Config.DemonArt.Enabled == true,
     		UseOrb = Config.DemonArt.UseOrb == true,
     		SpinFallback = Config.DemonArt.SpinFallback == true
@@ -442,6 +457,11 @@ local function startSlayerProgression()
     		local powers = slot:FindFirstChild("Powers")
     		local breathing = powers and powers:FindFirstChild("Breathing")
     		local demonArt = powers and powers:FindFirstChild("DemonArt")
+        if Config.Progression.HumanOnly == true and raceName == "human" then
+            if not breathing then return nil, nil, raceName end
+            local name = clean(breathing.Value)
+            return name, name ~= "" and "Breathing" or nil, raceName
+        end
     		if raceName == "demon" then
     			-- A saved Breathing style does not mean this Demon owns a Demon Art.
     			if not demonArt then return nil, nil, raceName end
@@ -704,6 +724,13 @@ local function startSlayerProgression()
     	end
 
     	local function setStyleAcquisition(level, style, raceName)
+        if Config.Progression.HumanOnly == true then
+            enforceHumanOnly()
+            Config.Breathing.AutoLearn = raceName == "human"
+                and level >= Config.Progression.StyleUnlockLevel
+                and style == "" and requested.Breathing
+            return
+        end
     		-- Missing style data must not be treated as an empty style.
     		local canAcquire = raceName ~= nil and level >= Config.Progression.StyleUnlockLevel and style == ""
     		local isDemon = raceName == "demon"
@@ -743,6 +770,7 @@ local function startSlayerProgression()
 
     	local function update()
     		if not state.Running or state.Kicked then return end
+        enforceHumanOnly()
     		local player = Players.LocalPlayer
     		local slot = player and findSlot(player)
     		if not slot then
@@ -768,6 +796,18 @@ local function startSlayerProgression()
     		state.LastLevel = level
     		local style, styleType, raceName = readStyle(slot)
     		state.RaceName = raceName
+        state.RaceBlocked = Config.Progression.HumanOnly == true
+            and raceName ~= nil and raceName ~= "human"
+        if Config.Progression.HumanOnly == true and raceName ~= "human" then
+            pause()
+            if raceName == nil then
+                status("Human-only mode: waiting for confirmed Human race data.")
+            else
+                status("Human-only mode: current race is " .. raceName
+                    .. "; farming paused. Select a Human slot and rerun the script.")
+            end
+            return
+        end
     		local previousStyle = state.LastStyle
     		if style ~= nil then
     			state.LastStyle = style -- Keep the last confirmed value while data is loading.
@@ -914,12 +954,12 @@ local function startSlayerAutomation()
 
     -- Apply the first confirmed progression state before the loader reads Configs.
     setSlayerLoaderStatus("Waiting for player data")
-    while controller and controller.Running and not controller.Kicked
+    while controller and controller.Running and not controller.Kicked and not controller.RaceBlocked
         and (controller.LastLevel == nil or controller.LastStyle == nil) do
         task.wait(0.25)
     end
     if versionKickRequested or triggered or game.PlaceId ~= AFK_PLACE_ID
-        or (controller and (controller.Kicked or not controller.Running)) then
+        or (controller and (controller.Kicked or controller.RaceBlocked or not controller.Running)) then
         return
     end
 
