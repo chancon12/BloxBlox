@@ -37,9 +37,9 @@ end
 
 environment.Configs = {
 	RandomStart = {
-		Enabled = true, -- false keeps your manual acquisition settings
-		Breathing = false,
-		DemonArt = true,
+		Enabled = false, -- false keeps your manual acquisition settings
+		Breathing = true,
+		DemonArt = false,
 		-- Both false = random 50/50. Enable only one to force that path.
 		-- Demons use the Demon Art path when Progression.AutoLearnDemonArt is enabled.
 		BreathingNames = {
