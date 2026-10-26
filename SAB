@@ -1,0 +1,1248 @@
+do
+    if not game:GetService("RunService"):IsClient() then
+        warn("SAB_LOCALHOST: A client context is required.")
+        return
+    end
+    local environment = type(getgenv) == "function" and getgenv() or _G
+    local registryKey = "__StealABrainrotAccountApiChecker_v1"
+    local state = rawget(environment, registryKey)
+    if type(state) ~= "table" then
+        state = {generation = 0}
+        rawset(environment, registryKey, state)
+    end
+    local previous = state.generation
+    if type(previous) ~= "number" or previous ~= previous
+        or previous < 0 or previous >= math.huge then
+        previous = 0
+    end
+    state.generation = previous + 1
+    local generation = state.generation
+    local interval = 30
+    local endpoint = "http://localhost:3030/api/accounts/description"
+    local attemptAt = state.lastAttemptAt
+    if type(attemptAt) ~= "number" or attemptAt ~= attemptAt or attemptAt > os.clock() then
+        state.lastAttemptAt = -math.huge
+    end
+    if state.inFlight ~= nil and type(state.inFlight) ~= "table" then
+        state.inFlight = nil
+    end
+    local function current()
+        return state.generation == generation
+    end
+    state.Stop = function()
+        if current() then state.generation = state.generation + 1 end
+    end
+
+    local players = game:GetService("Players")
+    local replicatedFirst = game:GetService("ReplicatedFirst")
+    local jsonService = game:GetService("HttpService") -- Serialization only.
+    local function readCashText(player)
+        local playerGui = player:FindFirstChildOfClass("PlayerGui")
+        if not playerGui then return nil, "PlayerGui is unavailable" end
+        local object = playerGui
+        local path = "PlayerGui"
+        for _, name in ipairs({"LeftBottom", "LeftBottom", "Currency"}) do
+            path = path .. "." .. name
+            object = object:FindFirstChild(name)
+            if not object then return nil, "missing " .. path end
+        end
+        if not (object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox")) then
+            return nil, "Currency is not a supported text UI object"
+        end
+        local text = object.Text
+        if type(text) ~= "string" or not text:find("%S") then
+            return nil, "Currency text is empty"
+        end
+        if player:FindFirstChildOfClass("PlayerGui") ~= playerGui
+            or not object:IsDescendantOf(playerGui) or object.Text ~= text then
+            return nil, "cash UI changed during collection"
+        end
+        return text, nil
+    end
+
+    local function readLeaderstat(player, name)
+        local folder = player:FindFirstChild("leaderstats")
+        if not folder then return nil, "leaderstats is unavailable" end
+        if not folder:IsA("Folder") then return nil, "leaderstats is not a Folder" end
+        local stat = folder:FindFirstChild(name)
+        if not stat then return nil, "leaderstats." .. name .. " is unavailable" end
+        local text, kind, rawValue
+        if stat:IsA("IntValue") or stat:IsA("NumberValue") then
+            local value = stat.Value
+            if type(value) ~= "number" or value ~= value or value <= -math.huge or value >= math.huge then
+                return nil, "leaderstats." .. name .. " is not a finite numeric value"
+            end
+            text, kind, rawValue = string.format("%.17g", value), "number", value
+        elseif stat:IsA("StringValue") then
+            text, kind = stat.Value, "string"
+            rawValue = text
+            if not text:find("%S") then return nil, "leaderstats." .. name .. " is empty" end
+        else
+            return nil, "leaderstats." .. name .. " has unsupported class " .. stat.ClassName
+        end
+        if player:FindFirstChild("leaderstats") ~= folder or folder.Parent ~= player
+            or folder:FindFirstChild(name) ~= stat or stat.Parent ~= folder then
+            return nil, "leaderstats changed during collection"
+        end
+        return {Text = text, Kind = kind, Value = rawValue, ClassName = stat.ClassName}, nil
+    end
+
+    local function exact(value)
+        assert(type(value) == "number" and value == value
+            and value >= 0 and value < math.huge, "Invalid numeric data.")
+        local text = value % 1 == 0 and string.format("%.0f", value)
+            or string.format("%.17g", value)
+        local mantissa, exponent = text:match("^([^eE]+)[eE]([%+%-]?%d+)$")
+        if mantissa then
+            local whole, fraction = mantissa:match("^(%d+)%.?(%d*)$")
+            local digits = whole .. fraction
+            local point = #whole + tonumber(exponent)
+            if point <= 0 then
+                text = "0." .. string.rep("0", -point) .. digits
+            elseif point >= #digits then
+                text = digits .. string.rep("0", point - #digits)
+            else
+                text = digits:sub(1, point) .. "." .. digits:sub(point + 1)
+            end
+        end
+        local whole, fraction = text:match("^(%d+)%.?(%d*)$")
+        assert(whole, "Cannot format numeric data.")
+        whole = whole:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+        fraction = fraction:gsub("0+$", "")
+        return whole .. (fraction ~= "" and "." .. fraction or "")
+    end
+
+    -- Truncate compact currency by slicing its integer digits.
+    local function compact(value)
+        local integer = exact(value):match("^[%d,]+"):gsub(",", "")
+        if #integer <= 3 then return integer end
+        local suffixes = {"K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No", "Dc"}
+        local tier = math.min(math.floor((#integer - 1) / 3), #suffixes)
+        local leading = #integer - tier * 3
+        local tenths = integer:sub(leading + 1, leading + 1)
+        return integer:sub(1, leading)
+            .. (tenths ~= "" and tenths ~= "0" and "." .. tenths or "")
+            .. suffixes[tier]
+    end
+
+    local function countLabel(count, singular, plural)
+        return compact(count) .. " " .. (count == 1 and singular or plural)
+    end
+
+    -- Plain strings extracted offline from Datas.Animals (provided 2026-10-21 export).
+    -- This is a data-only catalogue; no game module is loaded or executed.
+    local animalCatalogue = {
+        ["1x1x1x1"] = {Name = "1x1x1x1", Rarity = "Secret"},
+        ["25"] = {Name = "25", Rarity = "Secret"},
+        ["4th Bros"] = {Name = "4th Bros", Rarity = "Secret"},
+        ["67"] = {Name = "67", Rarity = "Secret"},
+        ["Abyssaloco"] = {Name = "Abyssaloco", Rarity = "Secret"},
+        ["Admin Lucky Block"] = {Name = "Lucky Block", Rarity = "Admin"},
+        ["Agarrini la Palini"] = {Name = "Agarrini la Palini", Rarity = "Secret"},
+        ["Alessio"] = {Name = "Alessio", Rarity = "Brainrot God"},
+        ["Anpali Babel"] = {Name = "Anpali Babel", Rarity = "Brainrot God"},
+        ["Antonio"] = {Name = "Antonio", Rarity = "Secret"},
+        ["Appelini"] = {Name = "Appelini", Rarity = "Brainrot God"},
+        ["Aquanaut"] = {Name = "Aquanaut", Rarity = "Brainrot God"},
+        ["Aquarino"] = {Name = "Aquarino", Rarity = "Secret"},
+        ["Arca Bros"] = {Name = "Arca Bros", Rarity = "Secret"},
+        ["Arcadopus"] = {Name = "Arcadopus", Rarity = "Secret"},
+        ["Arcadopus Egg"] = {Name = "Arcadopus Egg", Rarity = "Secret"},
+        ["Arcadragon"] = {Name = "Arcadragon", Rarity = "Secret"},
+        ["Astrolero Cervalero"] = {Name = "Astrolero Cervalero", Rarity = "Brainrot God"},
+        ["Avocadini Antilopini"] = {Name = "Avocadini Antilopini", Rarity = "Epic"},
+        ["Avocadini Guffo"] = {Name = "Avocadini Guffo", Rarity = "Epic"},
+        ["Avocadorilla"] = {Name = "Avocadorilla", Rarity = "Mythic"},
+        ["Bacuru and Egguru"] = {Name = "Bacuru and Egguru", Rarity = "Secret"},
+        ["Ballerina Cappuccina"] = {Name = "Ballerina Cappuccina", Rarity = "Legendary"},
+        ["Ballerina Peppermintina"] = {Name = "Ballerina Peppermintina", Rarity = "Brainrot God"},
+        ["Ballerino Lololo"] = {Name = "Ballerino Lololo", Rarity = "Brainrot God"},
+        ["Bambini Crostini"] = {Name = "Bambini Crostini", Rarity = "Epic"},
+        ["Bambu Bambu Sahur"] = {Name = "Bambu Bambu Sahur", Rarity = "Brainrot God"},
+        ["Bananita Dolphinita"] = {Name = "Bananita Dolphinita", Rarity = "Epic"},
+        ["Bananito"] = {Name = "Bananito", Rarity = "Secret"},
+        ["Bananito Bandito"] = {Name = "Bananito Bandito", Rarity = "Mythic"},
+        ["Bananito Skelito"] = {Name = "Bananito Skelito", Rarity = "Secret"},
+        ["Bandito Axolito"] = {Name = "Bandito Axolito", Rarity = "Legendary"},
+        ["Bandito Bobritto"] = {Name = "Bandito Bobritto", Rarity = "Rare"},
+        ["Baskito"] = {Name = "Baskito", Rarity = "Secret"},
+        ["Baskito Egg"] = {Name = "Baskito Egg", Rarity = "Easter"},
+        ["Bat-in-the-Box"] = {Name = "Bat-in-the-Box", Rarity = "Secret"},
+        ["Bearito Cabinito"] = {Name = "Bearito Cabinito", Rarity = "Secret"},
+        ["Beavo Potto"] = {Name = "Beavo Potto", Rarity = "Brainrot God"},
+        ["Bee Loco"] = {Name = "Bee Loco", Rarity = "Mythic"},
+        ["Bee Lucky Block"] = {Name = "Bee Lucky Block", Rarity = "Honey"},
+        ["Belula Beluga"] = {Name = "Belula Beluga", Rarity = "Brainrot God"},
+        ["Berenjello Angello"] = {Name = "Berenjello Angello", Rarity = "Mythic"},
+        ["Berryno"] = {Name = "Berryno", Rarity = "Secret"},
+        ["Bisonte Giuppitere"] = {Name = "Bisonte Giuppitere", Rarity = "Secret"},
+        ["Blackhole Goat"] = {Name = "Blackhole Goat", Rarity = "Secret"},
+        ["Blueberrinni Octopusini"] = {Name = "Blueberrinni Octopusini", Rarity = "Legendary"},
+        ["Boatito Auratito"] = {Name = "Boatito Auratito", Rarity = "Secret"},
+        ["Boba Panda"] = {Name = "Boba Panda", Rarity = "Brainrot God"},
+        ["Bombardini Tortinii"] = {Name = "Bombardini Tortinii", Rarity = "Brainrot God"},
+        ["Bombardiro Crocodilo"] = {Name = "Bombardiro Crocodilo", Rarity = "Mythic"},
+        ["Bombardiro Vaccariro"] = {Name = "Bombardiro Vaccariro", Rarity = "Secret"},
+        ["Bombombini Gusini"] = {Name = "Bombombini Gusini", Rarity = "Mythic"},
+        ["Boneca Ambalabu"] = {Name = "Boneca Ambalabu", Rarity = "Rare"},
+        ["Boo Boo Rocket"] = {Name = "Boo Boo Rocket", Rarity = "Secret"},
+        ["Boppin Bunny"] = {Name = "Boppin Bunny", Rarity = "Secret"},
+        ["Brainrot God Lucky Block"] = {Name = "Lucky Block", Rarity = "Brainrot God"},
+        ["Brasilini Berimbini"] = {Name = "Brasilini Berimbini", Rarity = "Brainrot God"},
+        ["Brr Brr Patapim"] = {Name = "Brr Brr Patapim", Rarity = "Epic"},
+        ["Brr es Teh Patipum"] = {Name = "Brr es Teh Patipum", Rarity = "Brainrot God"},
+        ["Brri Brri Bicus Dicus Bombicus"] = {Name = "Brri Brri Bicus Dicus Bombicus", Rarity = "Epic"},
+        ["Brunito Marsito"] = {Name = "Brunito Marsito", Rarity = "Secret"},
+        ["Brutto Gialutto"] = {Name = "Brutto Gialutto", Rarity = "Mythic"},
+        ["Bucketoro"] = {Name = "Bucketoro", Rarity = "Mythic"},
+        ["Bufalino Boomberino"] = {Name = "Bufalino Boomberino", Rarity = "Secret"},
+        ["Buho de Fuego"] = {Name = "Buho de Fuego", Rarity = "Legendary"},
+        ["Buho de Noelo"] = {Name = "Buho de Noelo", Rarity = "Brainrot God"},
+        ["Buho de Volto"] = {Name = "Buho de Volto", Rarity = "Secret"},
+        ["Buho del Cielo"] = {Name = "Buho del Cielo", Rarity = "Legendary"},
+        ["Bulbito Bandito Traktorito"] = {Name = "Bulbito Bandito Traktorito", Rarity = "Brainrot God"},
+        ["Bumbatron"] = {Name = "Bumbatron", Rarity = "Secret"},
+        ["Bunito Bunito Spinito"] = {Name = "Bunito Bunito Spinito", Rarity = "Secret"},
+        ["Bunny Bunny Bunny Sahur"] = {Name = "Bunny Bunny Bunny Sahur", Rarity = "Secret"},
+        ["Bunny Bunny Bunny Sahur Egg"] = {Name = "Bunny Bunny Bunny Sahur Egg", Rarity = "Easter"},
+        ["Bunny Tralala"] = {Name = "Bunny Tralala", Rarity = "Brainrot God"},
+        ["Bunny Tralala Egg"] = {Name = "Bunny Tralala Egg", Rarity = "Easter"},
+        ["Bunny and Eggy"] = {Name = "Bunny and Eggy", Rarity = "Secret"},
+        ["Bunnyman"] = {Name = "Bunnyman", Rarity = "Secret"},
+        ["Buntteo"] = {Name = "Buntteo", Rarity = "Secret"},
+        ["Buntteo Egg"] = {Name = "Buntteo Egg", Rarity = "Easter"},
+        ["Burbaloni Loliloli"] = {Name = "Burbaloni Loliloli", Rarity = "Legendary"},
+        ["Burguro And Fryuro"] = {Name = "Burguro And Fryuro", Rarity = "Secret"},
+        ["Burrito Bandito"] = {Name = "Burrito Bandito", Rarity = "Secret"},
+        ["Burrito Bat"] = {Name = "Burrito Bat", Rarity = "Secret"},
+        ["Burrito Bat Egg"] = {Name = "Burrito Bat Egg", Rarity = "Secret"},
+        ["Cacasito Satalito"] = {Name = "Cacasito Satalito", Rarity = "Brainrot God"},
+        ["Cachorrito Melonito"] = {Name = "Cachorrito Melonito", Rarity = "Mythic"},
+        ["Cacto Hipopotamo"] = {Name = "Cacto Hipopotamo", Rarity = "Rare"},
+        ["Camera Ramena"] = {Name = "Camera Ramena", Rarity = "Secret"},
+        ["Candi Corni"] = {Name = "Candi Corni", Rarity = "Brainrot God"},
+        ["Candini Fluffini"] = {Name = "Candini Fluffini", Rarity = "Secret"},
+        ["Cangurato Gelato"] = {Name = "Cangurato Gelato", Rarity = "Secret"},
+        ["Capi Taco"] = {Name = "Capi Taco", Rarity = "Brainrot God"},
+        ["Capibaro Celestino"] = {Name = "Capibaro Celestino", Rarity = "Secret"},
+        ["Capibaro Celestino Egg"] = {Name = "Capibaro Celestino Egg", Rarity = "Secret"},
+        ["Capitano Americano"] = {Name = "Capitano Americano", Rarity = "Secret"},
+        ["Capitano Gullini"] = {Name = "Capitano Gullini", Rarity = "Secret"},
+        ["Capitano Moby"] = {Name = "Capitano Moby", Rarity = "Secret"},
+        ["Capitano Moby Egg"] = {Name = "Capitano Moby Egg", Rarity = "Secret"},
+        ["Cappuccino Assassino"] = {Name = "Cappuccino Assassino", Rarity = "Epic"},
+        ["Cappuccino Clownino"] = {Name = "Cappuccino Clownino", Rarity = "Brainrot God"},
+        ["Caramello Filtrello"] = {Name = "Caramello Filtrello", Rarity = "Legendary"},
+        ["Carloo"] = {Name = "Carloo", Rarity = "Mythic"},
+        ["Carrotini Brainini"] = {Name = "Carrotini Brainini", Rarity = "Mythic"},
+        ["Cash or Card"] = {Name = "Cash or Card", Rarity = "Secret"},
+        ["Cavallo Virtuoso"] = {Name = "Cavallo Virtuoso", Rarity = "Mythic"},
+        ["Cavallo Virtuoso Egg"] = {Name = "Cavallo Virtuoso Egg", Rarity = "Mythic"},
+        ["Caylusaurus"] = {Name = "Caylusaurus", Rarity = "Secret"},
+        ["Celestial Pegasus"] = {Name = "Celestial Pegasus", Rarity = "Secret"},
+        ["Celularcini Viciosini"] = {Name = "Celularcini Viciosini", Rarity = "Secret"},
+        ["Centrucci Nuclucci"] = {Name = "Centrucci Nuclucci", Rarity = "Mythic"},
+        ["Cerberus"] = {Name = "Cerberus", Rarity = "Secret"},
+        ["Cerberus Egg"] = {Name = "Cerberus Egg", Rarity = "Secret"},
+        ["Chachechi"] = {Name = "Chachechi", Rarity = "Secret"},
+        ["Chef Crabracadabra"] = {Name = "Chef Crabracadabra", Rarity = "Legendary"},
+        ["Chicken Zombie"] = {Name = "Chicken Zombie", Rarity = "Secret"},
+        ["Chicleteira Bicicleteira"] = {Name = "Chicleteira Bicicleteira", Rarity = "Secret"},
+        ["Chicleteira Bicicleteira Egg"] = {Name = "Chicleteira Bicicleteira Egg", Rarity = "Secret"},
+        ["Chicleteira Champeona"] = {Name = "Chicleteira Champeona", Rarity = "Secret"},
+        ["Chicleteira Cupideira"] = {Name = "Chicleteira Cupideira", Rarity = "Secret"},
+        ["Chicleteira Noelteira"] = {Name = "Chicleteira Noelteira", Rarity = "Secret"},
+        ["Chicleteira Surfeiteira"] = {Name = "Chicleteira Surfeiteira", Rarity = "Secret"},
+        ["Chicleteirina Bicicleteirina"] = {Name = "Chicleteirina Bicicleteirina", Rarity = "Secret"},
+        ["Chicli Chicla"] = {Name = "Chicli Chicla", Rarity = "Secret"},
+        ["Chihuanini Taconini"] = {Name = "Chihuanini Taconini", Rarity = "Brainrot God"},
+        ["Chill Puppy"] = {Name = "Chill Puppy", Rarity = "Secret"},
+        ["Chill Puppy Egg"] = {Name = "Chill Puppy Egg", Rarity = "Secret"},
+        ["Chillin Chili"] = {Name = "Chillin Chili", Rarity = "Secret"},
+        ["Chimnino"] = {Name = "Chimnino", Rarity = "Secret"},
+        ["Chimpanzini Bananini"] = {Name = "Chimpanzini Bananini", Rarity = "Legendary"},
+        ["Chipso and Queso"] = {Name = "Chipso and Queso", Rarity = "Secret"},
+        ["Chocco Bunny"] = {Name = "Chocco Bunny", Rarity = "Legendary"},
+        ["Chrismasmamat"] = {Name = "Chrismasmamat", Rarity = "Brainrot God"},
+        ["Churrito Bunnito"] = {Name = "Churrito Bunnito", Rarity = "Secret"},
+        ["Churrito Bunnito Egg"] = {Name = "Churrito Bunnito Egg", Rarity = "Easter"},
+        ["Cigno Fulgoro"] = {Name = "Cigno Fulgoro", Rarity = "Secret"},
+        ["Clickerino Crabo"] = {Name = "Clickerino Crabo", Rarity = "Legendary"},
+        ["Cloverat Clapat"] = {Name = "Cloverat Clapat", Rarity = "Secret"},
+        ["Clovkur Kurkur"] = {Name = "Clovkur Kurkur", Rarity = "Brainrot God"},
+        ["Co Co Co Sahur"] = {Name = "Co Co Co Sahur", Rarity = "Secret"},
+        ["Cobra Gelato"] = {Name = "Cobra Gelato", Rarity = "Secret"},
+        ["Coco and Mango"] = {Name = "Coco and Mango", Rarity = "Secret"},
+        ["Cocoa Assassino"] = {Name = "Cocoa Assassino", Rarity = "Brainrot God"},
+        ["Cocofanto Elefanto"] = {Name = "Cocofanto Elefanto", Rarity = "Brainrot God"},
+        ["Cocosini Mama"] = {Name = "Cocosini Mama", Rarity = "Legendary"},
+        ["Cocoteddy"] = {Name = "Cocoteddy", Rarity = "Mythic"},
+        ["Cola Cat"] = {Name = "Cola Cat", Rarity = "Secret"},
+        ["Conetto Morsetto"] = {Name = "Conetto Morsetto", Rarity = "Secret"},
+        ["Cooki and Milki"] = {Name = "Cooki and Milki", Rarity = "Secret"},
+        ["Corn Corn Corn Sahur"] = {Name = "Corn Corn Corn Sahur", Rarity = "Brainrot God"},
+        ["Crabbo Limonetta"] = {Name = "Crabbo Limonetta", Rarity = "Brainrot God"},
+        ["Craburger"] = {Name = "Craburger", Rarity = "Secret"},
+        ["Craburger Egg"] = {Name = "Craburger Egg", Rarity = "Secret"},
+        ["Cuadramat and Pakrahmatmamat"] = {Name = "Cuadramat and Pakrahmatmamat", Rarity = "Secret"},
+        ["Cupcake Koala"] = {Name = "Cupcake Koala", Rarity = "Rare"},
+        ["Cupid Cupid Sahur"] = {Name = "Cupid Cupid Sahur", Rarity = "Secret"},
+        ["Cupid Cupid Sahur Egg"] = {Name = "Cupid Cupid Sahur Egg", Rarity = "Secret"},
+        ["Cupid Hotspot"] = {Name = "Cupid Hotspot", Rarity = "Secret"},
+        ["DJ Panda"] = {Name = "DJ Panda", Rarity = "Secret"},
+        ["DJ Panda Egg"] = {Name = "DJ Panda Egg", Rarity = "Secret"},
+        ["Deputy Leopard"] = {Name = "Deputy Leopard", Rarity = "Secret"},
+        ["Digi Narwhal"] = {Name = "Digi Narwhal", Rarity = "Secret"},
+        ["Divino Platypio"] = {Name = "Divino Platypio", Rarity = "Brainrot God"},
+        ["Doi Doi Do"] = {Name = "Doi Doi Do", Rarity = "Epic"},
+        ["Dolphini Jetskini"] = {Name = "Dolphini Jetskini", Rarity = "Brainrot God"},
+        ["Donkeyturbo Express"] = {Name = "Donkeyturbo Express", Rarity = "Secret"},
+        ["Draculino"] = {Name = "Draculino", Rarity = "Secret"},
+        ["Draculino Egg"] = {Name = "Draculino Egg", Rarity = "Secret"},
+        ["Dragon Aquanini"] = {Name = "Dragon Aquanini", Rarity = "Secret"},
+        ["Dragon Cannelloni"] = {Name = "Dragon Cannelloni", Rarity = "Secret"},
+        ["Dragon Cannelloni Egg"] = {Name = "Dragon Cannelloni Egg", Rarity = "Secret"},
+        ["Dragon Gingerini"] = {Name = "Dragon Gingerini", Rarity = "Secret"},
+        ["Dragon Skeletonini"] = {Name = "Dragon Skeletonini", Rarity = "Secret"},
+        ["Dug dug dug"] = {Name = "Dug dug dug", Rarity = "Secret"},
+        ["Duggy Bros"] = {Name = "Duggy Bros", Rarity = "Secret"},
+        ["Dul Dul Dul"] = {Name = "Dul Dul Dul", Rarity = "Secret"},
+        ["Dumborino Miracello"] = {Name = "Dumborino Miracello", Rarity = "Brainrot God"},
+        ["Easter Easter Easter Sahur"] = {Name = "Easter Easter Easter Sahur", Rarity = "Secret"},
+        ["Easter Easter Easter Sahur Egg"] = {Name = "Easter Easter Easter Sahur Egg", Rarity = "Easter"},
+        ["Egg Lucky Block"] = {Name = "Egg Lucky Block", Rarity = "Easter"},
+        ["Eggdin Egg Egg Dun"] = {Name = "Eggdin Egg Egg Dun", Rarity = "Brainrot God"},
+        ["Eggdin Egg Egg Dun Egg"] = {Name = "Eggdin Egg Egg Dun Egg", Rarity = "Easter"},
+        ["Eid Eid Eid Sahur"] = {Name = "Eid Eid Eid Sahur", Rarity = "Secret"},
+        ["Electro Quacko"] = {Name = "Electro Quacko", Rarity = "Legendary"},
+        ["Elefanto Frigo"] = {Name = "Elefanto Frigo", Rarity = "Secret"},
+        ["Esok Goala"] = {Name = "Esok Goala", Rarity = "Secret"},
+        ["Esok Sekolah"] = {Name = "Esok Sekolah", Rarity = "Secret"},
+        ["Espresso Signora"] = {Name = "Espresso Signora", Rarity = "Brainrot God"},
+        ["Eviledon"] = {Name = "Eviledon", Rarity = "Secret"},
+        ["Examen Bros"] = {Name = "Examen Bros", Rarity = "Secret"},
+        ["Extinct Ballerina"] = {Name = "Extinct Ballerina", Rarity = "Brainrot God"},
+        ["Extinct Ballerina Egg"] = {Name = "Extinct Ballerina Egg", Rarity = "Brainrot God"},
+        ["Extinct Matteo"] = {Name = "Extinct Matteo", Rarity = "Secret"},
+        ["Extinct Tralalero"] = {Name = "Extinct Tralalero", Rarity = "Secret"},
+        ["Fangaro Lupino"] = {Name = "Fangaro Lupino", Rarity = "Secret"},
+        ["Festive 67"] = {Name = "Festive 67", Rarity = "Secret"},
+        ["Festive Lucky Block"] = {Name = "Festive Lucky Block", Rarity = "Festive"},
+        ["Fishboard"] = {Name = "Fishboard", Rarity = "Secret"},
+        ["Fishboard Egg"] = {Name = "Fishboard Egg", Rarity = "Secret"},
+        ["Fishino Clownino"] = {Name = "Fishino Clownino", Rarity = "Secret"},
+        ["Fizzy Soda"] = {Name = "Fizzy Soda", Rarity = "Mythic"},
+        ["Flancito"] = {Name = "Flancito", Rarity = "Secret"},
+        ["Flipa Sandala"] = {Name = "Flipa Sandala", Rarity = "Secret"},
+        ["Flippo Marino"] = {Name = "Flippo Marino", Rarity = "Brainrot God"},
+        ["Fluriflura"] = {Name = "Fluriflura", Rarity = "Common"},
+        ["Flying Dutchman"] = {Name = "Flying Dutchman", Rarity = "Secret"},
+        ["Fortunu and Cashuru"] = {Name = "Fortunu and Cashuru", Rarity = "Secret"},
+        ["Foxini Lanternini"] = {Name = "Foxini Lanternini", Rarity = "Secret"},
+        ["Fragola La La La"] = {Name = "Fragola La La La", Rarity = "Secret"},
+        ["Fragrama and Chocrama"] = {Name = "Fragrama and Chocrama", Rarity = "Secret"},
+        ["Frankentteo"] = {Name = "Frankentteo", Rarity = "Secret"},
+        ["Frigo Camelo"] = {Name = "Frigo Camelo", Rarity = "Mythic"},
+        ["Frio Ninja"] = {Name = "Frio Ninja", Rarity = "Brainrot God"},
+        ["Frio Ninja Egg"] = {Name = "Frio Ninja Egg", Rarity = "Brainrot God"},
+        ["Frogato Pirato"] = {Name = "Frogato Pirato", Rarity = "Epic"},
+        ["Frogo Elfo"] = {Name = "Frogo Elfo", Rarity = "Rare"},
+        ["Frostino Vampiro"] = {Name = "Frostino Vampiro", Rarity = "Mythic"},
+        ["Frullato Framingo"] = {Name = "Frullato Framingo", Rarity = "Secret"},
+        ["Futbolini Skatini"] = {Name = "Futbolini Skatini", Rarity = "Secret"},
+        ["GOAT"] = {Name = "GOAT", Rarity = "Secret"},
+        ["Ganganzelli Trulala"] = {Name = "Ganganzelli Trulala", Rarity = "Mythic"},
+        ["Gangster Footera"] = {Name = "Gangster Footera", Rarity = "Rare"},
+        ["Garama and Madundung"] = {Name = "Garama and Madundung", Rarity = "Secret"},
+        ["Gato Celesto"] = {Name = "Gato Celesto", Rarity = "Epic"},
+        ["Gattatino Nyanino"] = {Name = "Gattatino Nyanino", Rarity = "Brainrot God"},
+        ["Gattino Hydrantino"] = {Name = "Gattino Hydrantino", Rarity = "Secret"},
+        ["Gattito Tacoto"] = {Name = "Gattito Tacoto", Rarity = "Brainrot God"},
+        ["Gelatina Volatina"] = {Name = "Gelatina Volatina", Rarity = "Secret"},
+        ["Gelato Lumacho"] = {Name = "Gelato Lumacho", Rarity = "Secret"},
+        ["Giftini Spyderini"] = {Name = "Giftini Spyderini", Rarity = "Secret"},
+        ["Ginger Cisterna"] = {Name = "Ginger Cisterna", Rarity = "Brainrot God"},
+        ["Ginger Gerat"] = {Name = "Ginger Gerat", Rarity = "Secret"},
+        ["Ginger Globo"] = {Name = "Ginger Globo", Rarity = "Brainrot God"},
+        ["Girafa Celestre"] = {Name = "Girafa Celestre", Rarity = "Brainrot God"},
+        ["Girafini Raftini"] = {Name = "Girafini Raftini", Rarity = "Secret"},
+        ["Glaciator"] = {Name = "Glaciator", Rarity = "Secret"},
+        ["Globa Steppa"] = {Name = "Globa Steppa", Rarity = "Secret"},
+        ["Glorbo Fruttodrillo"] = {Name = "Glorbo Fruttodrillo", Rarity = "Legendary"},
+        ["Gobblino Uniciclino"] = {Name = "Gobblino Uniciclino", Rarity = "Secret"},
+        ["Gold Egg"] = {Name = "Gold Egg", Rarity = "Secret"},
+        ["Gold Elf"] = {Name = "Gold Elf", Rarity = "Secret"},
+        ["Gold Gold Gold"] = {Name = "Gold Gold Gold", Rarity = "Secret"},
+        ["Gold and Diamond"] = {Name = "Gold and Diamond", Rarity = "Secret"},
+        ["Gorillo Subwoofero"] = {Name = "Gorillo Subwoofero", Rarity = "Secret"},
+        ["Gorillo Watermelondrillo"] = {Name = "Gorillo Watermelondrillo", Rarity = "Mythic"},
+        ["Grabatron"] = {Name = "Grabatron", Rarity = "Secret"},
+        ["Graipuss Medussi"] = {Name = "Graipuss Medussi", Rarity = "Secret"},
+        ["Graipuss Medussi Egg"] = {Name = "Graipuss Medussi Egg", Rarity = "Secret"},
+        ["Granchiello Spiritell"] = {Name = "Granchiello Spiritell", Rarity = "Brainrot God"},
+        ["Granny"] = {Name = "Granny", Rarity = "Secret"},
+        ["Griffin"] = {Name = "Griffin", Rarity = "Secret"},
+        ["Grim Cheese"] = {Name = "Grim Cheese", Rarity = "Secret"},
+        ["Gub"] = {Name = "Gub", Rarity = "Secret"},
+        ["Guerriro Digitale"] = {Name = "Guerriro Digitale", Rarity = "Secret"},
+        ["Guest 666"] = {Name = "Guest 666", Rarity = "Secret"},
+        ["Gym Bros"] = {Name = "Gym Bros", Rarity = "Secret"},
+        ["Harpuccino"] = {Name = "Harpuccino", Rarity = "Mythic"},
+        ["Headless Horseman"] = {Name = "Headless Horseman", Rarity = "OG"},
+        ["Heart Lucky Block"] = {Name = "Heart Lucky Block", Rarity = "Valentines"},
+        ["Hippo Golazo"] = {Name = "Hippo Golazo", Rarity = "Secret"},
+        ["Hippo Jacuzzo"] = {Name = "Hippo Jacuzzo", Rarity = "Brainrot God"},
+        ["Ho Ho Ho Sahur"] = {Name = "Ho Ho Ho Sahur", Rarity = "Secret"},
+        ["Holy Arepa"] = {Name = "Holy Arepa", Rarity = "Common"},
+        ["Honey Honey Bear"] = {Name = "Honey Honey Bear", Rarity = "Secret"},
+        ["Honey Honey Narwhal"] = {Name = "Honey Honey Narwhal", Rarity = "Secret"},
+        ["Hopilikalika Hopilikalako"] = {Name = "Hopilikalika Hopilikalako", Rarity = "Secret"},
+        ["Hopilikalika Hopilikalako Egg"] = {Name = "Hopilikalika Hopilikalako Egg", Rarity = "Easter"},
+        ["Horegini Boom"] = {Name = "Horegini Boom", Rarity = "Secret"},
+        ["Hydra Bunny"] = {Name = "Hydra Bunny", Rarity = "Secret"},
+        ["Hydra Bunny Egg"] = {Name = "Hydra Bunny Egg", Rarity = "Easter"},
+        ["Hydra Dragon Cannelloni"] = {Name = "Hydra Dragon Cannelloni", Rarity = "Secret"},
+        ["Hydra Serpent"] = {Name = "Hydra Serpent", Rarity = "Secret"},
+        ["Jacko Jack Jack"] = {Name = "Jacko Jack Jack", Rarity = "Brainrot God"},
+        ["Jacko Spaventosa"] = {Name = "Jacko Spaventosa", Rarity = "Mythic"},
+        ["Jackorilla"] = {Name = "Jackorilla", Rarity = "Secret"},
+        ["Jelly Moby"] = {Name = "Jelly Moby", Rarity = "Secret"},
+        ["Jingle Jingle Sahur"] = {Name = "Jingle Jingle Sahur", Rarity = "Mythic"},
+        ["Job Job Job Sahur"] = {Name = "Job Job Job Sahur", Rarity = "Secret"},
+        ["John Doe"] = {Name = "John Doe", Rarity = "Secret"},
+        ["John Pork"] = {Name = "John Pork", Rarity = "OG"},
+        ["Jolly Jolly Sahur"] = {Name = "Jolly Jolly Sahur", Rarity = "Secret"},
+        ["Kalika Bros"] = {Name = "Kalika Bros", Rarity = "Secret"},
+        ["Karker Sahur"] = {Name = "Karker Sahur", Rarity = "Secret"},
+        ["Karkerheart Luvkur"] = {Name = "Karkerheart Luvkur", Rarity = "Brainrot God"},
+        ["Karkerkar Kurkur"] = {Name = "Karkerkar Kurkur", Rarity = "Secret"},
+        ["Ketchuru and Musturu"] = {Name = "Ketchuru and Musturu", Rarity = "Secret"},
+        ["Ketupat Bros"] = {Name = "Ketupat Bros", Rarity = "Secret"},
+        ["Ketupat Kepat"] = {Name = "Ketupat Kepat", Rarity = "Secret"},
+        ["Koala Parabala"] = {Name = "Koala Parabala", Rarity = "Brainrot God"},
+        ["Kraken"] = {Name = "Kraken", Rarity = "Secret"},
+        ["Krupuk Pagi Pagi"] = {Name = "Krupuk Pagi Pagi", Rarity = "Brainrot God"},
+        ["La Anniversary Grande"] = {Name = "La Anniversary Grande", Rarity = "Secret"},
+        ["La Breakfast Combinasion"] = {Name = "La Breakfast Combinasion", Rarity = "Secret"},
+        ["La Casa Boo"] = {Name = "La Casa Boo", Rarity = "Secret"},
+        ["La Craft Machine"] = {Name = "La Craft Machine", Rarity = "Secret"},
+        ["La Cucaracha"] = {Name = "La Cucaracha", Rarity = "Secret"},
+        ["La Easter Grande"] = {Name = "La Easter Grande", Rarity = "Secret"},
+        ["La Extinct Grande"] = {Name = "La Extinct Grande", Rarity = "Secret"},
+        ["La Food Combinasion"] = {Name = "La Food Combinasion", Rarity = "Secret"},
+        ["La Fuse Machine"] = {Name = "La Fuse Machine", Rarity = "Secret"},
+        ["La Ginger Sekolah"] = {Name = "La Ginger Sekolah", Rarity = "Secret"},
+        ["La Grande Combinasion"] = {Name = "La Grande Combinasion", Rarity = "Secret"},
+        ["La Grande Combinasion Egg"] = {Name = "La Grande Combinasion Egg", Rarity = "Secret"},
+        ["La Jolly Grande"] = {Name = "La Jolly Grande", Rarity = "Secret"},
+        ["La Karkerkar Combinasion"] = {Name = "La Karkerkar Combinasion", Rarity = "Secret"},
+        ["La Lucky Grande"] = {Name = "La Lucky Grande", Rarity = "Secret"},
+        ["La Romantic Grande"] = {Name = "La Romantic Grande", Rarity = "Secret"},
+        ["La Sahur Combinasion"] = {Name = "La Sahur Combinasion", Rarity = "Secret"},
+        ["La Secret Combinasion"] = {Name = "La Secret Combinasion", Rarity = "Secret"},
+        ["La Spooky Grande"] = {Name = "La Spooky Grande", Rarity = "Secret"},
+        ["La Summer Grande"] = {Name = "La Summer Grande", Rarity = "Secret"},
+        ["La Supreme Combinasion"] = {Name = "La Supreme Combinasion", Rarity = "Secret"},
+        ["La Taco Combinasion"] = {Name = "La Taco Combinasion", Rarity = "Secret"},
+        ["La Vacca Jacko Linterino"] = {Name = "La Vacca Jacko Linterino", Rarity = "Secret"},
+        ["La Vacca Lepre Lepreino"] = {Name = "La Vacca Lepre Lepreino", Rarity = "Secret"},
+        ["La Vacca Prese Presente"] = {Name = "La Vacca Prese Presente", Rarity = "Secret"},
+        ["La Vacca Saturno Saturnita"] = {Name = "La Vacca Saturno Saturnita", Rarity = "Secret"},
+        ["Las Capuchinas"] = {Name = "Las Capuchinas", Rarity = "Brainrot God"},
+        ["Las Sis"] = {Name = "Las Sis", Rarity = "Secret"},
+        ["Las Tralaleritas"] = {Name = "Las Tralaleritas", Rarity = "Secret"},
+        ["Las Vaquitas Saturnitas"] = {Name = "Las Vaquitas Saturnitas", Rarity = "Secret"},
+        ["Lavadorito Spinito"] = {Name = "Lavadorito Spinito", Rarity = "Secret"},
+        ["Lavamanta"] = {Name = "Lavamanta", Rarity = "Secret"},
+        ["Lavamanta Egg"] = {Name = "Lavamanta Egg", Rarity = "Secret"},
+        ["Lazy Ducky"] = {Name = "Lazy Ducky", Rarity = "Brainrot God"},
+        ["Lemonita Splashita"] = {Name = "Lemonita Splashita", Rarity = "Brainrot God"},
+        ["Leprechaun Lucky Block"] = {Name = "Leprechaun Lucky Block", Rarity = "St Patrick's"},
+        ["Lerulerulerule"] = {Name = "Lerulerulerule", Rarity = "Mythic"},
+        ["Lionel Cactuseli"] = {Name = "Lionel Cactuseli", Rarity = "Legendary"},
+        ["Lionello Casarello"] = {Name = "Lionello Casarello", Rarity = "Secret"},
+        ["Lionello Casarello Egg"] = {Name = "Lionello Casarello Egg", Rarity = "Secret"},
+        ["Lirilì Larilà"] = {Name = "Lirilì Larilà", Rarity = "Common"},
+        ["List List List Sahur"] = {Name = "List List List Sahur", Rarity = "Secret"},
+        ["Los 25"] = {Name = "Los 25", Rarity = "Secret"},
+        ["Los 67"] = {Name = "Los 67", Rarity = "Secret"},
+        ["Los Admins"] = {Name = "Los Admins", Rarity = "Secret"},
+        ["Los Amigos"] = {Name = "Los Amigos", Rarity = "Secret"},
+        ["Los Bombinitos"] = {Name = "Los Bombinitos", Rarity = "Brainrot God"},
+        ["Los Bros"] = {Name = "Los Bros", Rarity = "Secret"},
+        ["Los Bunitos"] = {Name = "Los Bunitos", Rarity = "Secret"},
+        ["Los Bunitos Egg"] = {Name = "Los Bunitos Egg", Rarity = "Easter"},
+        ["Los Burritos"] = {Name = "Los Burritos", Rarity = "Secret"},
+        ["Los Candies"] = {Name = "Los Candies", Rarity = "Secret"},
+        ["Los Chicleteiras"] = {Name = "Los Chicleteiras", Rarity = "Secret"},
+        ["Los Chihuaninis"] = {Name = "Los Chihuaninis", Rarity = "Brainrot God"},
+        ["Los Chillis"] = {Name = "Los Chillis", Rarity = "Secret"},
+        ["Los Combinasionas"] = {Name = "Los Combinasionas", Rarity = "Secret"},
+        ["Los Cornis"] = {Name = "Los Cornis", Rarity = "Secret"},
+        ["Los Crocodillitos"] = {Name = "Los Crocodillitos", Rarity = "Brainrot God"},
+        ["Los Cucarachas"] = {Name = "Los Cucarachas", Rarity = "Secret"},
+        ["Los Cupids"] = {Name = "Los Cupids", Rarity = "Secret"},
+        ["Los Dragons"] = {Name = "Los Dragons", Rarity = "Secret"},
+        ["Los Fruits"] = {Name = "Los Fruits", Rarity = "Secret"},
+        ["Los Gattitos"] = {Name = "Los Gattitos", Rarity = "Brainrot God"},
+        ["Los Hackers"] = {Name = "Los Hackers", Rarity = "Secret"},
+        ["Los Hotspotsitos"] = {Name = "Los Hotspotsitos", Rarity = "Secret"},
+        ["Los Jobcitos"] = {Name = "Los Jobcitos", Rarity = "Secret"},
+        ["Los Jolly Combinasionas"] = {Name = "Los Jolly Combinasionas", Rarity = "Secret"},
+        ["Los Karkeritos"] = {Name = "Los Karkeritos", Rarity = "Secret"},
+        ["Los Lucky Blocks"] = {Name = "Los Lucky Blocks", Rarity = "Admin"},
+        ["Los Mariachis"] = {Name = "Los Mariachis", Rarity = "Secret"},
+        ["Los Matteos"] = {Name = "Los Matteos", Rarity = "Secret"},
+        ["Los Mi Gatitos"] = {Name = "Los Mi Gatitos", Rarity = "Secret"},
+        ["Los Mobilis"] = {Name = "Los Mobilis", Rarity = "Secret"},
+        ["Los Noobinis"] = {Name = "Los Noobinis", Rarity = "Mythic"},
+        ["Los Nooo My Hotspotsitos"] = {Name = "Los Nooo My Hotspotsitos", Rarity = "Secret"},
+        ["Los Orcalitos"] = {Name = "Los Orcalitos", Rarity = "Brainrot God"},
+        ["Los Planitos"] = {Name = "Los Planitos", Rarity = "Secret"},
+        ["Los Primos"] = {Name = "Los Primos", Rarity = "Secret"},
+        ["Los Puggies"] = {Name = "Los Puggies", Rarity = "Secret"},
+        ["Los Quesadillas"] = {Name = "Los Quesadillas", Rarity = "Secret"},
+        ["Los Secret Combinasionas"] = {Name = "Los Secret Combinasionas", Rarity = "Secret"},
+        ["Los Sekolahs"] = {Name = "Los Sekolahs", Rarity = "Secret"},
+        ["Los Sigmas"] = {Name = "Los Sigmas", Rarity = "Secret"},
+        ["Los Spaghettis"] = {Name = "Los Spaghettis", Rarity = "Secret"},
+        ["Los Spooky Combinasionas"] = {Name = "Los Spooky Combinasionas", Rarity = "Secret"},
+        ["Los Spyderinis"] = {Name = "Los Spyderinis", Rarity = "Secret"},
+        ["Los Sweethearts"] = {Name = "Los Sweethearts", Rarity = "Secret"},
+        ["Los Taco Blocks"] = {Name = "Los Taco Blocks", Rarity = "Taco"},
+        ["Los Tacoritas"] = {Name = "Los Tacoritas", Rarity = "Secret"},
+        ["Los Tangcitos"] = {Name = "Los Tangcitos", Rarity = "Secret"},
+        ["Los Tictacs"] = {Name = "Los Tictacs", Rarity = "Secret"},
+        ["Los Tipi Tacos"] = {Name = "Los Tipi Tacos", Rarity = "Brainrot God"},
+        ["Los Tortus"] = {Name = "Los Tortus", Rarity = "Secret"},
+        ["Los Tralaleritos"] = {Name = "Los Tralaleritos", Rarity = "Secret"},
+        ["Los Treaters"] = {Name = "Los Treaters", Rarity = "Secret"},
+        ["Los Trios"] = {Name = "Los Trios", Rarity = "Secret"},
+        ["Los Tungtungtungcitos"] = {Name = "Los Tungtungtungcitos", Rarity = "Brainrot God"},
+        ["Love Love Bear"] = {Name = "Love Love Bear", Rarity = "Secret"},
+        ["Love Love Love Sahur"] = {Name = "Love Love Love Sahur", Rarity = "Secret"},
+        ["Lovin Rose"] = {Name = "Lovin Rose", Rarity = "Secret"},
+        ["Luck Luck Luck Sahur"] = {Name = "Luck Luck Luck Sahur", Rarity = "Secret"},
+        ["Lumaca Malefica"] = {Name = "Lumaca Malefica", Rarity = "Brainrot God"},
+        ["Luv Luv Luv"] = {Name = "Luv Luv Luv", Rarity = "Brainrot God"},
+        ["Magi Ribbitini"] = {Name = "Magi Ribbitini", Rarity = "Mythic"},
+        ["Malame Amarele"] = {Name = "Malame Amarele", Rarity = "Epic"},
+        ["Mangolini Parrocini"] = {Name = "Mangolini Parrocini", Rarity = "Epic"},
+        ["Mariachi Corazoni"] = {Name = "Mariachi Corazoni", Rarity = "Secret"},
+        ["Marino Submarino"] = {Name = "Marino Submarino", Rarity = "Secret"},
+        ["Marino Submarino Egg"] = {Name = "Marino Submarino Egg", Rarity = "Secret"},
+        ["Mastodontico Telepiedone"] = {Name = "Mastodontico Telepiedone", Rarity = "Brainrot God"},
+        ["Matteo"] = {Name = "Matteo", Rarity = "Brainrot God"},
+        ["Medusini and Demonini"] = {Name = "Medusini and Demonini", Rarity = "Secret"},
+        ["Meowl"] = {Name = "Meowl", Rarity = "OG"},
+        ["Mi Gatito"] = {Name = "Mi Gatito", Rarity = "Secret"},
+        ["Mieteteira Bicicleteira"] = {Name = "Mieteteira Bicicleteira", Rarity = "Secret"},
+        ["Moby Bros"] = {Name = "Moby Bros", Rarity = "Secret"},
+        ["Money Money Bros"] = {Name = "Money Money Bros", Rarity = "Secret"},
+        ["Money Money Man"] = {Name = "Money Money Man", Rarity = "Brainrot God"},
+        ["Money Money Puggy"] = {Name = "Money Money Puggy", Rarity = "Secret"},
+        ["Money Money Reindeer"] = {Name = "Money Money Reindeer", Rarity = "Secret"},
+        ["Mortaruga"] = {Name = "Mortaruga", Rarity = "Brainrot God"},
+        ["Motorino Bumbino"] = {Name = "Motorino Bumbino", Rarity = "Secret"},
+        ["Mummelo Bandello"] = {Name = "Mummelo Bandello", Rarity = "Brainrot God"},
+        ["Mummio Rappitto"] = {Name = "Mummio Rappitto", Rarity = "Epic"},
+        ["Mummy Ambalabu"] = {Name = "Mummy Ambalabu", Rarity = "Brainrot God"},
+        ["Mythic Lucky Block"] = {Name = "Lucky Block", Rarity = "Mythic"},
+        ["Nacho Spyder"] = {Name = "Nacho Spyder", Rarity = "Secret"},
+        ["Nachorilla"] = {Name = "Nachorilla", Rarity = "Secret"},
+        ["Naughty Naughty"] = {Name = "Naughty Naughty", Rarity = "Secret"},
+        ["Noo La Polizia"] = {Name = "Noo La Polizia", Rarity = "Brainrot God"},
+        ["Noo my Candy"] = {Name = "Noo my Candy", Rarity = "Secret"},
+        ["Noo my Eggs"] = {Name = "Noo my Eggs", Rarity = "Secret"},
+        ["Noo my Eggs Egg"] = {Name = "Noo my Eggs Egg", Rarity = "Easter"},
+        ["Noo my Gold"] = {Name = "Noo my Gold", Rarity = "Secret"},
+        ["Noo my Heart"] = {Name = "Noo my Heart", Rarity = "Secret"},
+        ["Noo my Present"] = {Name = "Noo my Present", Rarity = "Secret"},
+        ["Noo my Resume"] = {Name = "Noo my Resume", Rarity = "Secret"},
+        ["Noo my examine"] = {Name = "Noo my Examen", Rarity = "Secret"},
+        ["Noobini Pizzanini"] = {Name = "Noobini Pizzanini", Rarity = "Common"},
+        ["Noobini Santanini"] = {Name = "Noobini Santanini", Rarity = "Common"},
+        ["Noodle Noodle Poodle"] = {Name = "Noodle Noodle Poodle", Rarity = "Secret"},
+        ["Nooo My Hotspot"] = {Name = "Nooo My Hotspot", Rarity = "Secret"},
+        ["Nuclearo Dinossauro"] = {Name = "Nuclearo Dinossauro", Rarity = "Secret"},
+        ["Octo Lucky Block"] = {Name = "Octo Lucky Block", Rarity = "Summer"},
+        ["Octoball"] = {Name = "Octoball", Rarity = "Secret"},
+        ["Odin Din Din Dun"] = {Name = "Odin Din Din Dun", Rarity = "Brainrot God"},
+        ["Ombrello Topolino"] = {Name = "Ombrello Topolino", Rarity = "Secret"},
+        ["Oni Oni Panda"] = {Name = "Oni Oni Panda", Rarity = "Secret"},
+        ["Orangutini Ananassini"] = {Name = "Orangutini Ananassini", Rarity = "Mythic"},
+        ["Orbi Mochi"] = {Name = "Orbi Mochi", Rarity = "Secret"},
+        ["Orcaledon"] = {Name = "Orcaledon", Rarity = "Secret"},
+        ["Orcalero Orcala"] = {Name = "Orcalero Orcala", Rarity = "Brainrot God"},
+        ["Orcalita Orcala"] = {Name = "Orcalita Orcala", Rarity = "Brainrot God"},
+        ["Orchidox"] = {Name = "Orchidox", Rarity = "Secret"},
+        ["Pakrahmatmamat"] = {Name = "Pakrahmatmamat", Rarity = "Brainrot God"},
+        ["Pakrahmatmatina"] = {Name = "Pakrahmatmatina", Rarity = "Brainrot God"},
+        ["Pancake and Syrup"] = {Name = "Pancake and Syrup", Rarity = "Secret"},
+        ["Panda Popanda"] = {Name = "Panda Popanda", Rarity = "Secret"},
+        ["Pandaccini Bananini"] = {Name = "Pandaccini Bananini", Rarity = "Legendary"},
+        ["Pandanini Frostini"] = {Name = "Pandanini Frostini", Rarity = "Brainrot God"},
+        ["Paradiso Axolottino"] = {Name = "Paradiso Axolottino", Rarity = "Secret"},
+        ["Patteo"] = {Name = "Patteo", Rarity = "Brainrot God"},
+        ["Pelican Pachetto"] = {Name = "Pelican Pachetto", Rarity = "Secret"},
+        ["Pengolino Nuvoletto"] = {Name = "Pengolino Nuvoletto", Rarity = "Rare"},
+        ["Penguin Tree"] = {Name = "Penguin Tree", Rarity = "Epic"},
+        ["Penguino Cocosino"] = {Name = "Penguino Cocosino", Rarity = "Epic"},
+        ["Penguino Pumpkino"] = {Name = "Penguino Pumpkino", Rarity = "Epic"},
+        ["Perochello Lemonchello"] = {Name = "Perochello Lemonchello", Rarity = "Epic"},
+        ["Perrito Burrito"] = {Name = "Perrito Burrito", Rarity = "Secret"},
+        ["Peschito Machito"] = {Name = "Peschito Machito", Rarity = "Secret"},
+        ["Phoenix"] = {Name = "Phoenix", Rarity = "Secret"},
+        ["Pi Pi Watermelon"] = {Name = "Pi Pi Watermelon", Rarity = "Legendary"},
+        ["Piccione Macchina"] = {Name = "Piccione Macchina", Rarity = "Brainrot God"},
+        ["Piccionetta Macchina"] = {Name = "Piccionetta Macchina", Rarity = "Brainrot God"},
+        ["Pin Pin Pengu"] = {Name = "Pin Pin Pengu", Rarity = "Secret"},
+        ["Pin Pin Pengu Egg"] = {Name = "Pin Pin Pengu Egg", Rarity = "Secret"},
+        ["Pinealotto Fruttarino"] = {Name = "Pinealotto Fruttarino", Rarity = "Rare"},
+        ["Pineaplino"] = {Name = "Pineaplino", Rarity = "Brainrot God"},
+        ["Pipi Avocado"] = {Name = "Pipi Avocado", Rarity = "Rare"},
+        ["Pipi Corni"] = {Name = "Pipi Corni", Rarity = "Common"},
+        ["Pipi Kiwi"] = {Name = "Pipi Kiwi", Rarity = "Common"},
+        ["Pipi Potato"] = {Name = "Pipi Potato", Rarity = "Legendary"},
+        ["Pirulitoita Bicicleteira"] = {Name = "Pirulitoita Bicicleteira", Rarity = "Secret"},
+        ["Pizza and Ranch"] = {Name = "Pizza and Ranch", Rarity = "Secret"},
+        ["Plant Bros"] = {Name = "Plant Bros", Rarity = "Secret"},
+        ["Please my Present"] = {Name = "Please my Present", Rarity = "Secret"},
+        ["Pogo Pogo Penguin"] = {Name = "Pogo Pogo Penguin", Rarity = "Secret"},
+        ["Polaroidini"] = {Name = "Polaroidini", Rarity = "Secret"},
+        ["Pop Pop Petalini"] = {Name = "Pop Pop Petalini", Rarity = "Secret"},
+        ["Pop Pop Sahur"] = {Name = "Pop Pop Sahur", Rarity = "Brainrot God"},
+        ["Popcuru and Fizzuru"] = {Name = "Popcuru and Fizzuru", Rarity = "Secret"},
+        ["Pot Hotspot"] = {Name = "Pot Hotspot", Rarity = "Secret"},
+        ["Pot Pumpkin"] = {Name = "Pot Pumpkin", Rarity = "Secret"},
+        ["Premium Bee Lucky Block"] = {Name = "Premium Bee Lucky Block", Rarity = "Honey"},
+        ["Premium Egg Lucky Block"] = {Name = "Premium Egg Lucky Block", Rarity = "Easter"},
+        ["Premium Festive Lucky Block"] = {Name = "Premium Festive Lucky Block", Rarity = "Festive"},
+        ["Premium Heart Lucky Block"] = {Name = "Premium Heart Lucky Block", Rarity = "Valentines"},
+        ["Premium Leprechaun Lucky Block"] = {Name = "Premium Leprechaun Lucky Block", Rarity = "St Patrick's"},
+        ["Premium Octo Lucky Block"] = {Name = "Premium Octo Lucky Block", Rarity = "Summer"},
+        ["Premium Skull Lucky Block"] = {Name = "Premium Skull Lucky Block", Rarity = "Skull"},
+        ["Pretzo Robo"] = {Name = "Pretzo Robo", Rarity = "Secret"},
+        ["Puffaball"] = {Name = "Puffaball", Rarity = "Legendary"},
+        ["Puffino Builderino"] = {Name = "Puffino Builderino", Rarity = "Secret"},
+        ["Pumpkini Spyderini"] = {Name = "Pumpkini Spyderini", Rarity = "Secret"},
+        ["Qamar Camelamp"] = {Name = "Qamar Camelamp", Rarity = "Secret"},
+        ["Qamar Camelamp Egg"] = {Name = "Qamar Camelamp Egg", Rarity = "Secret"},
+        ["Quackalena"] = {Name = "Quackalena", Rarity = "Brainrot God"},
+        ["Quackini Snackini"] = {Name = "Quackini Snackini", Rarity = "Secret"},
+        ["Quackini Snackini Egg"] = {Name = "Quackini Snackini Egg", Rarity = "Easter"},
+        ["Quackula"] = {Name = "Quackula", Rarity = "Legendary"},
+        ["Queen Bee"] = {Name = "Queen Bee", Rarity = "Secret"},
+        ["Quesadilla Crocodila"] = {Name = "Quesadilla Crocodila", Rarity = "Secret"},
+        ["Quesadillo Vampiro"] = {Name = "Quesadillo Vampiro", Rarity = "Secret"},
+        ["Quivioli Ameleonni"] = {Name = "Quivioli Ameleonni", Rarity = "Legendary"},
+        ["Raccooni Jandelini"] = {Name = "Raccooni Jandelini", Rarity = "Common"},
+        ["Rang Ring Bus"] = {Name = "Rang Ring Bus", Rarity = "Secret"},
+        ["Ranito Pepito"] = {Name = "Ranito Pepito", Rarity = "Secret"},
+        ["Ranito Pepito Egg"] = {Name = "Ranito Pepito Egg", Rarity = "Secret"},
+        ["Ref Ref Ref Sahur"] = {Name = "Ref Ref Ref Sahur", Rarity = "Secret"},
+        ["Reindeer Tralala"] = {Name = "Reindeer Tralala", Rarity = "Secret"},
+        ["Reinito Sleighito"] = {Name = "Reinito Sleighito", Rarity = "Secret"},
+        ["Rexino Ramino"] = {Name = "Rexino Ramino", Rarity = "Secret"},
+        ["Rexino Ramino Egg"] = {Name = "Rexino Ramino Egg", Rarity = "Secret"},
+        ["Rhino Helicopterino"] = {Name = "Rhino Helicopterino", Rarity = "Mythic"},
+        ["Rhino Toasterino"] = {Name = "Rhino Toasterino", Rarity = "Mythic"},
+        ["Rico Dinero"] = {Name = "Rico Dinero", Rarity = "Secret"},
+        ["Robo Grafito"] = {Name = "Robo Grafito", Rarity = "Brainrot God"},
+        ["Rocco Disco"] = {Name = "Rocco Disco", Rarity = "Secret"},
+        ["Rockarino Rockara"] = {Name = "Rockarino Rockara", Rarity = "Secret"},
+        ["Rockarino Rockara Egg"] = {Name = "Rockarino Rockara Egg", Rarity = "Secret"},
+        ["Rocketini Frostini"] = {Name = "Rocketini Frostini", Rarity = "Secret"},
+        ["Rosatops Triceratino"] = {Name = "Rosatops Triceratino", Rarity = "Secret"},
+        ["Rosetti Tualetti"] = {Name = "Rosetti Tualetti", Rarity = "Secret"},
+        ["Rosey and Teddy"] = {Name = "Rosey and Teddy", Rarity = "Secret"},
+        ["Rubiko and Kubiko"] = {Name = "Rubiko and Kubiko", Rarity = "Secret"},
+        ["Rubrikiko"] = {Name = "Rubrikiko", Rarity = "Secret"},
+        ["S'more Serat"] = {Name = "S'more Serat", Rarity = "Secret"},
+        ["Salamino Penguino"] = {Name = "Salamino Penguino", Rarity = "Epic"},
+        ["Sammyni Cakini"] = {Name = "Sammyni Cakini", Rarity = "Secret"},
+        ["Sammyni Fattini"] = {Name = "Sammyni Fattini", Rarity = "Secret"},
+        ["Sammyni Spookyni"] = {Name = "Sammyni Spookyni", Rarity = "Secret"},
+        ["Sammyni Spyderini"] = {Name = "Sammyni Spyderini", Rarity = "Secret"},
+        ["Sammyni Spyderini Egg"] = {Name = "Sammyni Spyderini Egg", Rarity = "Secret"},
+        ["Sammyni Truckini"] = {Name = "Sammyni Truckini", Rarity = "Secret"},
+        ["Sand Sand Sand"] = {Name = "Sand Sand Sand", Rarity = "Secret"},
+        ["Santa Hotspot"] = {Name = "Santa Hotspot", Rarity = "Secret"},
+        ["Santteo"] = {Name = "Santteo", Rarity = "Secret"},
+        ["Scorpino Coasterino"] = {Name = "Scorpino Coasterino", Rarity = "Secret"},
+        ["Sealo Regalo"] = {Name = "Sealo Regalo", Rarity = "Legendary"},
+        ["Secret Lucky Block"] = {Name = "Lucky Block", Rarity = "Secret"},
+        ["Serafinna Medusella"] = {Name = "Serafinna Medusella", Rarity = "Secret"},
+        ["Seraphino Gruyero"] = {Name = "Seraphino Gruyero", Rarity = "Legendary"},
+        ["Sigma Boy"] = {Name = "Sigma Boy", Rarity = "Legendary"},
+        ["Sigma Girl"] = {Name = "Sigma Girl", Rarity = "Legendary"},
+        ["Signore Carapace"] = {Name = "Signore Carapace", Rarity = "Secret"},
+        ["Sir Mangus"] = {Name = "Sir Mangus", Rarity = "Secret"},
+        ["Sir Mangus Egg"] = {Name = "Sir Mangus Egg", Rarity = "Secret"},
+        ["Skelly and Coffy"] = {Name = "Skelly and Coffy", Rarity = "Secret"},
+        ["Ski Ski Skunki"] = {Name = "Ski Ski Skunki", Rarity = "Secret"},
+        ["Ski Ski Skunki Egg"] = {Name = "Ski Ski Skunki Egg", Rarity = "Secret"},
+        ["Skibidi Toilet"] = {Name = "Skibidi Toilet", Rarity = "OG"},
+        ["Skull Lucky Block"] = {Name = "Skull Lucky Block", Rarity = "Skull"},
+        ["Skull Skull Skull"] = {Name = "Skull Skull Skull", Rarity = "Brainrot God"},
+        ["Slushi Huski"] = {Name = "Slushi Huski", Rarity = "Brainrot God"},
+        ["Snailenzo"] = {Name = "Snailenzo", Rarity = "Brainrot God"},
+        ["Snailo Clovero"] = {Name = "Snailo Clovero", Rarity = "Secret"},
+        ["Spaghetti Tualetti"] = {Name = "Spaghetti Tualetti", Rarity = "Secret"},
+        ["Spinny Hammy"] = {Name = "Spinny Hammy", Rarity = "Secret"},
+        ["Spioniro Golubiro"] = {Name = "Spioniro Golubiro", Rarity = "Mythic"},
+        ["Spongini Quackini"] = {Name = "Spongini Quackini", Rarity = "Mythic"},
+        ["Spooky Lucky Block"] = {Name = "Spooky Lucky Block", Rarity = "Spooky"},
+        ["Spooky and Pumpky"] = {Name = "Spooky and Pumpky", Rarity = "Secret"},
+        ["Spyder Elephant"] = {Name = "Spyder Elephant", Rarity = "OG"},
+        ["Squalanana"] = {Name = "Squalanana", Rarity = "Brainrot God"},
+        ["Steakini Fattini"] = {Name = "Steakini Fattini", Rarity = "Secret"},
+        ["Stoppo Luminino"] = {Name = "Stoppo Luminino", Rarity = "Mythic"},
+        ["Strawberrelli Flamingelli"] = {Name = "Strawberrelli Flamingelli", Rarity = "Legendary"},
+        ["Strawberrita"] = {Name = "Strawberrita", Rarity = "Secret"},
+        ["Strawberry Elephant"] = {Name = "Strawberry Elephant", Rarity = "OG"},
+        ["Sundrilla Sundae"] = {Name = "Sundrilla Sundae", Rarity = "Brainrot God"},
+        ["Sushi Inu"] = {Name = "Sushi Inu", Rarity = "Secret"},
+        ["Svinina Bombardino"] = {Name = "Svinina Bombardino", Rarity = "Common"},
+        ["Swag Soda"] = {Name = "Swag Soda", Rarity = "Secret"},
+        ["Swag Soda Egg"] = {Name = "Swag Soda Egg", Rarity = "Secret"},
+        ["Swaggy Bros"] = {Name = "Swaggy Bros", Rarity = "Secret"},
+        ["Syrup Samurai"] = {Name = "Syrup Samurai", Rarity = "Secret"},
+        ["Ta Ta Ta Ta Sahur"] = {Name = "Ta Ta Ta Ta Sahur", Rarity = "Rare"},
+        ["Taco Lucky Block"] = {Name = "Lucky Block", Rarity = "Taco"},
+        ["Tacorillo Crocodillo"] = {Name = "Tacorillo Crocodillo", Rarity = "Secret"},
+        ["Tacorita Bicicleta"] = {Name = "Tacorita Bicicleta", Rarity = "Secret"},
+        ["Tacoturbo Tacorito"] = {Name = "Tacoturbo Tacorito", Rarity = "Secret"},
+        ["Talpa Di Fero"] = {Name = "Talpa Di Fero", Rarity = "Common"},
+        ["Tang Tang Keletang"] = {Name = "Tang Tang Keletang", Rarity = "Secret"},
+        ["Tartaragno"] = {Name = "Tartaragno", Rarity = "Common"},
+        ["Tartaruga Cisterna"] = {Name = "Tartaruga Cisterna", Rarity = "Brainrot God"},
+        ["Tartaruga Cisterna Egg"] = {Name = "Tartaruga Cisterna Egg", Rarity = "Brainrot God"},
+        ["Te Te Te Sahur"] = {Name = "Te Te Te Sahur", Rarity = "Mythic"},
+        ["Telemorte"] = {Name = "Telemorte", Rarity = "Secret"},
+        ["Tenini Ballini"] = {Name = "Tenini Ballini", Rarity = "Brainrot God"},
+        ["Tentacolo Tecnico"] = {Name = "Tentacolo Tecnico", Rarity = "Brainrot God"},
+        ["Ti Ti Ti Sahur"] = {Name = "Ti Ti Ti Sahur", Rarity = "Epic"},
+        ["Tic Tic Ribbit"] = {Name = "Tic Tic Ribbit", Rarity = "Mythic"},
+        ["Tic Tic Rick"] = {Name = "Tic Tic Rick", Rarity = "Brainrot God"},
+        ["Tictac Sahur"] = {Name = "Tictac Sahur", Rarity = "Secret"},
+        ["Tigrilini Watermelini"] = {Name = "Tigrilini Watermelini", Rarity = "Mythic"},
+        ["Tigroligre Frutonni"] = {Name = "Tigroligre Frutonni", Rarity = "Brainrot God"},
+        ["Tim Cheese"] = {Name = "Tim Cheese", Rarity = "Common"},
+        ["Tipi Topi Taco"] = {Name = "Tipi Topi Taco", Rarity = "Brainrot God"},
+        ["Tirilikalika Tirilikalako"] = {Name = "Tirilikalika Tirilikalako", Rarity = "Secret"},
+        ["To to to Sahur"] = {Name = "To to to Sahur", Rarity = "Secret"},
+        ["To to to Sahur Egg"] = {Name = "To to to Sahur Egg", Rarity = "Secret"},
+        ["Tob Tobi Tobi"] = {Name = "Tob Tobi Tobi", Rarity = "Mythic"},
+        ["Toiletto Focaccino"] = {Name = "Toiletto Focaccino", Rarity = "Mythic"},
+        ["Tootini Shrimpini"] = {Name = "Tootini Shrimpini", Rarity = "Brainrot God"},
+        ["Toro Españolo"] = {Name = "Toro Españolo", Rarity = "Secret"},
+        ["Torrtuginni Dragonfrutini"] = {Name = "Torrtuginni Dragonfrutini", Rarity = "Secret"},
+        ["Tortuginni Sandcastlini"] = {Name = "Tortuginni Sandcastlini", Rarity = "Brainrot God"},
+        ["Tosto Dino"] = {Name = "Tosto Dino", Rarity = "Secret"},
+        ["Tracoducotulu Delapeladustuz"] = {Name = "Tracoducotulu Delapeladustuz", Rarity = "Mythic"},
+        ["Tractoro Dinosauro"] = {Name = "Tractoro Dinosauro", Rarity = "Brainrot God"},
+        ["Tralaledon"] = {Name = "Tralaledon", Rarity = "Secret"},
+        ["Tralalero Tralala"] = {Name = "Tralalero Tralala", Rarity = "Brainrot God"},
+        ["Tralalita Tralala"] = {Name = "Tralalita Tralala", Rarity = "Brainrot God"},
+        ["Tree Tree Tree Sahur"] = {Name = "Tree Tree Tree Sahur", Rarity = "Mythic"},
+        ["Trenostruzzo Turbo 3000"] = {Name = "Trenostruzzo Turbo 3000", Rarity = "Brainrot God"},
+        ["Trenostruzzo Turbo 4000"] = {Name = "Trenostruzzo Turbo 4000", Rarity = "Secret"},
+        ["Trenotubo Axolotrico 9000"] = {Name = "Trenotubo Axolotrico 9000", Rarity = "Brainrot God"},
+        ["Tric Trac Baraboom"] = {Name = "Tric Trac Baraboom", Rarity = "Rare"},
+        ["Trickolino"] = {Name = "Trickolino", Rarity = "Secret"},
+        ["Triplito Tralaleritos"] = {Name = "Triplito Tralaleritos", Rarity = "Secret"},
+        ["Trippi Troppi"] = {Name = "Trippi Troppi", Rarity = "Rare"},
+        ["Trippi Troppi Troppa Trippa"] = {Name = "Trippi Troppi Troppa Trippa", Rarity = "Brainrot God"},
+        ["Trulimero Trulicina"] = {Name = "Trulimero Trulicina", Rarity = "Epic"},
+        ["Tuff Toucan"] = {Name = "Tuff Toucan", Rarity = "Secret"},
+        ["Tukanno Bananno"] = {Name = "Tukanno Bananno", Rarity = "Brainrot God"},
+        ["Unclito Samito"] = {Name = "Unclito Samito", Rarity = "Brainrot God"},
+        ["Urubini Flamenguini"] = {Name = "Urubini Flamenguini", Rarity = "Brainrot God"},
+        ["Vampi Ribbitini"] = {Name = "Vampi Ribbitini", Rarity = "Brainrot God"},
+        ["Vampira Cappucina"] = {Name = "Vampira Cappucina", Rarity = "Brainrot God"},
+        ["Var Var Var"] = {Name = "Var Var Var", Rarity = "Secret"},
+        ["Ventoliero Pavonero"] = {Name = "Ventoliero Pavonero", Rarity = "Secret"},
+        ["Venuspino"] = {Name = "Venuspino", Rarity = "Secret"},
+        ["Vulturino Skeletono"] = {Name = "Vulturino Skeletono", Rarity = "Secret"},
+        ["W or L"] = {Name = "W or L", Rarity = "Secret"},
+        ["Wheelchair Granny"] = {Name = "Granny", Rarity = "Secret"},
+        ["Wombo Rollo"] = {Name = "Wombo Rollo", Rarity = "Epic"},
+        ["Yess my Resume"] = {Name = "Yess my Resume", Rarity = "Secret"},
+        ["Yess my examine"] = {Name = "Yess my Examen", Rarity = "Secret"},
+        ["Yeti Claus"] = {Name = "Yeti Claus", Rarity = "Brainrot God"},
+        ["Yetimatic"] = {Name = "Yetimatic", Rarity = "Secret"},
+        ["Yetimatic Egg"] = {Name = "Yetimatic Egg", Rarity = "Secret"},
+        ["Zebrino Pianino"] = {Name = "Zebrino Pianino", Rarity = "Secret"},
+        ["Zebrino Pianino Egg"] = {Name = "Zebrino Pianino Egg", Rarity = "Secret"},
+        ["Zibra Zubra Zibralini"] = {Name = "Zibra Zubra Zibralini", Rarity = "Mythic"},
+        ["Zombie Bowl"] = {Name = "Zombie Bowl", Rarity = "Secret"},
+        ["Zombie Tralala"] = {Name = "Zombie Tralala", Rarity = "Secret"},
+    }
+
+    -- Datas.Bases physical Source lines 7-85; unknown/new tiers stay unavailable.
+    local baseCatalogue = {
+        [0] = {Floors = 1, Slots = 10},
+        [1] = {Floors = 1, Slots = 10},
+        [2] = {Floors = 2, Slots = 11},
+        [3] = {Floors = 2, Slots = 12},
+        [4] = {Floors = 2, Slots = 13},
+        [5] = {Floors = 2, Slots = 14},
+        [6] = {Floors = 2, Slots = 15},
+        [7] = {Floors = 2, Slots = 16},
+        [8] = {Floors = 2, Slots = 17},
+        [9] = {Floors = 2, Slots = 18},
+        [10] = {Floors = 3, Slots = 19},
+        [11] = {Floors = 3, Slots = 20},
+        [12] = {Floors = 3, Slots = 21},
+        [13] = {Floors = 3, Slots = 22},
+        [14] = {Floors = 3, Slots = 23},
+        [15] = {Floors = 3, Slots = 24},
+        [16] = {Floors = 3, Slots = 25},
+        [17] = {Floors = 3, Slots = 26},
+        [18] = {Floors = 3, Slots = 27},
+        [19] = {Floors = 3, Slots = 28},
+    }
+
+    -- Existing game-rendered ownership indicator; never infer ownership by distance/name.
+    -- PlotClient physical Source 1399-1405 sets YourBase.Enabled only for LocalPlayer.
+    local function findOwnPlot()
+        local plots = workspace:FindFirstChild("Plots")
+        if not plots then return nil, nil, "Plots are not loaded" end
+        local found, indicator, matches = nil, nil, 0
+        for _, plot in ipairs(plots:GetChildren()) do
+            if plot:IsA("Model") then
+                local sign = plot:FindFirstChild("PlotSign")
+                local marker = sign and sign:FindFirstChild("YourBase")
+                if marker and marker:IsA("BillboardGui") and marker.Enabled then
+                    found, indicator, matches = plot, marker, matches + 1
+                end
+            end
+        end
+        if matches ~= 1 then return nil, nil, "Own-plot indicator is missing or ambiguous" end
+        if found:GetAttribute("Loaded") ~= true then return nil, nil, "Own plot is still loading" end
+        return found, indicator, nil
+    end
+
+    local promptStates = {
+        None = true, Sell = true, Grab = true, Place = true,
+        Return = true, Open = true, Steal = true,
+    }
+    local rarityByDisplay = {}
+    for _, info in pairs(animalCatalogue) do
+        local previousRarity = rarityByDisplay[info.Name]
+        if previousRarity == nil then
+            rarityByDisplay[info.Name] = info.Rarity
+        elseif previousRarity ~= info.Rarity then
+            rarityByDisplay[info.Name] = false
+        end
+    end
+
+    local function readLoadedPlot()
+        if replicatedFirst:GetAttribute("DataLoaded") ~= true then
+            return nil, "Player data is not ready"
+        end
+        local plot, marker, reason = findOwnPlot()
+        if not plot then return nil, reason end
+        local tier = plot:GetAttribute("Tier")
+        local config = type(tier) == "number" and tier % 1 == 0 and baseCatalogue[tier] or nil
+        local result = {Rows = {}, Count = nil, ObservedModels = 0, Partial = true}
+
+        -- LaserHitbox Floor attributes are interpreted by PlotClient Source 1034-1044.
+        local floorIds, maxFloor, floorBad = {}, 0, false
+        local laserHitbox = plot:FindFirstChild("LaserHitbox")
+        if laserHitbox then
+            for _, part in ipairs(laserHitbox:GetChildren()) do
+                if part:IsA("BasePart") then
+                    local id = part:GetAttribute("Floor")
+                    if id ~= nil then
+                        if type(id) ~= "number" or id % 1 ~= 0 or id < 1 or id > 3 then
+                            floorBad = true
+                        else
+                            floorIds[id], maxFloor = true, math.max(maxFloor, id)
+                        end
+                    end
+                end
+            end
+        end
+        for id = 1, maxFloor do
+            if not floorIds[id] then floorBad = true end
+        end
+        if not floorBad and maxFloor > 0 and (not config or maxFloor == config.Floors) then
+            result.Floors = maxFloor
+        end
+
+        local podiums = plot:FindFirstChild("AnimalPodiums")
+        local slots, slotCount, slotBad = {}, 0, false
+        if podiums and podiums:IsA("Folder") then
+            for _, child in ipairs(podiums:GetChildren()) do
+                if child:IsA("Model") then
+                    local index = tonumber(child.Name)
+                    if not index or index % 1 ~= 0 or index < 1
+                        or tostring(index) ~= child.Name or slots[index] then
+                        slotBad = true
+                    else
+                        slots[index], slotCount = child, slotCount + 1
+                    end
+                end
+            end
+        else
+            slotBad = true
+        end
+        local topologyReady = config ~= nil and not slotBad and slotCount == config.Slots
+        if config then
+            for index = 1, config.Slots do
+                local podium = slots[index]
+                local base = podium and podium:FindFirstChild("Base")
+                local spawn = base and base:FindFirstChild("Spawn")
+                if not spawn or not spawn:IsA("BasePart") then topologyReady = false end
+            end
+        end
+        -- Templates contain inactive podiums. Require the reviewed Tier and a complete
+        -- matching numbered-podium structure instead of counting arbitrary models.
+        if topologyReady then result.Capacity = config.Slots end
+        if plot:GetAttribute("Nuked") then
+            local samePlot, sameMarker = findOwnPlot()
+            if samePlot ~= plot or sameMarker ~= marker or plot:GetAttribute("Tier") ~= tier
+                or plot:FindFirstChild("AnimalPodiums") ~= podiums
+                or replicatedFirst:GetAttribute("DataLoaded") ~= true then
+                return nil, "Own plot changed during collection"
+            end
+            result.Reason = "Plot display is temporarily unavailable"
+            return result, nil
+        end
+
+        -- Read existing prompts only. Never activate them or connect their events.
+        -- AnimalPrompt Source 25-36 supplies ObjectText even when State is None/busy.
+        local promptCounts, occupied, coverageReady = {}, 0, topologyReady
+        for _, podium in pairs(slots) do
+            if podium:GetAttribute("DeferDisplay") then coverageReady = false end
+            local base = podium:FindFirstChild("Base")
+            local spawn = base and base:FindFirstChild("Spawn")
+            local attachment = spawn and spawn:FindFirstChild("PromptAttachment")
+            local promptCount, configured, names, nameCount = 0, 0, {}, 0
+            if attachment and attachment:IsA("Attachment") then
+                for _, prompt in ipairs(attachment:GetChildren()) do
+                    if prompt:IsA("ProximityPrompt") then
+                        promptCount = promptCount + 1
+                        local stateName = prompt:GetAttribute("State")
+                        if type(stateName) == "string" and promptStates[stateName] then
+                            configured = configured + 1
+                            local text = prompt.ObjectText
+                            if type(text) == "string" and text:find("%S") and not names[text] then
+                                names[text], nameCount = true, nameCount + 1
+                            end
+                        end
+                    end
+                end
+            end
+            if promptCount ~= 2 or configured ~= 2 or nameCount > 1 then coverageReady = false end
+            if nameCount == 1 and not podium:GetAttribute("DeferDisplay") then
+                for name in pairs(names) do
+                    promptCounts[name] = (promptCounts[name] or 0) + 1
+                    occupied = occupied + 1
+                end
+            end
+        end
+
+        local groups, modelCounts = {}, {}
+        local function addRow(identity, name, rarity, mutation, source, amount)
+            local key = source .. ":" .. #identity .. ":" .. identity
+                .. (mutation and ":M" .. #mutation .. ":" .. mutation or ":U")
+            local group = groups[key]
+            if not group then
+                group = {Count = 0, Name = name, Rarity = rarity, Mutation = mutation, Source = source}
+                groups[key] = group
+            end
+            group.Count = group.Count + amount
+        end
+        -- PlotClient Source 136-184 clones by Index, parents directly to PlotModel,
+        -- and writes Mutation. Never match detached overhead GUIs by proximity.
+        for _, child in ipairs(plot:GetChildren()) do
+            local info = child:IsA("Model") and animalCatalogue[child.Name] or nil
+            if info then
+                local mutation = child:GetAttribute("Mutation")
+                local fallback = child:GetAttribute("__mutation")
+                if type(mutation) ~= "string" or mutation == "" then mutation = nil end
+                if type(fallback) ~= "string" or fallback == "" then fallback = nil end
+                local rowSource = "model"
+                if mutation and fallback and mutation ~= fallback then
+                    mutation, rowSource = nil, "model-unknown"
+                elseif not mutation then
+                    mutation = fallback
+                end
+                addRow(child.Name, info.Name, info.Rarity, mutation, rowSource, 1)
+                modelCounts[info.Name] = (modelCounts[info.Name] or 0) + 1
+                result.ObservedModels = result.ObservedModels + 1
+            end
+        end
+
+        -- Models load asynchronously. Fully configured podium prompts can fill name-only
+        -- gaps, but they cannot supply mutations for a model that has not appeared.
+        for name, count in pairs(modelCounts) do
+            if count > (promptCounts[name] or 0) then coverageReady = false end
+        end
+        if coverageReady then
+            for name, count in pairs(promptCounts) do
+                local missing = count - (modelCounts[name] or 0)
+                if missing > 0 then
+                    addRow(name, name, rarityByDisplay[name] or nil, nil, "prompt", missing)
+                end
+            end
+            result.Count, result.Partial = occupied, false
+        end
+
+        for _, group in pairs(groups) do
+            local parts = {group.Name}
+            if group.Rarity then table.insert(parts, group.Rarity) end
+            if group.Mutation then
+                table.insert(parts, "Mutation: " .. group.Mutation)
+            end
+            table.insert(result.Rows, "x" .. exact(group.Count) .. " " .. table.concat(parts, " | "))
+        end
+        table.sort(result.Rows)
+
+        if result.Partial then result.Reason = "Podium/model data is incomplete or inconsistent" end
+        local samePlot, sameMarker = findOwnPlot()
+        if samePlot ~= plot or sameMarker ~= marker or plot:GetAttribute("Tier") ~= tier
+            or plot:FindFirstChild("AnimalPodiums") ~= podiums
+            or replicatedFirst:GetAttribute("DataLoaded") ~= true then
+            return nil, "Own plot changed during collection"
+        end
+        return result, nil
+    end
+
+    local lastPlotIssue
+
+    -- User-supplied seller copy. Edit or remove claims that do not apply to a listing.
+    local sellerFooter = {
+        "✅ Full Access Account",
+        "⚡ Instant Delivery",
+        "🛠️ 24/7 Support & Warranty",
+    }
+
+    local function displayedAmount(text)
+        -- Remove an existing dollar prefix only; never expand a formatted suffix.
+        local amount = text:match("^%s*(.-)%s*$")
+        return (amount:gsub("^%$%s*", ""))
+    end
+
+    local function collect()
+        local player = players.LocalPlayer
+        assert(player, "LocalPlayer is not available.")
+        local character = player.Character
+        local backpack = player:FindFirstChildOfClass("Backpack")
+        local dataLoaded = replicatedFirst:GetAttribute("DataLoaded")
+        local backpackReady = character and character:GetAttribute("BackpackReady")
+        local plotOK, plotSnapshot, plotReason = pcall(readLoadedPlot)
+        if not plotOK then plotReason, plotSnapshot = tostring(plotSnapshot), nil end
+        local issue = plotReason or (plotSnapshot and plotSnapshot.Reason)
+        if issue and issue ~= lastPlotIssue then
+            warn("SAB_LOCALHOST: Loaded plot view: " .. issue)
+        end
+        lastPlotIssue = issue
+
+        local rebirthStat = readLeaderstat(player, "Rebirths")
+        local rebirthTitle, rebirthDetails = "? Rebirths", "Unavailable"
+        if rebirthStat then
+            if rebirthStat.Kind == "number" then
+                local value = rebirthStat.Value
+                assert(value >= 0 and value % 1 == 0, "Rebirth count is not a nonnegative integer.")
+                rebirthTitle = countLabel(value, "Rebirth", "Rebirths")
+                rebirthDetails = exact(value)
+            else
+                rebirthDetails = rebirthStat.Text
+                rebirthTitle = rebirthDetails .. (rebirthDetails == "1" and " Rebirth" or " Rebirths")
+            end
+        end
+
+        local cashStat = readLeaderstat(player, "Cash")
+        local cashTitle, cashDetails = "?", "Unavailable"
+        if cashStat and cashStat.Kind == "number" then
+            assert(cashStat.Value >= 0, "Cash is negative; report discarded.")
+            cashTitle = compact(cashStat.Value)
+            cashDetails = "$" .. exact(cashStat.Value)
+        elseif cashStat then
+            local amount = displayedAmount(cashStat.Text)
+            assert(amount ~= "", "Cash text has no amount; report discarded.")
+            cashTitle = amount
+            cashDetails = "$" .. amount
+        elseif dataLoaded == true then
+            local text = readCashText(player)
+            if text then
+                local amount = displayedAmount(text)
+                if amount ~= "" then
+                    cashTitle = amount
+                    cashDetails = "$" .. amount
+                end
+            end
+        end
+
+        -- The listing's Weapons & Gear category counts currently replicated Tool instances.
+        local toolCount, toolLines
+        if dataLoaded == true and character and character.Parent == workspace
+            and character:FindFirstChild("Humanoid") and backpack and backpackReady then
+            local counts, seen = {}, {}
+            toolCount, toolLines = 0, {}
+            local function scan(container)
+                for _, tool in ipairs(container:GetChildren()) do
+                    if tool:IsA("Tool") and not seen[tool] then
+                        seen[tool] = true
+                        counts[tool.Name] = (counts[tool.Name] or 0) + 1
+                        toolCount = toolCount + 1
+                    end
+                end
+            end
+            scan(backpack)
+            scan(character)
+            assert(player.Character == character and character.Parent == workspace
+                and backpack.Parent == player and player:FindFirstChildOfClass("Backpack") == backpack
+                and character:GetAttribute("BackpackReady")
+                and replicatedFirst:GetAttribute("DataLoaded") == true,
+                "Tool readiness changed during collection; report discarded.")
+            for name, count in pairs(counts) do
+                table.insert(toolLines, "x" .. exact(count) .. " " .. name)
+            end
+            table.sort(toolLines)
+        end
+
+        local toolTitle = toolCount ~= nil and countLabel(toolCount, "Weapon", "Weapons") or "? Weapons"
+        local toolDetails = "Unavailable"
+        if toolLines then
+            toolDetails = #toolLines > 0 and table.concat(toolLines, ", ") or "None"
+        end
+        local floors = plotSnapshot and plotSnapshot.Floors
+        local capacity = plotSnapshot and plotSnapshot.Capacity
+        local brainrotCount = plotSnapshot and plotSnapshot.Count
+        local floorTitle = floors and countLabel(floors, "Floor", "Floors") or "? Floors"
+        local brainrotTitle = brainrotCount ~= nil and countLabel(brainrotCount, "Brainrot", "Brainrots") or "? Brainrots"
+        local slotsText = capacity and ((brainrotCount ~= nil and exact(brainrotCount) or "?") .. " / " .. exact(capacity)) or "Unavailable"
+        local title = "🔥【Steal a Brainrot】🔄 " .. rebirthTitle
+            .. " | 🏢 " .. floorTitle
+            .. " | ⚔️ " .. toolTitle
+            .. " | 🧠 " .. brainrotTitle
+            .. " | 💰 " .. cashTitle
+        local lines = {
+            title,
+            "",
+            "📋 Account Details",
+            "🔄 Rebirths: " .. rebirthDetails,
+            "🏢 Floors: " .. (floors and exact(floors) or "Unavailable"),
+            "🎒 Brainrot Slots: " .. slotsText,
+            "💰 Cash: " .. cashDetails,
+            "⚔️ Weapons & Gear: " .. toolDetails,
+            "",
+            "🧠 Owned Brainrots",
+        }
+        if not plotSnapshot or plotSnapshot.Partial then
+            table.insert(lines, "Unavailable")
+        elseif #plotSnapshot.Rows > 0 then
+            for _, row in ipairs(plotSnapshot.Rows) do table.insert(lines, row) end
+        elseif brainrotCount == 0 then
+            table.insert(lines, "None")
+        else
+            table.insert(lines, "Unavailable")
+        end
+        table.insert(lines, "")
+        for _, line in ipairs(sellerFooter) do table.insert(lines, line) end
+        return player.Name, table.concat(lines, "\n")
+    end
+
+    local function sendLatest(username, description)
+        if not current() then return "stopped" end
+        -- Reuse the original request marker so a rerun waits for an earlier request.
+        if state.inFlight then return "pending" end
+        local changed = state.lastSuccessfulEndpoint ~= endpoint
+            or state.lastSuccessfulUser ~= username
+            or state.lastSuccessfulDescription ~= description
+        if not changed and state.retryNeeded ~= true then return "unchanged" end
+        if os.clock() - state.lastAttemptAt < interval then return "throttled" end
+        if not current() then return "stopped" end
+
+        local owner = {}
+        state.inFlight = owner
+        state.lastAttemptAt = os.clock()
+        state.retryNeeded = true
+        local stage = "JSON encoding"
+        local status
+        local sent, response = pcall(function()
+            local encoded = jsonService:JSONEncode({username = username, description = description})
+            stage = "HTTP transport selection"
+            local transport = type(request) == "function" and request
+                or type(http_request) == "function" and http_request
+                or type(syn) == "table" and type(syn.request) == "function" and syn.request
+                or type(http) == "table" and type(http.request) == "function" and http.request
+            assert(type(transport) == "function", "No supported runner HTTP request function is available.")
+            stage = "HTTP PUT"
+            local result = transport({
+                Url = endpoint,
+                Method = "PUT",
+                Headers = {["Content-Type"] = "application/json"},
+                Body = encoded,
+            })
+            stage = "HTTP response"
+            if type(result) == "table" then
+                status = tonumber(result.StatusCode or result.Status or result.status_code)
+            end
+            return result
+        end)
+        local success = sent and type(response) == "table" and status ~= nil
+            and status >= 200 and status <= 299 and response.Success ~= false
+
+        -- Record the request's actual result even when this worker retired while waiting.
+        -- A newer worker can then send its own latest snapshot after the marker clears.
+        if state.inFlight == owner then
+            if success then
+                state.lastSuccessfulEndpoint = endpoint
+                state.lastSuccessfulUser = username
+                state.lastSuccessfulDescription = description
+                state.retryNeeded = false
+            end
+            state.inFlight = nil
+        end
+        if success then return "sent", "HTTP " .. tostring(status) end
+        if not sent then return "failed", stage .. ": " .. tostring(response) end
+        if type(response) ~= "table" then
+            return "failed", "Runner returned an unexpected HTTP response."
+        end
+        return "failed", "HTTP " .. tostring(status) .. " | "
+            .. tostring(response.StatusMessage or response.Message or "Request was not accepted")
+    end
+
+    task.spawn(function()
+        if not current() then return end
+        print("SAB_LOCALHOST: Started. Reading existing leaderstats, Tools and your loaded plot display without game-module access. PUTting changes to localhost every 30 seconds.")
+        local lastUser, lastDescription, lastError, lastSendStatus
+        while current() do
+            local cycleStart = os.clock()
+            local ok, userOrError, description = pcall(collect)
+            if not current() then return end
+            if ok then
+                if lastUser ~= userOrError or lastDescription ~= description or lastError ~= nil then
+                    print(description)
+                    lastUser, lastDescription = userOrError, description
+                end
+                lastError = nil
+                local outcome, detail = sendLatest(userOrError, description)
+                if not current() then return end
+                if outcome == "sent" then
+                    print("SAB_LOCALHOST: Description sent to localhost. " .. detail)
+                elseif outcome == "failed" then
+                    warn("SAB_LOCALHOST: Send failed; the latest snapshot will retry after the interval. " .. detail)
+                elseif outcome == "pending" and lastSendStatus ~= "pending" then
+                    print("SAB_LOCALHOST: Waiting for an earlier HTTP request to finish.")
+                end
+                lastSendStatus = outcome
+            else
+                local message = tostring(userOrError)
+                if lastError ~= message then
+                    warn("SAB_LOCALHOST: " .. message .. " Will retry after the interval.")
+                    lastError = message
+                end
+            end
+            while current() and os.clock() - cycleStart < interval do
+                task.wait(0.25)
+            end
+        end
+    end)
+end
