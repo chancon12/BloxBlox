@@ -838,6 +838,17 @@ do
         end
     end
 
+    local function countPlotBlocks(purchases)
+        if not purchases or not purchases:IsA("Folder") then return nil end
+        local count = 0
+        for _, child in ipairs(purchases:GetChildren()) do
+            if child:IsA("Model") and child.Name == "PlotBlock" then
+                count = count + 1
+            end
+        end
+        return count
+    end
+
     local function readLoadedPlot()
         if replicatedFirst:GetAttribute("DataLoaded") ~= true then
             return nil, "Player data is not ready"
@@ -848,28 +859,12 @@ do
         local config = type(tier) == "number" and tier % 1 == 0 and baseCatalogue[tier] or nil
         local result = {Rows = {}, Count = nil, ObservedModels = 0, Partial = true}
 
-        -- LaserHitbox Floor attributes are interpreted by PlotClient Source 1034-1044.
-        local floorIds, maxFloor, floorBad = {}, 0, false
-        local laserHitbox = plot:FindFirstChild("LaserHitbox")
-        if laserHitbox then
-            for _, part in ipairs(laserHitbox:GetChildren()) do
-                if part:IsA("BasePart") then
-                    local id = part:GetAttribute("Floor")
-                    if id ~= nil then
-                        if type(id) ~= "number" or id % 1 ~= 0 or id < 1 or id > 3 then
-                            floorBad = true
-                        else
-                            floorIds[id], maxFloor = true, math.max(maxFloor, id)
-                        end
-                    end
-                end
-            end
-        end
-        for id = 1, maxFloor do
-            if not floorIds[id] then floorBad = true end
-        end
-        if not floorBad and maxFloor > 0 and (not config or maxFloor == config.Floors) then
-            result.Floors = maxFloor
+        -- Each supplied base template has one direct Purchases.PlotBlock Model per floor.
+        -- Count duplicate sibling names; Tier only checks that all expected blocks are loaded.
+        local purchases = plot:FindFirstChild("Purchases")
+        local floorCount = countPlotBlocks(purchases)
+        if config and floorCount == config.Floors then
+            result.Floors = floorCount
         end
 
         local podiums = plot:FindFirstChild("AnimalPodiums")
@@ -905,6 +900,8 @@ do
             local samePlot, sameMarker = findOwnPlot()
             if samePlot ~= plot or sameMarker ~= marker or plot:GetAttribute("Tier") ~= tier
                 or plot:FindFirstChild("AnimalPodiums") ~= podiums
+                or plot:FindFirstChild("Purchases") ~= purchases
+                or countPlotBlocks(purchases) ~= floorCount
                 or replicatedFirst:GetAttribute("DataLoaded") ~= true then
                 return nil, "Own plot changed during collection"
             end
@@ -1006,6 +1003,8 @@ do
         local samePlot, sameMarker = findOwnPlot()
         if samePlot ~= plot or sameMarker ~= marker or plot:GetAttribute("Tier") ~= tier
             or plot:FindFirstChild("AnimalPodiums") ~= podiums
+                or plot:FindFirstChild("Purchases") ~= purchases
+                or countPlotBlocks(purchases) ~= floorCount
             or replicatedFirst:GetAttribute("DataLoaded") ~= true then
             return nil, "Own plot changed during collection"
         end
