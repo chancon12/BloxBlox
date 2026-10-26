@@ -1,7 +1,7 @@
 -- Demon Slayer: Human-only Breathing progression, private-server workflow, and live status.
 local Config = {
     DebugPrints = false, -- Set false to turn off diagnostic prints.
-    ExpectedVersion = 26,
+    ExpectedVersion = 262,
     MainAutomationEnabled = true,
     SlayerLoader = {
         Enabled = true, -- Loads your Slayer farming script after the config is ready.
