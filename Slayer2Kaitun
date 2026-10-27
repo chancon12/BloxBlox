@@ -43,7 +43,7 @@ environment.Configs = {
 		-- HumanOnly forces the Breathing path and never chooses Demon Art.
 		BreathingNames = {
 			"Flame", "Insect", "Serpent", "Sound",
-			"Stone", "Thunder", "Water", "Wind"
+			"Stone", "Thunder", "Wind"
 		},
 		DemonArtNames = {
 			"Arrow", "Blood Manipulation", "Cryokinesis", "Dream",
