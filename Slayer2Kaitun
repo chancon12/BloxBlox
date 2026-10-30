@@ -553,6 +553,210 @@ local function startSlayerProgression()
     		return false, remaining
     	end
 
+    	-- BEGIN CURRENT BREATHING SKILL UNLOCKER
+    	-- Shared request state prevents this worker from overlapping itself on a rerun.
+    	local unlockRegistryKey = "__SlayerBreathingSkillUnlock_v1"
+    	local unlockState = rawget(environment, unlockRegistryKey)
+    	if type(unlockState) ~= "table" then
+    	    unlockState = {NextAttemptAt = 0}
+    	    rawset(environment, unlockRegistryKey, unlockState)
+    	end
+    	local unlockModules
+    	local nextUnlockModuleTry = 0
+
+    	local function breathingUnlockRunning()
+    	    return state.Running and not state.Kicked
+    	        and Config.Progression.Enabled == true
+    	        and environment.__DemonSlayerProgressionController == state
+    	end
+
+    	local function loadBreathingUnlockModules(isCurrent)
+    	    if unlockModules then return unlockModules end
+    	    if os.clock() < nextUnlockModuleTry then return nil end
+    	    nextUnlockModuleTry = os.clock() + 5
+    	    local loaded = {}
+    	    local paths = {
+    	        {"Breathings", {"CAM", "Global", "Powers", "Breathings"}},
+    	        {"Stats", {"CAM", "Global", "SkillService", "Stats"}},
+    	        {"Tree", {"CAM", "Global", "SkillService", "SkillTreeholder"}},
+    	        {"Signal", {"Communication", "ServerAndClient", "Signals", "SignalFunction"}},
+    	    }
+    	    for _, entry in ipairs(paths) do
+    	        local node = ReplicatedStorage
+    	        for _, name in ipairs(entry[2]) do
+    	            node = node:FindFirstChild(name)
+    	            if not node then return nil end
+    	        end
+    	        if not node:IsA("ModuleScript") then return nil end
+    	        loaded[entry[1]] = require(node)
+    	        if not isCurrent() then return nil end
+    	    end
+    	    if type(loaded.Breathings) ~= "table"
+    	        or type(loaded.Stats) ~= "table"
+    	        or type(loaded.Stats.IsSkillUnlocked) ~= "function"
+    	        or type(loaded.Stats.GetRequirements) ~= "function"
+    	        or type(loaded.Stats.GetSkillInfoFor) ~= "function"
+    	        or type(loaded.Stats.SourceCheck) ~= "function"
+    	        or type(loaded.Tree) ~= "table"
+    	        or type(loaded.Tree.RequirementsSolver) ~= "table"
+    	        or type(loaded.Signal) ~= "table"
+    	        or type(loaded.Signal.ToServer) ~= "function" then
+    	        return nil
+    	    end
+    	    unlockModules = loaded
+    	    return loaded
+    	end
+
+    	-- One request per call. The next move waits for the game's learned state.
+    	local function unlockCurrentBreathingSkill()
+    	    if not breathingUnlockRunning() or Config.Breathing.AutoUnlockSkills ~= true
+    	        or not game:GetService("RunService"):IsClient() then return end
+    	    if unlockState.InFlight or os.clock() < (unlockState.NextAttemptAt or 0) then return end
+
+    	    local player = Players.LocalPlayer
+    	    local slot = player and findSlot(player)
+    	    if not slot then return end
+    	    local style, styleType, race = readStyle(slot)
+    	    if styleType ~= "Breathing" or not style or style == "" then return end
+    	    if race ~= "human" and race ~= "slayer" and race ~= "hybrid" then return end
+    	    if Config.Progression.HumanOnly == true and race ~= "human" then return end
+
+    	    local function isCurrent()
+    	        if not breathingUnlockRunning() or Config.Breathing.AutoUnlockSkills ~= true
+    	            or Players.LocalPlayer ~= player or findSlot(player) ~= slot then return false end
+    	        local currentStyle, currentType, currentRace = readStyle(slot)
+    	        return currentStyle == style and currentType == styleType and currentRace == race
+    	            and (Config.Progression.HumanOnly ~= true or currentRace == "human")
+    	    end
+
+    	    -- Missing replicated prerequisites mean loading, never an empty skill tree.
+    	    local points = slot:FindFirstChild("SkillPoints")
+    	    local met = slot:FindFirstChild("MetRequirements")
+    	    local inventory = slot:FindFirstChild("Inventory")
+    	    if not points or type(points.Value) ~= "number" or points.Value ~= points.Value
+    	        or points.Value < 0 or points.Value == math.huge
+    	        or not slot:FindFirstChild("SkillTreeUnlockedList")
+    	        or not slot:FindFirstChild("MasteryProgressionList")
+    	        or not met or not met:FindFirstChild("Boss")
+    	        or not inventory or not inventory:FindFirstChild("Inventory") then return end
+
+    	    local modules = loadBreathingUnlockModules(isCurrent)
+    	    if not modules or not isCurrent() then return end
+    	    local power = modules.Breathings[style]
+    	    if type(power) ~= "table" then
+    	        for name, definition in pairs(modules.Breathings) do
+    	            if type(name) == "string" and styleKey(name) == styleKey(style) then
+    	                power = definition
+    	                break
+    	            end
+    	        end
+    	    end
+    	    if type(power) ~= "table" or type(power.Skills) ~= "table" then return end
+
+    	    local names = {}
+    	    for _, definition in ipairs(power.Skills) do
+    	        if type(definition) ~= "table" or type(definition.Name) ~= "string"
+    	            or clean(definition.Name) == "" then return end
+    	        if clean(definition.Name):lower() ~= "blocking" then
+    	            names[#names + 1] = definition.Name
+    	        end
+    	    end
+    	    if #names == 0 then return end
+
+    	    local pending = unlockState.Pending
+    	    if pending then
+    	        if pending.Slot ~= slot or pending.Style ~= style then
+    	            unlockState.Pending = nil
+    	        else
+    	            local learned = modules.Stats.IsSkillUnlocked(player, pending.Name)
+    	            if not isCurrent() or type(learned) ~= "boolean" then return end
+    	            if learned then
+    	                unlockState.Pending = nil
+    	                print("[Breathing Skills] Confirmed unlocked: " .. pending.Name)
+    	            elseif os.clock() < pending.Until then
+    	                return
+    	            else
+    	                unlockState.Pending = nil
+    	            end
+    	        end
+    	    end
+
+    	    local previousName
+    	    for index, name in ipairs(names) do
+    	        local info = modules.Stats.GetSkillInfoFor(player, name)
+    	        if not isCurrent() or type(info) ~= "table" or info.CategoryType ~= "Breathing"
+    	            or info.Category ~= style or info.Index ~= index then return end
+    	        local learned = modules.Stats.IsSkillUnlocked(player, name)
+    	        if not isCurrent() or type(learned) ~= "boolean" then return end
+    	        if not learned then
+    	            if previousName then
+    	                local _, previousReady = modules.Stats.GetRequirements(player, previousName)
+    	                if not isCurrent() or previousReady ~= true then return end
+    	            end
+    	            local requirements = modules.Stats.GetRequirements(player, name)
+    	            if not isCurrent() or type(requirements) ~= "table" or next(requirements) == nil then return end
+    	            local sourceAllowed = modules.Stats.SourceCheck(player, name)
+    	            if not isCurrent() or sourceAllowed ~= true then return end
+    	            for requirement, value in pairs(requirements) do
+    	                local solver = modules.Tree.RequirementsSolver[requirement]
+    	                if type(solver) ~= "table" or type(solver.CanBuy) ~= "function" then return end
+    	                local allowed = solver.CanBuy(player, name, value)
+    	                if not isCurrent() or allowed ~= true then return end
+    	            end
+    	            -- The external loader may also unlock skills; recheck just before requesting.
+    	            local stillLearned = modules.Stats.IsSkillUnlocked(player, name)
+    	            if not isCurrent() or stillLearned ~= false or unlockState.InFlight
+    	                or os.clock() < (unlockState.NextAttemptAt or 0) then return end
+
+    	            local owner = {}
+    	            local awaiting = {Slot = slot, Style = style, Name = name, Until = os.clock() + 10}
+    	            unlockState.InFlight = owner
+    	            unlockState.Pending = awaiting
+    	            unlockState.NextAttemptAt = os.clock() + 2
+    	            local ok, result, message = pcall(modules.Signal.ToServer, "UnlockSkillTreeNode", name)
+    	            if unlockState.InFlight == owner then
+    	                unlockState.InFlight = nil
+    	                if not ok or result == false then
+    	                    unlockState.NextAttemptAt = os.clock() + 5
+    	                end
+    	                if unlockState.Pending == awaiting then
+    	                    if ok and result == false then
+    	                        unlockState.Pending = nil
+    	                    else
+    	                        awaiting.Until = os.clock() + 10
+    	                    end
+    	                end
+    	            end
+    	            if isCurrent() then
+    	                if not ok then
+    	                    warn("[Breathing Skills] Unlock request failed: " .. tostring(result))
+    	                elseif result == false then
+    	                    debugPrint("Breathing Skills", "Unlock denied", name, tostring(message))
+    	                else
+    	                    debugPrint("Breathing Skills", "Requested", name, "waiting for learned state")
+    	                end
+    	            end
+    	            return
+    	        end
+    	        previousName = name
+    	    end
+    	end
+
+    	local function startBreathingSkillUnlocker()
+    	    task.spawn(function()
+    	        local nextWarningAt = 0
+    	        while breathingUnlockRunning() do
+    	            local ok, message = pcall(unlockCurrentBreathingSkill)
+    	            if not ok and breathingUnlockRunning() and os.clock() >= nextWarningAt then
+    	                nextWarningAt = os.clock() + 10
+    	                warn("[Breathing Skills] Check failed; will retry: " .. tostring(message))
+    	            end
+    	            task.wait(1)
+    	        end
+    	    end)
+    	end
+    	-- END CURRENT BREATHING SKILL UNLOCKER
+
     	local breathingIcons = {
     		serpent = "🐍", flame = "🔥", water = "🌊", wind = "🍃",
     		stone = "🪨", insect = "🦋", sound = "🎵", lightning = "⚡"
@@ -930,6 +1134,7 @@ local function startSlayerProgression()
     	-- Apply already-loaded data before your loader reads Configs.
     	pause()
     	safeUpdate()
+    	startBreathingSkillUnlocker()
     	task.spawn(function()
     		while state.Running and not state.Kicked and Config.Progression.Enabled do
     			task.wait(Config.Progression.CheckInterval)
