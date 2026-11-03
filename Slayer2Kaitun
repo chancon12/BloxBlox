@@ -198,7 +198,7 @@ environment.Configs = {
 		X = {Enabled = false, ["Hold Duration"] = 1, Mode = "Instant"},
 		Z = {Enabled = true, ["Hold Duration"] = 1, Mode = "Instant"}
 	},
-	Stats = {Enabled = false, Selected = {"Additional Damage", "Max Health"}},
+	Stats = {Enabled = true, Selected = {"Additional Damage", "Max Health"}},
 	StreamerMode = {Enabled = false},
 	Titles = {AutoEquip = true, Build = "Additional Damage"}
 }
