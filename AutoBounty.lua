@@ -1,6 +1,6 @@
 -- Direct core settings. Sends once per server/webhook; no toggle or GUI controls.
 local SecretsWebhookConfig = {
-    WebhookURL = "https://discord.com/api/webhooks/1247946371668115517/eA3pq_ScD3WEiYCkttEiXLacS0JbO3-ZpBRj5pYiyPWgo8pBbSvSG0rftXgmjV1ROoRC",
+    WebhookURL = "https://discord.com/api/webhooks/1567409737966817362/wS-l2E31paHQTjTAh3ocsRE-ajz6X7sp0cfLtmquGhIrktegqtXAdjQiys3ayMx-JtVF",
     WebhookName = "Secrets Master",
 }
 
