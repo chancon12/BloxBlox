@@ -138,7 +138,7 @@ environment.Configs = {
 			"Eliminate Shinora", "Eliminate Zentaro", "Fujiko"
 		}
 	},
-	Breathing = {AutoLearn = false, AutoUnlockSkills = true, Selected = "Flame"}, -- Controller enables learning at level 25+.
+	Breathing = {AutoLearn = true, AutoUnlockSkills = true, Selected = "Flame"}, -- Controller applies the level 25+, race, and owned-style checks.
 	Character = {
 		Fly = {Enabled = false, Keybind = "F8", Speed = 50},
 		Noclip = {Enabled = false, Keybind = "F6", Speed = 50},
@@ -584,13 +584,29 @@ local function startSlayerProgression()
     	local unlockWorkerOwner = {}
     	local unlockModules
     	local nextUnlockModuleTry = 0
+    	local lastUnlockReason
     	local nextUnlockReasonAt = 0
 
     	local function logBreathingSkill(reason, force)
-    	    if force or os.clock() >= nextUnlockReasonAt then
+    	    if force or reason ~= lastUnlockReason or os.clock() >= nextUnlockReasonAt then
+    	        lastUnlockReason = reason
     	        nextUnlockReasonAt = os.clock() + 10
     	        warn("[Breathing Skills] " .. reason)
     	    end
+    	end
+
+    	local function breathingMoveText(label, name)
+    	    if type(label) ~= "string" or clean(label) == "" or label == name then
+    	        return tostring(name)
+    	    end
+    	    return label .. " [" .. tostring(name) .. "]"
+    	end
+
+    	local function breathingUnlockReason(reason)
+    	    if reason == nil or clean(tostring(reason)) == "" then
+    	        return "game returned no reason"
+    	    end
+    	    return tostring(reason)
     	end
 
     	local function reserveBreathingSkillPoints(reserve)
@@ -659,9 +675,9 @@ local function startSlayerProgression()
     	end
 
     	local function unlockCurrentBreathingSkill()
-    	    local function blocked(reason)
+    	    local function blocked(reason, force)
     	        reserveBreathingSkillPoints(false)
-    	        logBreathingSkill(reason)
+    	        logBreathingSkill(reason, force)
     	    end
     	    if not breathingUnlockRunning() or Config.Breathing.AutoUnlockSkills ~= true then
     	        reserveBreathingSkillPoints(false)
@@ -713,20 +729,22 @@ local function startSlayerProgression()
     	        if pending.Slot ~= slot or pending.Style ~= style then
     	            unlockState.Pending = nil
     	        else
+    	            local pendingMove = breathingMoveText(pending.Label, pending.Name)
     	            local learned = modules.Stats.IsSkillUnlocked(player, pending.Name)
     	            if not currentAfterCall() then return end
     	            if type(learned) ~= "boolean" then
-    	                blocked("Learned state is not ready: " .. pending.Name); return
+    	                blocked("Learned state is not ready: " .. pendingMove); return
     	            end
     	            if learned then
     	                unlockState.Pending = nil
-    	                logBreathingSkill("Confirmed unlocked: " .. pending.Name, true)
+    	                logBreathingSkill("Confirmed unlocked: " .. pendingMove, true)
     	            elseif os.clock() < pending.Until then
     	                reserveBreathingSkillPoints(true)
-    	                logBreathingSkill("Waiting for learned-state confirmation: " .. pending.Name)
+    	                logBreathingSkill("Waiting for learned-state confirmation: " .. pendingMove)
     	                return
     	            else
     	                unlockState.Pending = nil
+    	                logBreathingSkill("Unlock not confirmed for " .. pendingMove .. "; confirmation window expired. Retrying eligibility checks.", true)
     	            end
     	        end
     	    end
@@ -752,6 +770,7 @@ local function startSlayerProgression()
     	        blocked("No skill catalog for current Breathing: " .. style); return
     	    end
     	    local names = {}
+    	    local moveLabels = {}
     	    for _, definition in ipairs(power.Skills) do
     	        if type(definition) ~= "table" or type(definition.Name) ~= "string"
     	            or clean(definition.Name) == "" then
@@ -759,33 +778,42 @@ local function startSlayerProgression()
     	        end
     	        if clean(definition.Name):lower() ~= "blocking" then
     	            names[#names + 1] = definition.Name
+    	            moveLabels[definition.Name] = skillMoveLabel(definition)
     	        end
     	    end
     	    if #names == 0 then blocked("Current Breathing has no listed skills."); return end
 
     	    local previousName
     	    for index, name in ipairs(names) do
+    	        local move = breathingMoveText(moveLabels[name], name)
     	        local info = modules.Stats.GetSkillInfoFor(player, name)
     	        if not currentAfterCall() then return end
     	        if type(info) ~= "table" or info.CategoryType ~= "Breathing"
     	            or info.Category ~= style or info.Index ~= index then
-    	            blocked("Skill metadata does not match current Breathing: " .. name); return
+    	            blocked("Skill metadata does not match current Breathing: " .. move); return
     	        end
     	        local learned = modules.Stats.IsSkillUnlocked(player, name)
     	        if not currentAfterCall() then return end
-    	        if type(learned) ~= "boolean" then blocked("Learned state is not ready: " .. name); return end
+    	        if type(learned) ~= "boolean" then blocked("Learned state is not ready: " .. move); return end
     	        if not learned then
     	            if previousName then
-    	                local ok, _, previousReady = pcall(modules.Stats.GetRequirements, player, previousName)
+    	                local previousMove = breathingMoveText(moveLabels[previousName], previousName)
+    	                local ok, previousRequirements, previousReady = pcall(modules.Stats.GetRequirements, player, previousName)
     	                if not currentAfterCall() then return end
-    	                if not ok or previousReady ~= true then
-    	                    blocked("Previous skill is not ready: " .. previousName); return
+    	                if not ok then
+    	                    blocked("Previous skill requirements check errored for " .. previousMove .. ": " .. breathingUnlockReason(previousRequirements), true); return
+    	                end
+    	                if previousReady ~= true then
+    	                    blocked("Previous skill is not ready: " .. previousMove .. "; waiting to unlock " .. move); return
     	                end
     	            end
     	            local ok, requirements = pcall(modules.Stats.GetRequirements, player, name)
     	            if not currentAfterCall() then return end
-    	            if not ok or type(requirements) ~= "table" or next(requirements) == nil then
-    	                blocked("Requirements are not ready: " .. name); return
+    	            if not ok then
+    	                blocked("Requirements check errored for " .. move .. ": " .. breathingUnlockReason(requirements), true); return
+    	            end
+    	            if type(requirements) ~= "table" or next(requirements) == nil then
+    	                blocked("Requirements are not ready: " .. move); return
     	            end
 
     	            -- Mirror the purchase UI's CanBuy checks, not the casting SourceCheck.
@@ -794,21 +822,25 @@ local function startSlayerProgression()
     	                if requirement ~= "SkillPoints" then
     	                    if requirement == "Mastery" and type(value) == "number" and value > 0
     	                        and not slot:FindFirstChild("MasteryProgressionList") then
-    	                        blocked("Waiting for Mastery data: " .. name); return
+    	                        blocked("Waiting for Mastery data: " .. move); return
     	                    elseif requirement == "Boss" then
     	                        local met = slot:FindFirstChild("MetRequirements")
     	                        if not met or not met:FindFirstChild("Boss") then
-    	                            blocked("Waiting for Boss data: " .. name); return
+    	                            blocked("Waiting for Boss data: " .. move); return
     	                        end
     	                    end
     	                    local solver = modules.Tree.RequirementsSolver[requirement]
     	                    if type(solver) ~= "table" or type(solver.CanBuy) ~= "function" then
-    	                        blocked("Unknown requirement " .. tostring(requirement) .. ": " .. name); return
+    	                        blocked("Unknown requirement " .. tostring(requirement) .. ": " .. move); return
     	                    end
-    	                    local checked, allowed = pcall(solver.CanBuy, player, name, value)
+    	                    local checked, allowed, checkReason = pcall(solver.CanBuy, player, name, value)
     	                    if not currentAfterCall() then return end
-    	                    if not checked or allowed ~= true then
-    	                        blocked("Waiting for " .. tostring(requirement) .. " (" .. tostring(value) .. "): " .. name); return
+    	                    if not checked then
+    	                        blocked(tostring(requirement) .. " check errored for " .. move .. ": " .. breathingUnlockReason(allowed), true); return
+    	                    end
+    	                    if allowed ~= true then
+    	                        local reason = checkReason ~= nil and ("; " .. breathingUnlockReason(checkReason)) or ""
+    	                        blocked("Waiting for " .. tostring(requirement) .. " (" .. tostring(value) .. "): " .. move .. reason); return
     	                    end
     	                end
     	            end
@@ -817,14 +849,17 @@ local function startSlayerProgression()
     	                local solver = modules.Tree.RequirementsSolver.SkillPoints
     	                if type(pointCost) ~= "number" or pointCost ~= pointCost or pointCost < 0
     	                    or pointCost == math.huge or type(solver) ~= "table" or type(solver.CanBuy) ~= "function" then
-    	                    blocked("SkillPoints requirement is not ready: " .. name); return
+    	                    blocked("SkillPoints requirement is not ready: " .. move); return
     	                end
     	                reserveBreathingSkillPoints(true)
-    	                local checked, allowed = pcall(solver.CanBuy, player, name, pointCost)
+    	                local checked, allowed, checkReason = pcall(solver.CanBuy, player, name, pointCost)
     	                if not currentAfterCall() then return end
-    	                if not checked then blocked("SkillPoints check failed: " .. name); return end
+    	                if not checked then
+    	                    blocked("SkillPoints check errored for " .. move .. ": " .. breathingUnlockReason(allowed), true); return
+    	                end
     	                if allowed ~= true then
-    	                    logBreathingSkill("Saving SkillPoints for " .. name .. ": " .. tostring(points.Value) .. "/" .. tostring(pointCost))
+    	                    local reason = checkReason ~= nil and ("; " .. breathingUnlockReason(checkReason)) or ""
+    	                    logBreathingSkill("Saving SkillPoints for " .. move .. ": " .. tostring(points.Value) .. "/" .. tostring(pointCost) .. reason)
     	                    return
     	                end
     	            else
@@ -842,10 +877,11 @@ local function startSlayerProgression()
     	            end
 
     	            local owner = {}
-    	            local awaiting = {Slot = slot, Style = style, Name = name, Until = os.clock() + 10}
+    	            local awaiting = {Slot = slot, Style = style, Name = name, Label = moveLabels[name], Until = os.clock() + 10}
     	            unlockState.InFlight = owner
     	            unlockState.Pending = awaiting
     	            unlockState.NextAttemptAt = os.clock() + 2
+    	            logBreathingSkill("Attempting unlock: " .. move .. " | SkillPoints: " .. tostring(points.Value) .. "/" .. (pointCost ~= nil and tostring(pointCost) or "not required"), true)
     	            local requested, result, message = pcall(modules.Signal.ToServer, "UnlockSkillTreeNode", name)
     	            if unlockState.InFlight == owner then
     	                unlockState.InFlight = nil
@@ -859,11 +895,12 @@ local function startSlayerProgression()
     	            end
     	            if not currentAfterCall() then return end
     	            if not requested then
-    	                logBreathingSkill("Unlock request failed for " .. name .. ": " .. tostring(result), true)
+    	                logBreathingSkill("Unlock request errored for " .. move .. ": " .. breathingUnlockReason(result), true)
     	            elseif result == false then
-    	                logBreathingSkill("Unlock denied for " .. name .. ": " .. tostring(message), true)
+    	                logBreathingSkill("Unlock denied for " .. move .. ": " .. breathingUnlockReason(message), true)
     	            else
-    	                logBreathingSkill("Requested " .. name .. "; waiting for learned-state confirmation.", true)
+    	                local reason = message ~= nil and ("; game message: " .. breathingUnlockReason(message)) or ""
+    	                logBreathingSkill("Request returned for " .. move .. "; waiting for learned-state confirmation." .. reason, true)
     	            end
     	            return
     	        end
@@ -882,7 +919,7 @@ local function startSlayerProgression()
     	            if not ok then
     	                reserveBreathingSkillPoints(false)
     	                if breathingUnlockRunning() then
-    	                    logBreathingSkill("Check failed; will retry: " .. tostring(message))
+    	                    logBreathingSkill("Check errored; will retry: " .. breathingUnlockReason(message), true)
     	                end
     	            end
     	            task.wait(1)
