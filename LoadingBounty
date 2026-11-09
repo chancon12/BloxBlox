@@ -436,18 +436,37 @@ Combo = {
 }
 
 task.wait(5)
-print("[AutoBounty Loader] Downloading module")
 
-local downloadOk, source = pcall(function()
-    return game:HttpGet(MODULE_URL)
-end)
+local source
+for attempt = 1, 3 do
+    if not loaderStillCurrent() then
+        print("[AutoBounty Loader] Superseded by a newer loader run")
+        return
+    end
 
-if not loaderStillCurrent() then
-    print("[AutoBounty Loader] Superseded by a newer loader run")
-    return
+    print(string.format("[AutoBounty Loader] Downloading module (attempt %d/3)", attempt))
+    local downloadOk, result = pcall(function()
+        return game:HttpGet(MODULE_URL)
+    end)
+
+    if not loaderStillCurrent() then
+        print("[AutoBounty Loader] Superseded by a newer loader run")
+        return
+    end
+
+    if downloadOk and type(result) == "string" and result:find("%S") then
+        source = result
+        break
+    end
+
+    local detail = downloadOk and "empty or invalid response" or tostring(result)
+    if attempt == 3 then
+        error("[AutoBounty Loader] Module download failed after 3 attempts: " .. detail, 0)
+    end
+    warn(string.format("[AutoBounty Loader] Module download attempt %d failed: %s", attempt, detail))
+    task.wait(attempt == 1 and 2 or 4)
 end
 
-assert(downloadOk, "[AutoBounty Loader] Download failed: " .. tostring(source))
 print("[AutoBounty Loader] Downloaded " .. tostring(#source) .. " bytes")
 
 local chunk, compileError = loadstring(source)
