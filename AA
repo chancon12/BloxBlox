@@ -30,7 +30,7 @@
 -- * Claims/Codes and the preset's Castle loss fallback stay enabled.
 
 local Settings = {
-    USER_KEY = "PASTE_YOUR_KEY_HERE",
+    USER_KEY = "SEA-CABC0-T7W28-AMU1X-53RYV-UOSCU",
     StartLoader = true, -- false keeps only live reporting/result observation
     Parties = {}, -- supplied preset format: {Leader="Name", Members={"Alt"}}
     Summoning = {
