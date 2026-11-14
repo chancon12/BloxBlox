@@ -1,0 +1,1065 @@
+-- Anime Adventures: live account reporting + supplied Sea Hub presets.
+-- Run the COMPLETE file in the client, in the lobby, on each fresh join.
+-- USER_KEY below can instead come from an existing getgenv().USER_KEY.
+-- Put this entire file in your executor's auto-execute flow if that flow is
+-- already configured. This script does not install an auto-rejoin mechanism.
+--
+-- First report: once real account data is ready. Later checks/attempts: 60s.
+-- No local account files; temporary history/transport state stays in memory.
+-- Reexecuting retires old polling workers and never starts a second hub in
+-- the same client session. An existing HTTP request finishes before another.
+--
+-- Mode policy: unfinished Namek Story / starter team -> Gem Farm; an equipped
+-- Mythic-or-better attacker + affordable early coverage -> Normal Castle
+-- trial; a balanced equipped team + at least one Castle clear -> Summer trial.
+-- These are selection heuristics, not confirmed native unlock requirements.
+-- Above Castle room 100 the native game requires Hard.
+--
+-- Important limits of the supplied source:
+-- * No confirmed hub pause/claims-finished/applied-mode interface is supplied.
+--   While the hub runs, changes are logged as pending, then selected on a
+--   fresh lobby execution. No kicks or forced midrun reconfiguration.
+-- * Native results can confirm Summer full clears within this client session;
+--   that history does not survive teleport/rejoin and is never fabricated.
+-- * The preset controls cards; no unverified easier/harder card controls,
+--   Compass auto-selection, named unit targets, or party role assumptions.
+-- * Gems use the live single-pull price, a numeric unit limit, and KeepGems.
+--   The raw pity container is checked; unknown counter fields are not zero.
+-- * Pearl summons/purchases, selling, blanket evolution, and inventory
+--   purchases stay off. No verified Pearl-summon budget interface was supplied.
+-- * Claims/Codes and the preset's Castle loss fallback stay enabled.
+
+local Settings = {
+    USER_KEY = "PASTE_YOUR_KEY_HERE",
+    StartLoader = true, -- false keeps only live reporting/result observation
+    Parties = {}, -- supplied preset format: {Leader="Name", Members={"Alt"}}
+    Summoning = {
+        GemsEnabled = true,
+        GemsCap = 1000, -- maximum Gems allocated when this launcher selects a config
+        GemsReserve = 500,
+        PearlsReserve = 0, -- Pearl purchases/summons remain disabled
+    },
+    Policy = {
+        SummerWindow = 3,
+        SummerWins = 2, -- full native-bound clears; requires a complete window
+        SummerLossLimit = 3,
+        SummerMinimumNextRoom = 2, -- room is the NEXT Castle room, not wins
+    },
+}
+
+local Builder = (function()
+-- Pure description formatting. All input comes from the launcher's verified live snapshot.
+local Builder = {}
+
+local function isInteger(value, minimum)
+    return type(value) == "number" and value == value and value < math.huge
+        and value >= minimum and value % 1 == 0
+end
+
+local function plain(value)
+    if type(value) ~= "string" then return nil end
+    local text = value:gsub("<[^>]*>", ""):gsub("[\r\n\t]+", " "):gsub("%s+", " ")
+    text = text:match("^%s*(.-)%s*$")
+    return text ~= "" and text or nil
+end
+
+local function identifier(value)
+    return type(value) == "string" and value:find("%S") ~= nil
+        and value:find("[\r\n%z]") == nil
+end
+
+function Builder.Exact(value)
+    if not isInteger(value, 0) then return nil, "Expected a finite nonnegative integer." end
+    if value == 0 then return "0" end
+    local digits = string.format("%.0f", value)
+    local reversed = digits:reverse():gsub("(%d%d%d)", "%1,")
+    local formatted = reversed:reverse():gsub("^,", "")
+    return formatted
+end
+
+function Builder.Compact(value)
+    if not isInteger(value, 0) then return nil, "Expected a finite nonnegative integer." end
+    if value == 0 then return "0" end
+    local scales = {
+        {1e18, "Qi"}, {1e15, "Qa"}, {1e12, "T"},
+        {1e9, "B"}, {1e6, "M"}, {1e3, "K"},
+    }
+    for _, scale in ipairs(scales) do
+        if value >= scale[1] then
+            local tenth = scale[1] / 10
+            local tenths = math.floor(value / tenth)
+            -- Correct a possible floating-point division boundary before rendering.
+            if tenths * tenth > value then tenths = tenths - 1 end
+            local whole = math.floor(tenths / 10)
+            local decimal = tenths % 10
+            return string.format("%.0f", whole)
+                .. (decimal > 0 and "." .. string.format("%.0f", decimal) or "") .. scale[2]
+        end
+    end
+    return string.format("%.0f", value)
+end
+
+function Builder.Build(snapshot)
+    if type(snapshot) ~= "table" then return nil, "Live account snapshot is not ready." end
+    if not isInteger(snapshot.level, 1) then return nil, "Player level is not ready." end
+    if not isInteger(snapshot.gems, 0) then return nil, "Gems balance is not ready." end
+    if not isInteger(snapshot.coins, 0) then return nil, "Coins balance is not ready." end
+    if type(snapshot.units) ~= "table" then return nil, "Owned units are not ready." end
+
+    local rows, maxIndex = 0, 0
+    for key in next, snapshot.units do
+        if not isInteger(key, 1) then return nil, "Owned units must be a complete array." end
+        rows = rows + 1
+        if key > maxIndex then maxIndex = key end
+    end
+    if rows ~= maxIndex then return nil, "Owned units array is incomplete." end
+
+    local seenUUIDs, metadataById, groupsById, groups = {}, {}, {}, {}
+    local idsByName, idsByDisplay = {}, {}
+    local function noteName(map, name, id)
+        local entry = map[name]
+        if not entry then entry = {ids = {}, count = 0}; map[name] = entry end
+        if not entry.ids[id] then entry.ids[id], entry.count = true, entry.count + 1 end
+    end
+    for index = 1, rows do
+        local unit = snapshot.units[index]
+        if type(unit) ~= "table" or not identifier(unit.id) or not identifier(unit.uuid)
+            or type(unit.shiny) ~= "boolean" then
+            return nil, "Owned unit " .. tostring(index) .. " is incomplete."
+        end
+        local name, rarity = plain(unit.name), plain(unit.rarity)
+        if not name or not rarity then return nil, "Owned unit metadata is not ready." end
+        local existing = seenUUIDs[unit.uuid]
+        if existing then
+            if existing.id ~= unit.id or existing.shiny ~= unit.shiny
+                or existing.name ~= name or existing.rarity ~= rarity then
+                return nil, "Duplicate unit UUID has conflicting data."
+            end
+        else
+            seenUUIDs[unit.uuid] = {id = unit.id, shiny = unit.shiny, name = name, rarity = rarity}
+            local metadata = metadataById[unit.id]
+            if metadata and (metadata.name ~= name or metadata.rarity ~= rarity) then
+                return nil, "Owned unit ID has conflicting catalog metadata."
+            end
+            metadataById[unit.id] = {name = name, rarity = rarity}
+            local variants = groupsById[unit.id]
+            if not variants then variants = {}; groupsById[unit.id] = variants end
+            local group = variants[unit.shiny]
+            if not group then
+                local display = (unit.shiny and "Shiny " or "") .. name
+                group = {id = unit.id, shiny = unit.shiny, name = name,
+                    rarity = rarity, display = display, quantity = 0}
+                variants[unit.shiny] = group
+                groups[#groups + 1] = group
+                noteName(idsByName, name, unit.id)
+                noteName(idsByDisplay, display, unit.id)
+            end
+            group.quantity = group.quantity + 1
+        end
+    end
+    for _, group in ipairs(groups) do
+        group.label = group.display
+        if idsByName[group.name].count > 1 or idsByDisplay[group.display].count > 1 then
+            group.label = group.label .. " [" .. group.id .. "]"
+        end
+    end
+    table.sort(groups, function(a, b)
+        if a.label ~= b.label then return a.label < b.label end
+        if a.id ~= b.id then return a.id < b.id end
+        return a.shiny == false and b.shiny == true
+    end)
+
+    local inventory, secrets = {}, {}
+    for _, group in ipairs(groups) do
+        inventory[#inventory + 1] = "x" .. Builder.Exact(group.quantity) .. " " .. group.label
+        if group.rarity:lower() == "secret" then secrets[#secrets + 1] = group.label end
+    end
+    local title = {"🔥【ANIME ADVENTURES】🏆 Level " .. string.format("%.0f", snapshot.level)}
+    if #secrets > 0 then title[#title + 1] = "🌟 " .. table.concat(secrets, ", ") end
+    title[#title + 1] = "💎 " .. Builder.Compact(snapshot.gems) .. " Gems"
+    title[#title + 1] = "🪙 " .. Builder.Compact(snapshot.coins) .. " Coins"
+    local lines = {
+        table.concat(title, " | "), "", "📋 Account Details",
+        "🏆 Level: " .. Builder.Exact(snapshot.level),
+        "💎 Gems: " .. Builder.Exact(snapshot.gems),
+        "🪙 Coins: " .. Builder.Exact(snapshot.coins),
+    }
+    if #inventory > 0 then
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = "🎒 Unit Inventory: " .. table.concat(inventory, ", ")
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "✅ Full Access Account"
+    lines[#lines + 1] = "⚡ Instant Delivery"
+    lines[#lines + 1] = "🛠️ 24/7 Support & Warranty"
+    return table.concat(lines, "\n")
+end
+
+return Builder
+end)()
+
+local Progression = (function()
+-- Launcher policy and supplied Sea Hub settings. No game calls or persistence.
+local Progression = {}
+
+local function integer(value, minimum)
+    return type(value) == "number" and value == value and value < math.huge
+        and value >= minimum and value % 1 == 0
+end
+
+function Progression.SummerStatus(history, policy)
+    local results = type(history) == "table" and history.Summer or nil
+    if type(results) ~= "table" then return false, false, "Recent Summer history is unavailable." end
+    local window, target, lossLimit = policy.SummerWindow, policy.SummerWins, policy.SummerLossLimit
+    if not integer(window, 1) or not integer(target, 1) or target > window
+        or not integer(lossLimit, 1) then
+        return false, false, "Summer policy settings are invalid."
+    end
+    local fullWins = 0
+    for index = math.max(1, #results - window + 1), #results do
+        if results[index].fullClear == true then fullWins = fullWins + 1 end
+    end
+    local losses = #results >= lossLimit
+    if losses then
+        for index = #results - lossLimit + 1, #results do
+            if results[index].victory ~= false then losses = false break end
+        end
+    end
+    local stable = #results >= window and fullWins >= target
+    return stable, losses, #results == 0 and "No Summer results observed in this client session."
+        or (tostring(fullWins) .. " confirmed full clears in the current result window.")
+end
+
+local function roles(snapshot, funds)
+    local result = {dps = false, farm = false, hill = false, early = false,
+        earlyUnknown = false}
+    for _, unit in ipairs(snapshot.equipped or {}) do
+        if unit.mainDps == true then result.dps = true end
+        if unit.farm == true then result.farm = true end
+        if unit.hill == true then result.hill = true end
+        if unit.ordinaryAttack == true then
+            local cost = unit.spawnCost
+            if type(cost) ~= "number" or cost ~= cost or cost == math.huge or cost < 0
+                or type(funds) ~= "number" or funds ~= funds or funds == math.huge or funds < 0 then
+                result.earlyUnknown = true
+            elseif cost <= funds then
+                result.early = true
+            end
+        end
+    end
+    result.balanced = result.dps and result.farm and result.hill and result.early
+    return result
+end
+
+function Progression.Choose(snapshot, history, policy)
+    if type(snapshot) ~= "table" or type(snapshot.progress) ~= "table"
+        or snapshot.progress.ready ~= true then
+        return nil, snapshot and snapshot.progress and snapshot.progress.reason
+            or "Progression data is not ready."
+    end
+    local progress = snapshot.progress
+    if type(policy) ~= "table" or not integer(policy.SummerMinimumNextRoom, 1) then
+        return nil, "Summer minimum Castle room must be a positive integer."
+    end
+    if progress.overrideEquipped then return nil, "Temporary equipped-unit overrides are active." end
+    if not progress.namekInfinite then
+        return {mode = "Gem Farm", equipBest = true,
+            reason = "Finish Namek Story acts 1–6 before using Namek Infinite as the Castle fallback."}
+    end
+    local stable, recovery, historyReason = Progression.SummerStatus(history, policy)
+    if recovery then
+        return {mode = "Gem Farm", equipBest = true,
+            reason = "Three confirmed Summer losses: rebuild the team.", summerStable = false}
+    end
+    local starter = roles(snapshot, progress.gemStartingResource)
+    if starter.dps and not starter.early and starter.earlyUnknown then
+        return nil, "Equipped early-attacker spawn cost is unavailable; Castle qualification is not confirmed."
+    end
+    if not starter.dps or not starter.early then
+        return {mode = "Gem Farm", equipBest = true,
+            reason = "Build and equip a permanent Mythic-or-better ordinary attacker plus early coverage."}
+    end
+    if not integer(progress.nextCastleRoom, 1) then return nil, "Next Castle room is not ready." end
+    local summer = roles(snapshot, progress.summerStartingResource)
+    if summer.balanced and progress.nextCastleRoom >= policy.SummerMinimumNextRoom then
+        return {mode = "Summer Event", equipBest = false, summerStable = stable,
+            reason = "Permanent equipped team covers early damage, DPS, economy, and attacking Hill placement. "
+                .. historyReason}
+    end
+    if progress.nextCastleRoom >= policy.SummerMinimumNextRoom and summer.dps and summer.farm
+        and summer.hill and not summer.early and summer.earlyUnknown then
+        return nil, "Equipped early-attacker spawn cost is unavailable; Summer qualification is not confirmed."
+    end
+    return {mode = "Infinite Castle", difficulty = progress.nextCastleRoom > 100 and "Hard" or "Normal",
+        equipBest = false, summerStable = false,
+        reason = progress.nextCastleRoom > 100
+            and "Recorded Castle progress is above room 100; the native game requires Hard."
+            or "Trial Normal Castle with the supplied three-loss Infinite fallback."}
+end
+
+function Progression.Record(history, kind, result, boundWaves, policy)
+    if type(result) ~= "table" then return false end
+    if kind ~= "Summer Event" then return false end
+    history.Summer = history.Summer or {}
+    local waves = type(result.stats) == "table" and result.stats.waves_completed or nil
+    local victory
+    if type(result.victory) == "boolean" then victory = result.victory end
+    local fullClear = victory == true and integer(waves, 0)
+        and integer(boundWaves, 1) and waves >= boundWaves
+    history.Summer[#history.Summer + 1] = {victory = victory, fullClear = fullClear == true}
+    local keep = math.max(policy.SummerWindow, policy.SummerLossLimit)
+    while #history.Summer > keep do table.remove(history.Summer, 1) end
+    return true
+end
+
+function Progression.GemLimit(snapshot, settings)
+    if not settings.GemsEnabled then return 0, "Gem summoning is disabled." end
+    if not integer(settings.GemsCap, 0) or not integer(settings.GemsReserve, 0) then
+        return 0, "Gem cap/reserve must be nonnegative integers."
+    end
+    local banner = snapshot.banner
+    if type(banner) ~= "table" or banner.ready ~= true
+        or not integer(banner.gemUnitCost, 1) then
+        return 0, banner and banner.reason or "Live banner setup or single-pull price is unavailable."
+    end
+    if type(banner.pityRaw) ~= "table" then
+        return 0, "The loaded pity container is unavailable; summoning is deferred."
+    end
+    -- This is a unit limit derived from the actual current base price, not a
+    -- fictitious GemsSpendCap field. x1 avoids crossing the cap with a x10 batch.
+    local allowed = math.min(settings.GemsCap, math.max(0, snapshot.gems - settings.GemsReserve))
+    return math.floor(allowed / banner.gemUnitCost),
+        "Numeric x1 summon cap uses the live price and reserve; raw pity is read without assuming a zero counter."
+end
+
+function Progression.Config(snapshot, choice, settings)
+    local maximum, spendReason = Progression.GemLimit(snapshot, settings.Summoning)
+    local config = {
+        Mode = choice.mode,
+        Parties = settings.Parties,
+        PartyWait = 120,
+        Done = {Level = 0, Gems = 0},
+        Team = {EquipBest = choice.equipBest},
+        SellSkins = {},
+        Evolve = false,
+        SellUnits = {Rarities = {}, Keep = 1},
+        UnitSpace = {MaxBuys = 0, SkinBuys = 0},
+        Claims = true,
+        Codes = true,
+        Webhook = {URL = "", Result = choice.mode ~= "Gem Farm"},
+        Board = true,
+        HideUI = true,
+        BoardPosition = "Center",
+        BoardLayout = "Landscape",
+        Performance = {BoostFPS = true, BlackScreen = false, DeleteMap = false},
+    }
+    if choice.mode == "Gem Farm" then
+        config.Gem = {LeaveWave = 0, LoseWave = 0, LobbyEvery = 0}
+    elseif choice.mode == "Infinite Castle" then
+        config.Castle = {Difficulty = choice.difficulty, MaxTries = 3, RunsAfterLoss = 3,
+            StopAtFloor = 0, InfiniteMap = "namek", LeaveWave = 0, QueueWait = 120}
+        config.Charm = {Stat = "unit_damage"}
+    elseif choice.mode == "Summer Event" then
+        -- The provided Summer preset controls its own SmartPlay card picker.
+        -- No easier-card, harder-card, or target-unit config API was supplied.
+        config.WaitPlayers, config.WaitSeconds = 0, 0
+        config.Charm = {Stat = "reward_mul"}
+        config.Shop = {
+            ["Event Shop Spend Cap"] = 0, ["Event Shop Keep"] = settings.Summoning.PearlsReserve,
+            ["Event Shop Items"] = {}, ["Sunny Star Open At"] = 0,
+            ["Sunny Star Delete Rarities"] = {}, ["Max Summons"] = 0,
+            ["Summon Amount"] = "gems", ["Stop On Rarity"] = {"Mythic", "Secret"},
+        }
+        -- The request keeps selling/purchases off. The supplied files do not
+        -- prove a Pearl balance reader or a separate Pearl-summon spending cap.
+        -- Do not turn the item-shop cap into a guessed summon budget.
+        return config, "Pearl purchases/summons remain off; no unverified budget or target-selection API is used."
+    else
+        return nil, "Unsupported mode."
+    end
+    config.Summon = {Max = maximum, Banner = "EventClover", Amount = "gems",
+        KeepGems = settings.Summoning.GemsReserve,
+        StopOnRarity = choice.mode == "Infinite Castle" and {"Mythic", "Secret"} or {}}
+    return config, spendReason
+end
+
+return Progression
+end)()
+
+local Reader = (function()
+-- Reads the game's already initialized client caches. No endpoints, init calls,
+-- external loaders, file APIs, or account state are used by this module.
+local Reader = {}
+Reader.__index = Reader
+
+local function finite(value)
+    return type(value) == "number" and value == value
+        and value > -math.huge and value < math.huge
+end
+
+local function integer(value, minimum)
+    return finite(value) and value % 1 == 0 and value >= (minimum or 0)
+end
+
+local function text(value)
+    return type(value) == "string" and value ~= "" and value or nil
+end
+
+local function property(object, name)
+    if object == nil then return nil end
+    if type(object) == "table" then return rawget(object, name) end
+    local ok, value = pcall(function() return object[name] end)
+    if ok then return value end
+end
+
+local function child(object, name)
+    if object == nil then return nil end
+    local method = property(object, "FindFirstChild")
+    if type(method) == "function" then
+        local ok, value = pcall(method, object, name)
+        if ok then return value end
+    end
+    return property(object, name)
+end
+
+local function valueOf(object, name)
+    return property(child(object, name), "Value")
+end
+
+local function copyUnit(unit)
+    return {id = unit.id, uuid = unit.uuid, name = unit.name,
+        rarity = unit.rarity, shiny = unit.shiny}
+end
+
+local function sortedUnits(units)
+    table.sort(units, function(a, b)
+        if a.name ~= b.name then return a.name < b.name end
+        if a.id ~= b.id then return a.id < b.id end
+        if a.shiny ~= b.shiny then return a.shiny == false end
+        return a.uuid < b.uuid
+    end)
+end
+
+local function isFarm(definition)
+    if finite(definition.farm_amount) and definition.farm_amount > 0 then return true end
+    if definition._show_as_farm_unit == true then return true end
+    if type(definition.tags) == "table" then
+        for _, tag in next, definition.tags do if tag == "Farm" then return true end end
+    end
+    if type(definition.end_of_wave) == "table" then
+        for _, action in next, definition.end_of_wave do
+            if type(action) == "table" and action.type == "farm" then return true end
+        end
+    end
+    return false
+end
+
+local function capabilities(definition)
+    local farm = isFarm(definition)
+    local ordinary = finite(definition.damage) and definition.damage > 0
+        and finite(definition.attack_cooldown) and definition.attack_cooldown > 0
+        and definition._NO_ATTACKS_UNIT ~= true and definition.spawn_unit ~= true
+    -- This is a conservative selection policy, not proof that a team can win.
+    local highRarity = definition.rarity == "Mythic" or definition.rarity == "Secret"
+        or definition.rarity == "Exclusive"
+    local buff = definition._show_as_buff_unit == true
+    return ordinary, ordinary and highRarity and not farm and not buff,
+        farm, ordinary and definition.hill_unit == true
+end
+
+function Reader.New(ctx)
+    assert(type(ctx) == "table" and ctx.RS, "Reader.New requires RS")
+    return setmetatable({Ctx = ctx, Env = ctx.Env or {}, Loader = nil}, Reader)
+end
+
+function Reader:_function(name)
+    local value = property(self.Env, name)
+    if type(value) == "function" then return value end
+    if name == "require" then return require end
+    if name == "getfenv" then return getfenv end
+    if name == "getloadedmodules" then return getloadedmodules end
+    if name == "getupvalues" then return getupvalues end
+end
+
+function Reader:_upvalues(fn)
+    local values = {}
+    if type(fn) ~= "function" then return values end
+    local debugLibrary = property(self.Env, "debug") or debug
+    local all = self:_function("getupvalues") or property(debugLibrary, "getupvalues")
+    if type(all) == "function" then
+        local ok, result = pcall(all, fn)
+        if ok and type(result) == "table" then
+            for _, value in next, result do values[#values + 1] = value end
+            return values
+        end
+    end
+    local one = property(debugLibrary, "getupvalue")
+    if type(one) == "function" then
+        for index = 1, 32 do
+            local ok, first, second = pcall(one, fn, index)
+            if not ok or first == nil then break end
+            -- Lua returns name,value; several executors return only value.
+            local value = second ~= nil and second or first
+            if type(first) == "string" and second == nil then value = nil end
+            if value ~= nil then values[#values + 1] = value end
+        end
+    end
+    return values
+end
+
+function Reader:_loader()
+    if self._cachedLoader then return self._cachedLoader end
+    local module = child(child(self.Ctx.RS, "src"), "Loader")
+    if not module then return nil, "Game Loader is not replicated yet" end
+    local loadedModules = self:_function("getloadedmodules")
+    if type(loadedModules) == "function" then
+        local ok, modules = pcall(loadedModules)
+        if not ok or type(modules) ~= "table" then return nil, "Loaded module cache is unavailable" end
+        local found = false
+        for _, candidate in next, modules do if candidate == module then found = true; break end end
+        if not found then return nil, "Waiting for the game to initialize its Loader" end
+    end
+    local requireModule = self:_function("require")
+    if type(requireModule) ~= "function" then return nil, "Cached module reader is unavailable" end
+    -- main has already required this module; never call Loader.init here.
+    local ok, loader = pcall(requireModule, module)
+    if not ok or type(loader) ~= "table" then return nil, "Game Loader cache is unavailable" end
+    if type(rawget(loader, "load_client_service")) ~= "function"
+        or type(rawget(loader, "load_core_service")) ~= "function" then
+        return nil, "Game Loader does not expose the verified cache functions"
+    end
+    self._cachedLoader = loader
+    return loader
+end
+
+function Reader:_service(loader, kind, name)
+    local fn = rawget(loader, kind == "core" and "load_core_service" or "load_client_service")
+    for _, cache in ipairs(self:_upvalues(fn)) do
+        if type(cache) == "table" then
+            local entry = rawget(cache, name)
+            local module = type(entry) == "table" and rawget(entry, "module")
+            if type(module) == "table" then return module end
+        end
+    end
+    return nil
+end
+
+function Reader:_data(loader, name, services)
+    for _, cache in ipairs(self:_upvalues(rawget(loader, "load_data"))) do
+        if type(cache) == "table" and type(rawget(cache, name)) == "table" then
+            return rawget(cache, name)
+        end
+    end
+    -- These globals are established by the supplied init_dependencies sources.
+    -- Inspect their existing environments; do not invoke init_dependencies.
+    local environmentOf = self:_function("getfenv")
+    if type(environmentOf) == "function" then
+        for _, service in ipairs(services) do
+            local fn = type(service) == "table" and rawget(service, "init_dependencies")
+            if type(fn) == "function" then
+                local ok, environment = pcall(environmentOf, fn)
+                local data = ok and type(environment) == "table" and rawget(environment, name)
+                if type(data) == "table" then return data end
+            end
+        end
+    end
+end
+
+local function progressFrom(profile, levels, waves, overridden)
+    local progress = {ready = true, namekInfinite = false, nextCastleRoom = 1,
+        overrideEquipped = overridden}
+    local reasons = {}
+    local function defer(reason) progress.ready = false; reasons[#reasons + 1] = reason end
+    local levelData = rawget(profile, "level_data")
+    if type(levelData) ~= "table" then
+        defer("Level progression data is not ready")
+    else
+        local completed = rawget(levelData, "completed_story_levels")
+        if type(completed) ~= "table" then defer("Story completion data is not ready")
+        else progress.namekInfinite = not not rawget(completed, "namek_level_6") end
+        local tower = rawget(levelData, "infinite_tower")
+        if tower ~= nil and type(tower) ~= "table" then
+            defer("Infinity Mansion progression is malformed")
+        elseif type(tower) == "table" then
+            local floor = rawget(tower, "floor_reached")
+            -- The native UI defaults only absent data to room 1.
+            if floor ~= nil then
+                if integer(floor, 1) then progress.nextCastleRoom = floor
+                else defer("Infinity Mansion room is malformed") end
+            end
+        end
+    end
+    if type(levels) ~= "table" or type(waves) ~= "table" then
+        defer("Level and wave catalogs are not cached yet")
+    else
+        local namek = rawget(levels, "namek_level_1")
+        local namekWaves = type(namek) == "table" and rawget(waves, namek.waves)
+        local amount = type(namekWaves) == "table" and namekWaves.initial_resource
+        if finite(amount) and amount >= 0 then progress.gemStartingResource = amount
+        else defer("Namek starting resources are not confirmed") end
+        local summer = rawget(levels, "summer2_event")
+        local override = type(summer) == "table" and summer._override_waves
+        local summerWaves = type(override) == "table" and rawget(waves, override.template)
+        local summerAmount = type(summerWaves) == "table" and summerWaves.initial_resource
+        if finite(summerAmount) and summerAmount >= 0 then progress.summerStartingResource = summerAmount
+        else defer("Summer starting resources are not confirmed") end
+        local bound = type(summer) == "table" and summer._override_infinite_bound_waves
+        if integer(bound, 1) then progress.summerBoundWaves = bound
+        else defer("Summer wave limit is not confirmed") end
+    end
+    if overridden then defer("A temporary forced lineup is active; permanent team automation is paused") end
+    if #reasons > 0 then progress.reason = table.concat(reasons, "; ") end
+    return progress
+end
+
+local function bannerFrom(profile, banners, summon)
+    local banner = {ready = false}
+    local pity = rawget(profile, "pity_data")
+    if type(pity) == "table" then banner.pityRaw = pity end -- Never infer a missing counter as zero.
+    if type(banners) ~= "table" then banner.reason = "Banner catalog is not cached yet"; return banner end
+    local gem = rawget(banners, "EventClover")
+    if type(gem) == "table" and gem.active == true and finite(gem.gem_cost) and gem.gem_cost > 0 then
+        banner.gemUnitCost = gem.gem_cost
+    end
+    local summer = rawget(banners, "Summer2026")
+    local cost = type(summer) == "table" and summer.resource_cost
+    if type(summer) == "table" and summer.active == true and type(cost) == "table"
+        and cost.id == "SummerPearls" and finite(cost.amount) and cost.amount > 0 then
+        banner.pearlsUnitCost = cost.amount
+    end
+    if type(summon) ~= "table" or type(rawget(summon, "BANNER_UNITS")) ~= "table"
+        or rawget(summon, "_BANNER_ID") == nil then
+        banner.reason = "Waiting for the game's current banner setup"
+        return banner
+    end
+    -- Setup readiness is separate from availability of either selected banner.
+    -- A nil per-banner cost prevents purchasing that banner.
+    banner.ready = true
+    if not banner.gemUnitCost and not banner.pearlsUnitCost then
+        banner.reason = "Neither selected banner has a confirmed active cost"
+    end
+    return banner
+end
+
+local function readSnapshot(self)
+    if not self.Ctx.LocalPlayer then return nil, "LocalPlayer is not ready" end
+    local loader, loaderReason = self:_loader()
+    if not loader then return nil, loaderReason end
+    local statsService = self:_service(loader, "client", "StatsServiceClient")
+    local unitsService = self:_service(loader, "client", "UnitCollectionServiceClient")
+    local levelCore = self:_service(loader, "core", "LevelServiceCore")
+    local unitCore = self:_service(loader, "core", "UnitServiceCore")
+    local gui = self:_service(loader, "client", "GUIService")
+    local summon = self:_service(loader, "client", "SummonServiceClient")
+    if not statsService or not unitsService or not levelCore then
+        return nil, "Waiting for the game's initialized stats, unit, and level service caches"
+    end
+    local session = rawget(statsService, "session")
+    if type(session) ~= "table" or rawget(session, "_initialized") ~= true
+        or rawget(session, "player") ~= self.Ctx.LocalPlayer
+        or rawget(unitsService, "session") ~= session then
+        return nil, "Waiting for the local player's initialized shared session"
+    end
+    local profile = rawget(session, "profile_data")
+    local collection = type(profile) == "table" and rawget(profile, "collection")
+    local owned = type(collection) == "table" and rawget(collection, "owned_units")
+    local permanentEquipped = type(collection) == "table" and rawget(collection, "equipped_units")
+    if type(owned) ~= "table" or type(permanentEquipped) ~= "table" then
+        return nil, "Owned and equipped unit data is not ready"
+    end
+    local stats = rawget(statsService, "stats")
+    local gems, coins, xp = valueOf(stats, "gem_amount"), valueOf(stats, "gold_amount"), valueOf(stats, "player_xp")
+    if not finite(gems) or gems < 0 or not finite(coins) or coins < 0 or not finite(xp) or xp < 0 then
+        return nil, "Live gems, persistent Gold, or player XP is not ready"
+    end
+    local calculateLevel = rawget(levelCore, "calculate_level")
+    if type(calculateLevel) ~= "function" then return nil, "Verified player level calculator is unavailable" end
+    local okLevel, level = pcall(calculateLevel, self.Ctx.LocalPlayer, xp)
+    if not okLevel or not integer(level, 1) then return nil, "Player level calculation is not ready" end
+    local services = {unitsService, gui or false, levelCore, summon or false}
+    local catalog = self:_data(loader, "Units", services)
+    if type(catalog) ~= "table" then return nil, "Unit catalog is not cached yet" end
+    local units, byUUID, rawByUUID = {}, {}, {}
+    for key, record in next, owned do
+        if type(record) ~= "table" then return nil, "An owned unit record is not ready" end
+        local id, uuid = text(rawget(record, "unit_id")), text(rawget(record, "uuid"))
+        if not id or not uuid or type(key) ~= "string" or key ~= uuid
+            or type(rawget(record, "shiny")) ~= "boolean" or byUUID[uuid] then
+            return nil, "An owned unit UUID, identity, or shiny flag is not ready"
+        end
+        local definition = rawget(catalog, id)
+        local name = type(definition) == "table" and text(definition.name)
+        local rarity = type(definition) == "table" and text(definition.rarity)
+        if not name or not rarity then return nil, "An owned unit's catalog metadata is not ready" end
+        local unit = {id = id, uuid = uuid, name = name, rarity = rarity, shiny = record.shiny}
+        units[#units + 1], byUUID[uuid], rawByUUID[uuid] = unit, unit, record
+    end
+    sortedUnits(units)
+    local equipped, seenEquipped = {}, {}
+    for slot, uuid in next, permanentEquipped do
+        if uuid ~= false then
+            local slotNumber = type(slot) == "string" and tonumber(slot)
+            if not integer(slotNumber, 1) or slotNumber > 6 or tostring(slotNumber) ~= slot
+                or not text(uuid) or not byUUID[uuid] or seenEquipped[uuid] then
+                return nil, "A permanent equipped unit slot is not ready"
+            end
+            local unit = copyUnit(byUUID[uuid])
+            local definition = catalog[unit.id]
+            unit.ordinaryAttack, unit.mainDps, unit.farm, unit.hill = capabilities(definition)
+            local multiplierFunction = unitCore and rawget(unitCore, "calculate_spawn_cost_multiplier")
+            if type(multiplierFunction) == "function" and finite(definition.cost) and definition.cost >= 0 then
+                local okCost, multiplier = pcall(multiplierFunction, session, rawByUUID[uuid])
+                if okCost and finite(multiplier) and multiplier >= 0 then
+                    local amount = definition.cost * multiplier
+                    if finite(amount) then unit.spawnCost = math.ceil(amount) end
+                end
+            end
+            unit.slot = slot
+            equipped[#equipped + 1], seenEquipped[uuid] = unit, true
+        end
+    end
+    table.sort(equipped, function(a, b) return tonumber(a.slot) < tonumber(b.slot) end)
+    local levels = self:_data(loader, "Levels", services)
+    local waves = self:_data(loader, "Waves", services)
+    local banners = self:_data(loader, "Banners", services)
+    local overridden = not not rawget(session, "override_equipped_units")
+    local snapshot = {
+        level = level, gems = gems, coins = coins, units = units, equipped = equipped,
+        progress = progressFrom(profile, levels, waves, overridden),
+        banner = bannerFrom(profile, banners, summon),
+        native = {GUI = gui, Loader = loader, Session = session},
+    }
+    self.Loader = loader
+    return snapshot, nil
+end
+
+function Reader:Read()
+    local ok, snapshot, reason = pcall(readSnapshot, self)
+    if not ok then return nil, "Live data changed during the read; waiting for a consistent snapshot" end
+    return snapshot, reason
+end
+
+return Reader
+end)()
+
+local Runtime = (function()
+local Runtime = {}
+
+function Runtime.Start(settings, Builder, Progression, Reader)
+    if not game:GetService("RunService"):IsClient() then
+        warn("[AA Launcher] Run this script on the client.")
+        return
+    end
+    local env = type(getgenv) == "function" and getgenv() or _G
+    local players = game:GetService("Players")
+    local rs = game:GetService("ReplicatedStorage")
+    local json = game:GetService("HttpService")
+    local registryKey = "__AA_LiveProgressionLauncher_v1"
+    local ledger = rawget(env, registryKey)
+    if type(ledger) ~= "table" or ledger.JobId ~= game.JobId then
+        ledger = {JobId = game.JobId, Generation = 0, Connections = {},
+            Transport = {}, Loader = {}, History = {Summer = {}},
+            Finish = {Epoch = 0, ProcessedEpoch = -1}}
+        rawset(env, registryKey, ledger)
+    end
+    ledger.Generation = ledger.Generation + 1
+    local generation = ledger.Generation
+    for _, connection in ipairs(ledger.Connections) do pcall(function() connection:Disconnect() end) end
+    ledger.Connections = {}
+    local context = {RS = rs, LocalPlayer = players.LocalPlayer, Env = env}
+    local reader = Reader.New(context)
+    local logged = {}
+    local function current()
+        return rawget(env, registryKey) == ledger and ledger.Generation == generation
+    end
+    local function report(message, failure)
+        if not current() then return end
+        message = type(message) == "string" and message or "Non-text diagnostic."
+        if logged[message] and os.clock() - logged[message] < 60 then return end
+        logged[message] = os.clock()
+        local logger = failure and warn or print
+        logger("[AA Launcher] " .. message)
+    end
+    local function readSnapshot()
+        context.LocalPlayer = players.LocalPlayer
+        local ok, snapshot, reason = pcall(reader.Read, reader)
+        if not current() then return nil, "This launcher execution has been replaced." end
+        if not ok then return nil, "The live reader raised an error; waiting for initialized game data." end
+        if type(snapshot) ~= "table" then return nil, reason or "Live data is not ready." end
+        ledger.Snapshot = snapshot
+        return snapshot
+    end
+    local function lobbyReady()
+        local map = workspace:FindFirstChild("_MAP_CONFIG")
+        local lobby = map and map:FindFirstChild("IsLobby")
+        local ready = workspace:FindFirstChild("SERVER_READY")
+        return lobby and lobby:IsA("BoolValue") and lobby.Value == true
+            and ready and ready:IsA("BoolValue") and ready.Value == true
+    end
+    local function requestFunction()
+        if type(request) == "function" then return request end
+        if type(http_request) == "function" then return http_request end
+        if type(syn) == "table" and type(syn.request) == "function" then return syn.request end
+        if type(http) == "table" and type(http.request) == "function" then return http.request end
+        return nil
+    end
+
+    -- Keep an in-flight request serialized across reruns; retire old polling
+    -- workers by generation without canceling a request half way through.
+    task.spawn(function()
+        local nextCheck = 0
+        while current() do
+            local transport = ledger.Transport
+            local now = os.clock()
+            if now >= nextCheck and not transport.InFlight then
+                local snapshot, reason = readSnapshot()
+                if not current() then return end
+                if not snapshot then
+                    report("Account updater waiting: " .. tostring(reason))
+                    nextCheck = now + 5
+                else
+                    local ok, description, formatReason = pcall(Builder.Build, snapshot)
+                    if not ok or type(description) ~= "string" then
+                        report("Account description waiting: " .. tostring(formatReason or "invalid account snapshot"), not ok)
+                        nextCheck = now + 5
+                    elseif description == transport.LastSent then
+                        nextCheck = now + 60
+                    elseif transport.LastAttempt and now - transport.LastAttempt < 60 then
+                        nextCheck = transport.LastAttempt + 60
+                    else
+                        local player = players.LocalPlayer
+                        local encoded, body = pcall(function()
+                            return json:JSONEncode({username = player.Name, description = description})
+                        end)
+                        if not encoded then
+                            report("Account description JSON encoding failed.", true)
+                            nextCheck = now + 60
+                        else
+                            local flight = {}
+                            transport.InFlight = flight
+                            nextCheck = now + 60
+                            task.spawn(function()
+                                if not current() then
+                                    if transport.InFlight == flight then transport.InFlight = nil end
+                                    return
+                                end
+                                transport.LastAttempt = os.clock()
+                                report("Sending title and full description to the account API.")
+                                local send = requestFunction()
+                                local sent, response = pcall(function()
+                                    if not send then return nil end
+                                    return send({
+                                        Url = "http://localhost:3030/api/accounts/description",
+                                        Method = "PUT",
+                                        Headers = {["Content-Type"] = "application/json"},
+                                        Body = body,
+                                    })
+                                end)
+                                local status = sent and type(response) == "table"
+                                    and tonumber(response.StatusCode or response.Status) or nil
+                                local success = status and status >= 200 and status < 300
+                                    and response.Success ~= false
+                                if transport.InFlight == flight then
+                                    if success then transport.LastSent = description end
+                                    transport.InFlight = nil
+                                end
+                                if success then
+                                    report("Account description sent successfully: HTTP " .. tostring(status) .. ".")
+                                else
+                                    local problem = not send and "no supported HTTP request function"
+                                        or not sent and "HTTP request error"
+                                        or status and ("HTTP " .. tostring(status)
+                                            .. (response.Success == false and " with Success=false" or ""))
+                                        or "response has no successful HTTP status"
+                                    report("Account description failed: " .. problem .. "; retry after 60 seconds.", true)
+                                end
+                            end)
+                        end
+                    end
+                end
+            end
+            task.wait(2)
+        end
+    end)
+
+    local function recordResult(payload)
+        if not current() or type(payload) ~= "table" then return end
+        -- Results UI settings exist before the result payload is populated.
+        -- Do not consume this match's epoch until the native fields are loaded.
+        local waves = type(payload.stats) == "table" and payload.stats.waves_completed
+        if type(payload.victory) ~= "boolean" or type(waves) ~= "number"
+            or waves ~= waves or waves < 0 or waves >= math.huge or waves % 1 ~= 0 then return end
+        local snapshot = ledger.Snapshot
+        local loader = snapshot and snapshot.native and snapshot.native.Loader or reader.Loader
+        local level = loader and loader.LevelData
+        if type(level) ~= "table" or level.id ~= "summer2_event" then return end
+        local finish = ledger.Finish
+        if finish.ProcessedEpoch == finish.Epoch then return end
+        local bound = snapshot and snapshot.progress and snapshot.progress.summerBoundWaves
+        if Progression.Record(ledger.History, "Summer Event", payload, bound, settings.Policy) then
+            finish.ProcessedEpoch = finish.Epoch
+            local stable, recovery, reason = Progression.SummerStatus(ledger.History, settings.Policy)
+            report("Summer result observed. " .. reason)
+            if stable then report("Summer stability target confirmed for this client session.") end
+            if recovery then report("Three Summer losses confirmed; team rebuilding is pending a fresh safe start.") end
+        end
+    end
+    local observedFlag, observedRemote
+    local function observeResults(snapshot)
+        local data = workspace:FindFirstChild("_DATA")
+        local finished = data and data:FindFirstChild("GameFinished")
+        if finished and finished:IsA("BoolValue") and finished ~= observedFlag then
+            if observedFlag then ledger.Finish.Epoch = ledger.Finish.Epoch + 1 end
+            observedFlag = finished
+            ledger.Connections[#ledger.Connections + 1] = finished.Changed:Connect(function(value)
+                if current() and value == false then ledger.Finish.Epoch = ledger.Finish.Epoch + 1 end
+            end)
+        end
+        local endpoints = rs:FindFirstChild("endpoints")
+        local incoming = endpoints and endpoints:FindFirstChild("server_to_client")
+        local remote = incoming and incoming:FindFirstChild("game_finished")
+        if remote and remote:IsA("RemoteEvent") and remote ~= observedRemote then
+            observedRemote = remote
+            ledger.Connections[#ledger.Connections + 1] = remote.OnClientEvent:Connect(recordResult)
+        end
+        if finished and finished:IsA("BoolValue") and finished.Value == true then
+            local gui = snapshot and snapshot.native and snapshot.native.GUI
+            local results = gui and gui.results_ui
+            if type(results) == "table" then recordResult(results.settings) end
+        end
+    end
+
+    local function loaderKey()
+        if type(settings.USER_KEY) == "string" and settings.USER_KEY:find("%S")
+            and settings.USER_KEY ~= "PASTE_YOUR_KEY_HERE" then return settings.USER_KEY end
+        local existing = rawget(env, "USER_KEY")
+        if type(existing) == "string" and existing:find("%S")
+            and existing ~= "PASTE_YOUR_KEY_HERE" then return existing end
+        return nil
+    end
+    local function startHub(snapshot, choice)
+        if not current() then return end
+        local state = ledger.Loader
+        local signature = choice.mode .. ":" .. tostring(choice.difficulty or "")
+        if state.Executed then
+            if state.Signature ~= signature then
+                report("Pending mode: " .. choice.mode
+                    .. ". The running hub is kept on its current configuration; reevaluate on fresh lobby execution.")
+            end
+            return
+        end
+        if state.Fetching or settings.StartLoader == false then return end
+        local key = loaderKey()
+        if not key then
+            report("API reporting is active. Set USER_KEY at the top, or keep an existing getgenv().USER_KEY, to start Sea Hub.")
+            return
+        end
+        if type(loadstring) ~= "function" then report("loadstring is unavailable; Sea Hub cannot start.", true) return end
+        local config, reason = Progression.Config(snapshot, choice, settings)
+        if type(config) ~= "table" then report("Config waiting: " .. tostring(reason), true) return end
+        local loaderURL = "https://api.seahub.dev/api/v1/scripts/loader"
+        local fetch = {}
+        state.Fetching = fetch
+        task.spawn(function()
+            local function releaseFetch()
+                if state.Fetching == fetch then state.Fetching = nil end
+            end
+            local source
+            for attempt = 1, 3 do
+                if not current() then break end
+                local ok, text = pcall(function() return game:HttpGet(loaderURL) end)
+                if ok and type(text) == "string" and text:find("%S") then source = text break end
+                report("Sea Hub download failed; attempt " .. attempt .. " of 3.", true)
+                if attempt < 3 then task.wait(5) end
+            end
+            if not current() then releaseFetch() return end
+            if not source then
+                releaseFetch()
+                state.DownloadFailed = true
+                report("Sea Hub download failed. Reexecute this file to retry; API reporting continues.", true)
+                return
+            end
+            local compiled, executable = pcall(loadstring, source)
+            if not compiled or type(executable) ~= "function" then
+                releaseFetch()
+                state.DownloadFailed = true
+                report("Sea Hub download did not compile; nothing was executed. Reexecute to retry.", true)
+                return
+            end
+            -- HTTP/module reads may yield. Refresh the account and lobby before
+            -- applying settings or executing anything from the downloaded text.
+            if state.Executed or not current() then releaseFetch() return end
+            if not lobbyReady() then
+                releaseFetch()
+                report("Sea Hub start deferred: the player is no longer in a ready lobby.")
+                return
+            end
+            local fresh, missing = readSnapshot()
+            if not current() then releaseFetch() return end
+            if not fresh or not lobbyReady() then
+                releaseFetch()
+                report("Sea Hub start deferred: " .. tostring(missing or "lobby data changed during startup"))
+                return
+            end
+            local selected, unavailable = Progression.Choose(fresh, ledger.History, settings.Policy)
+            if not selected then
+                releaseFetch()
+                report("Sea Hub start deferred: " .. tostring(unavailable))
+                return
+            end
+            local freshConfig, budgetReason = Progression.Config(fresh, selected, settings)
+            local freshKey = loaderKey()
+            if type(freshConfig) ~= "table" or not freshKey then
+                releaseFetch()
+                report("Sea Hub start deferred: " .. tostring(budgetReason or "USER_KEY is unavailable"))
+                return
+            end
+            -- Only options from the supplied presets are passed to Sea Hub.
+            env.SeaHubKaitun = freshConfig
+            env.USER_KEY = freshKey
+            env.SCRIPT_ID = "6aecb1cdd8161227478b5a5f"
+            env.LOADER_URL = loaderURL
+            signature = selected.mode .. ":" .. tostring(selected.difficulty or "")
+            releaseFetch()
+            state.Executed, state.Signature = true, signature
+            state.Mode = selected.mode
+            report(budgetReason)
+            report("Starting Sea Hub once in " .. selected.mode .. ".")
+            local ok = pcall(executable)
+            if not ok then
+                report("Sea Hub raised an execution error. It will not be executed a second time in this client session.", true)
+            end
+        end)
+    end
+    -- A reexecution may retry a failed download; an executed loader is never rerun.
+    ledger.Loader.DownloadFailed = nil
+    task.spawn(function()
+        while current() do
+            local snapshot, reason = readSnapshot()
+            if not current() then return end
+            if snapshot then
+                observeResults(snapshot)
+                if lobbyReady() then
+                    local choice, unavailable = Progression.Choose(snapshot, ledger.History, settings.Policy)
+                    if choice then
+                        report("Live-data selection: " .. choice.mode .. ". " .. choice.reason)
+                        if not ledger.Loader.DownloadFailed then startHub(snapshot, choice) end
+                    else
+                        report("Progression waiting: " .. tostring(unavailable))
+                    end
+                end
+            else
+                report("Live data waiting: " .. tostring(reason))
+            end
+            task.wait(5)
+        end
+    end)
+    report("Live account reporting started. First API send follows complete data; later checks use 60 seconds.")
+    report("Recent match history stays in memory for this client session; rejoining does not create or load an account file.")
+    return ledger
+end
+
+return Runtime
+end)()
+
+Runtime.Start(Settings, Builder, Progression, Reader)
