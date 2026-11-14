@@ -7,7 +7,7 @@ end
 
 local Config = {
     DebugPrints = false, -- Set false to turn off diagnostic prints.
-    ExpectedVersion = 1.001,
+    ExpectedVersion = 1.002,
     MainAutomationEnabled = true,
     SlayerLoader = {
         Enabled = true, -- Loads your Slayer farming script after the config is ready.
