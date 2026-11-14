@@ -70,7 +70,7 @@ env.SeaHubKaitun = {
     Performance = {
         BoostFPS = true,
         BlackScreen = false,
-        DeleteMap = false,
+        DeleteMap = true,
     },
 }
 
