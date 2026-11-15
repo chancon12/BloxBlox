@@ -189,6 +189,38 @@ function Builder.Build(snapshot)
             group.quantity = group.quantity + 1
         end
     end
+
+    if type(snapshot.equipped) ~= "table" then return nil, "Equipped slots are not ready." end
+    local equippedRows, equippedMax = 0, 0
+    for key in next, snapshot.equipped do
+        if not isInteger(key, 1) then return nil, "Equipped slots must be a complete array." end
+        equippedRows = equippedRows + 1
+        if key > equippedMax then equippedMax = key end
+    end
+    if equippedRows ~= equippedMax then return nil, "Equipped slots array is incomplete." end
+    local slots, seenSlots, equippedUUIDs = {}, {}, {}
+    for index = 1, equippedRows do
+        local unit = snapshot.equipped[index]
+        if type(unit) ~= "table" or not isInteger(unit.slot, 1) or unit.slot > 6
+            or not identifier(unit.id) or not identifier(unit.uuid)
+            or type(unit.shiny) ~= "boolean" or type(unit.evolved) ~= "boolean" then
+            return nil, "Equipped slot " .. tostring(index) .. " is incomplete."
+        end
+        local name, rarity = plain(unit.name), plain(unit.rarity)
+        if not name or not rarity then return nil, "Equipped unit metadata is not ready." end
+        if seenSlots[unit.slot] then return nil, "Duplicate equipped slot has conflicting data." end
+        if equippedUUIDs[unit.uuid] then return nil, "The same unit UUID occupies multiple slots." end
+        local owned = seenUUIDs[unit.uuid]
+        if owned and (owned.id ~= unit.id or owned.shiny ~= unit.shiny
+            or owned.name ~= name or owned.rarity ~= rarity) then
+            return nil, "Equipped unit conflicts with its owned UUID."
+        end
+        seenSlots[unit.slot], equippedUUIDs[unit.uuid] = true, true
+        slots[#slots + 1] = {slot = unit.slot, label = (unit.shiny and "Shiny " or "") .. name,
+            rarity = (unit.evolved and "Evo " or "") .. rarity}
+    end
+    table.sort(slots, function(a, b) return a.slot < b.slot end)
+
     for _, group in ipairs(groups) do
         group.label = group.display
         if idsByName[group.name].count > 1 or idsByDisplay[group.display].count > 1 then
@@ -210,12 +242,19 @@ function Builder.Build(snapshot)
     if #secrets > 0 then title[#title + 1] = "🌟 " .. table.concat(secrets, ", ") end
     title[#title + 1] = "💎 " .. Builder.Compact(snapshot.gems) .. " Gems"
     title[#title + 1] = "🪙 " .. Builder.Compact(snapshot.coins) .. " Coins"
-    local lines = {
-        table.concat(title, " | "), "", "📋 Account Details",
-        "🏆 Level: " .. Builder.Exact(snapshot.level),
-        "💎 Gems: " .. Builder.Exact(snapshot.gems),
-        "🪙 Coins: " .. Builder.Exact(snapshot.coins),
-    }
+    local lines = {table.concat(title, " | "), ""}
+    if #slots > 0 then
+        lines[#lines + 1] = "🛡️ Slot Units"
+        for _, unit in ipairs(slots) do
+            lines[#lines + 1] = "Slot " .. string.format("%.0f", unit.slot) .. ": "
+                .. unit.label .. " ( " .. unit.rarity .. " )"
+        end
+        lines[#lines + 1] = ""
+    end
+    lines[#lines + 1] = "📋 Account Details"
+    lines[#lines + 1] = "🏆 Level: " .. Builder.Exact(snapshot.level)
+    lines[#lines + 1] = "💎 Gems: " .. Builder.Exact(snapshot.gems)
+    lines[#lines + 1] = "🪙 Coins: " .. Builder.Exact(snapshot.coins)
     if #inventory > 0 then
         lines[#lines + 1] = ""
         lines[#lines + 1] = "🎒 Unit Inventory: " .. table.concat(inventory, ", ")
@@ -368,6 +407,68 @@ function Reader:_data(loader, name, services)
     end
 end
 
+local function evolvedStatus(definition, catalog)
+    -- evolved.from describes the CURRENT form. evolve.evolve_unit is the NEXT
+    -- form and must never be used as evidence that this unit is already Evo.
+    local evolved = rawget(definition, "evolved")
+    if evolved ~= nil and evolved ~= false then
+        local from = type(evolved) == "table" and text(rawget(evolved, "from"))
+        if not from or type(rawget(catalog, from)) ~= "table" then
+            return nil, "An equipped unit's evolution metadata is not ready"
+        end
+        return true
+    end
+    local nativeForm = rawget(definition, "base_evolve")
+    if nativeForm ~= nil and type(nativeForm) ~= "boolean" then
+        return nil, "An equipped unit's native evolved-form flag is not ready"
+    end
+    return nativeForm == true
+end
+
+local function readEquipped(unitsService, catalog)
+    -- These source-confirmed accessors only read the current client session.
+    -- They also resolve the real temporary lineup when the game overrides it.
+    local getEquipped = rawget(unitsService, "get_equipped_units")
+    local getUnit = rawget(unitsService, "get_equipped_unit_by_uuid")
+    if type(getEquipped) ~= "function" or type(getUnit) ~= "function" then
+        return nil, "Equipped-unit readers are not initialized yet"
+    end
+    local okSlots, slots = pcall(getEquipped)
+    if not okSlots or type(slots) ~= "table" then
+        return nil, "Current equipped slots are not ready"
+    end
+    local equipped, seenSlots, seenUUIDs = {}, {}, {}
+    for key, uuid in next, slots do
+        if uuid ~= false then
+            local slot = (type(key) == "number" or type(key) == "string") and tonumber(key)
+            if not integer(slot, 1) or slot > 6 or seenSlots[slot]
+                or (type(key) == "string" and tostring(slot) ~= key)
+                or not text(uuid) or seenUUIDs[uuid] then
+                return nil, "A current equipped slot or UUID is not ready"
+            end
+            local okUnit, record = pcall(getUnit, uuid)
+            if not okUnit or type(record) ~= "table" or rawget(record, "uuid") ~= uuid
+                or type(rawget(record, "shiny")) ~= "boolean" then
+                return nil, "A current equipped unit record is not ready"
+            end
+            local id = text(rawget(record, "unit_id"))
+            local definition = id and rawget(catalog, id)
+            local name = type(definition) == "table" and text(rawget(definition, "name"))
+            local rarity = type(definition) == "table" and text(rawget(definition, "rarity"))
+            if not name or not rarity then
+                return nil, "An equipped unit's catalog metadata is not ready"
+            end
+            local evolved, reason = evolvedStatus(definition, catalog)
+            if evolved == nil then return nil, reason end
+            equipped[#equipped + 1] = {slot = slot, id = id, uuid = uuid,
+                name = name, rarity = rarity, shiny = record.shiny, evolved = evolved}
+            seenSlots[slot], seenUUIDs[uuid] = true, true
+        end
+    end
+    table.sort(equipped, function(a, b) return a.slot < b.slot end)
+    return equipped
+end
+
 local function readSnapshot(self)
     if not self.Ctx.LocalPlayer then return nil, "LocalPlayer is not ready" end
     local loader, loaderReason = self:_loader()
@@ -417,7 +518,9 @@ local function readSnapshot(self)
         local unit = {id = id, uuid = uuid, name = name, rarity = rarity, shiny = record.shiny}
         units[#units + 1] = unit
     end
-    return {level = level, gems = gems, coins = coins, units = units}
+    local equipped, equippedReason = readEquipped(unitsService, catalog)
+    if not equipped then return nil, equippedReason end
+    return {level = level, gems = gems, coins = coins, units = units, equipped = equipped}
 end
 
 function Reader:Read()
