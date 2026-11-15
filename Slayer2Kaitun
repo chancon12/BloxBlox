@@ -79,11 +79,9 @@ environment.Configs = {
 		-- Gaining Breathing or Demon Art kicks once; rejoining with a style resumes farming.
 		TargetLevel = 225,
 		CheckInterval = 0.5,
-		KickOnReachingTarget = true,
-		KickOnAllSkillsUnlocked = true,
-		-- Starting at 225 does not kick. Crossing from below 225 does.
-		-- At 225: farm one matching boss until the current style's skills are unlocked.
-		-- Becoming fully unlocked kicks once; rejoining fully unlocked farms all bosses.
+		BossFarmAtTarget = false, -- Keep leveling at and above TargetLevel.
+		KickOnReachingTarget = false, -- Optional kick when entering the boss stage.
+		KickOnAllSkillsUnlocked = true, -- Applies only in the boss stage.
 		AllBosses = {
 			"Eliminate Domae", "Eliminate Datai", "Eliminate Akazo",
 			"Eliminate Reaper", "Eliminate Obari", "Eliminate Nezura",
@@ -1168,6 +1166,8 @@ local function startSlayerProgression()
     			return
     		end
     		local target = Config.Progression.TargetLevel
+    		local bossFarmAtTarget = Config.Progression.BossFarmAtTarget ~= false
+    		local atBossStage = bossFarmAtTarget and level >= target
     		local previousLevel = state.LastLevel
     		state.LastLevel = level
     		local style, styleType, raceName = readStyle(slot)
@@ -1191,8 +1191,8 @@ local function startSlayerProgression()
     		-- Share one confirmed result between the description and boss progression.
     		-- The DONE suffix depends on skills, even before the level-225 boss stage.
     		local allSkillsUnlocked, remainingMoves = readAllSkillsStatus(player, slot, style, styleType)
-    		if Config.Progression.KickOnReachingTarget and previousLevel
-    			and previousLevel < target and level >= target then
+    		if atBossStage and Config.Progression.KickOnReachingTarget and previousLevel
+    			and previousLevel < target then
     			kickForProgress(player, slot, level, style, styleType,
     				"Reached level " .. target .. ". Rejoin to start boss farming.", false, allSkillsUnlocked, remainingMoves)
     			return
@@ -1214,7 +1214,7 @@ local function startSlayerProgression()
     			return
     		end
 
-    		if level >= target and style and style ~= "" then
+    		if atBossStage and style and style ~= "" then
     			local currentStyleKey = (styleType or "") .. ":" .. styleKey(style)
     			if state.SkillStyleKey ~= currentStyleKey then
     				state.SkillStyleKey = currentStyleKey
@@ -1230,7 +1230,7 @@ local function startSlayerProgression()
     					return
     				end
     			end
-    		elseif style == "" or level < target then
+    		elseif style == "" or not atBossStage then
     			state.SkillStyleKey = nil
     			state.LastAllSkillsUnlocked = nil
     		end
@@ -1255,7 +1255,7 @@ local function startSlayerProgression()
     			return
     		end
 
-    		if level < target then
+    		if not atBossStage then
     			setBoss(nil)
     			Config.AutoFarm.Enabled = true
     			if level < styleLevel then
@@ -1265,7 +1265,9 @@ local function startSlayerProgression()
                 elseif Config.DemonArt.Enabled then
                     status("Level " .. level .. ": acquiring " .. tostring(Config.DemonArt.Orb) .. " Demon Art; leveling ON.")
                 elseif needsStyle and demonArtLearningDisabled and (raceName == "demon" or requested.DemonArt) then
-                    status("Level " .. level .. ": Demon Art learning disabled; leveling to " .. target .. ".")
+                    status("Level " .. level .. ": Demon Art learning disabled; leveling ON.")
+                elseif not bossFarmAtTarget then
+                    status("Level " .. level .. ": continuing level farm; style learning OFF; " .. (style or "style data loading"))
                 else
                     status("Level " .. level .. ": leveling to " .. target .. "; style learning OFF; " .. (style or "style data loading"))
                 end
