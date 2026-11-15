@@ -48,7 +48,7 @@ env.SeaHubKaitun = {
 
     Evolve = false,
     SellUnits = {
-        Rarities = {},
+        Rarities = {Rare, Epic, Legendary},
         Keep = 1,
     },
     UnitSpace = {
