@@ -8,6 +8,8 @@ env.SeaHubKaitun = {
         LoseWave = 0,               -- 0 = no early vote to lose
         LobbyEvery = 0,             -- used with LoseWave; 0 = never back
         Place = "Entrance",         -- "Entrance" | "Auto" | "Whole path"
+        CEO = true,
+        SkipWave = true,
     },
 
     Parties = {
@@ -23,12 +25,16 @@ env.SeaHubKaitun = {
     },
 
     Summon = {
-        Max = "all",                -- "all" | number of units | 0 = off
-        Banner = "EventClover",     -- EventClover (Special) | Legacy | Summer2026
-        Amount = "gems10",          -- "gems" | "gems10" | "ticket"
-        KeepGems = 0,
-        StartAt = 10000,                -- 0 = summon on every lobby visit; set a gem threshold to save up first.
-        StopOnRarity = {},
+        Max = "all",                -- "all" = keep summoning while gems last | a number = units this run | 0 = off
+        Banner = "EventClover",     -- banner id: EventClover (Special) | Legacy | Summer2026 ...
+        Amount = "gems10",          -- "gems" (x1) | "gems10" (x10) | "ticket"
+        KeepGems = 0,               -- never go below this many gems
+        StartAt = 10000,                -- save up first: no summon until you have this many gems, then back to the lobby
+                                    -- after the match, summon down to KeepGems, and save up again (0 = off: summon
+                                    -- on every lobby visit), e.g. 10000
+        StopOnRarity = {},          -- stop summoning for good once one of these comes out, e.g. { "Secret" } ({} = never)
+        Event = true,               -- also summon on the event banner (the Summer banner now) with its own currency
+                                    -- (Summer Pearls) in the lobby, whenever the gem banner can't summon; false = off
     },
 
     Team = {
