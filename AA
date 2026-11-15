@@ -27,6 +27,7 @@ env.SeaHubKaitun = {
         Banner = "EventClover",     -- EventClover (Special) | Legacy | Summer2026
         Amount = "gems10",          -- "gems" | "gems10" | "ticket"
         KeepGems = 0,
+        StartAt = 10000,                -- 0 = summon on every lobby visit; set a gem threshold to save up first.
         StopOnRarity = {},
     },
 
@@ -70,11 +71,11 @@ env.SeaHubKaitun = {
     Performance = {
         BoostFPS = true,
         BlackScreen = false,
-        DeleteMap = true,
+        DeleteMap = false,
     },
 }
 
-env.USER_KEY = env.USER_KEY or "SEA-CABC0-T7W28-AMU1X-53RYV-UOSCU"
+env.USER_KEY = env.USER_KEY or "PASTE_YOUR_KEY_HERE"
 env.SCRIPT_ID = "6aecb1cdd8161227478b5a5f"
 env.LOADER_URL = "https://api.seahub.dev/api/v1/scripts/loader"
 
