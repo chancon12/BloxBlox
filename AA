@@ -52,7 +52,9 @@ env.SeaHubKaitun = {
         },
     },
 
-    Evolve = false,
+    Evolve = true,
+    EvolveBuy = true,
+    EvolveStockUp = true,
     SellUnits = {
         Rarities = {"Rare", "Epic", "Legendary"},
         Keep = 1,
@@ -76,8 +78,8 @@ env.SeaHubKaitun = {
 
     Performance = {
         BoostFPS = true,
-        BlackScreen = false,
-        DeleteMap = false,
+        BlackScreen = true,
+        DeleteMap = true,
     },
 }
 
