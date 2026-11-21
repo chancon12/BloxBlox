@@ -11,7 +11,7 @@ local Config = {
     MainAutomationEnabled = true,
     SlayerLoader = {
         Enabled = true, -- Loads your Slayer farming script after the config is ready.
-        Key = "2c910074-5f65-4e35-80c7-68ef4379960b",
+        Key = "7f289cc8-12df-4481-bc84-a97182b6b01e",
         Url = "https://api.luarmor.net/files/v4/loaders/ff744638668c00b2f2f8fdce4072716e.lua",
     },
     RedeemLiveCodes = true, -- Pull every unexpired code exposed by the live Codes config.
